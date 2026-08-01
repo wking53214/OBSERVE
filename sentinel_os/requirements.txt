@@ -1,16 +1,8 @@
-fastapi==0.139.0
-starlette>=1.0.1  # CVE-2026-48710 (BadHost) fix floor -- pinned explicitly, not just via fastapi's transitive bound
+fastapi==0.104.1
 uvicorn==0.24.0
 psycopg2-binary==2.9.12
 anthropic==0.116.0
-httpx<0.28  # anthropic 0.116.0 breaks on client construction ("unexpected keyword argument 'proxies'") with httpx>=0.28
 pytest==7.4.0
 numpy>=2.1,<2.9
-pydantic>=2.9,<3  # fastapi 0.139.0 requires pydantic>=2.9.0
+pydantic==2.4.0
 python-dotenv==1.0.0
-opentelemetry-api>=1.20
-opentelemetry-sdk>=1.20
-opentelemetry-exporter-otlp-proto-grpc>=1.20  # only needed if OTEL_EXPORTER_OTLP_ENDPOINT is set
-redis==8.0.1
-httpx2==2.7.0
-cryptography>=41.0  # twin_custody.py: ECIES envelopes, Ed25519/X25519, AES-GCM, HKDF

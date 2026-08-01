@@ -1,0 +1,67 @@
+{
+  "L02_observed_trajectory": [
+    "pending",
+    "processing",
+    "scheduled",
+    "processing",
+    "done"
+  ],
+  "L06_concurrent_resubmits": {
+    "fresh_enqueues": 1,
+    "total": 20
+  },
+  "L07_submit_then_instant_poll": {
+    "pairs": 150,
+    "untrackable": 0
+  },
+  "L08_garbage_burst": {
+    "concurrent_callers": 300,
+    "garbage_422": 120,
+    "oversized_413": 30,
+    "post_burst_p95_s": 0.0467,
+    "valid_202": 150,
+    "valid_p50_s": 2.1861,
+    "valid_p99_s": 5.2996,
+    "wall_s": 13.194
+  },
+  "L09_after_10_dead": {
+    "all_202": true,
+    "submit_p95_s": 0.0523
+  },
+  "L10_stuck_job": {
+    "health_p99_s": 0.0953,
+    "health_samples": 18,
+    "others_done": 40,
+    "stuck_status": "processing"
+  },
+  "L11_frozen_redis": {
+    "all_503_honest": true,
+    "budget_s": 7.13,
+    "degraded_single_call_s": 2.043,
+    "health_baseline_single_s": 0.0379,
+    "health_probe_max_s": 0.1591,
+    "health_probe_p50_s": 0.0027,
+    "health_probe_samples": 166,
+    "queue_503_max_s": 3.182,
+    "queue_503_p50_s": 2.98
+  },
+  "L12_concurrency": {
+    "client_threads": 50,
+    "n": 200,
+    "overlap_factor": 44.7,
+    "p50_s": 1.9409,
+    "p99_s": 3.0589,
+    "serial_sum_s": 370.79,
+    "throughput_rps": 24.1,
+    "wall_s": 8.289
+  },
+  "L14_throughput_asyncio": {
+    "concurrency": 100,
+    "n": 500,
+    "p50_s": 0.5438,
+    "p99_s": 5.4139,
+    "rps": 82.0,
+    "wall_s": 6.095
+  },
+  "namespace": "tqtest_7d5cd4fe"
+}

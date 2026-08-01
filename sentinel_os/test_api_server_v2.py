@@ -243,28 +243,12 @@ def dump_metrics():
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def tc(redis_proc):
-    # Save prior values so this module-scoped fixture doesn't leak
-    # TRANSMISSION_REDIS_URL/TRANSMISSION_NAMESPACE into the rest of a
-    # full-suite pytest run -- an unrestored os.environ mutation here was
-    # observed to leak into test_queue_identity_converter.py's subprocess
-    # spawns (which build their env via os.environ.copy()), producing two
-    # false failures when both suites run in the same process.
-    _prior_redis_url = os.environ.get("TRANSMISSION_REDIS_URL")
-    _prior_namespace = os.environ.get("TRANSMISSION_NAMESPACE")
     os.environ["TRANSMISSION_REDIS_URL"] = REDIS_URL
     os.environ["TRANSMISSION_NAMESPACE"] = NAMESPACE
     from fastapi.testclient import TestClient
     import api_server_v2
     with TestClient(api_server_v2.app) as client:
         yield client
-    if _prior_redis_url is None:
-        os.environ.pop("TRANSMISSION_REDIS_URL", None)
-    else:
-        os.environ["TRANSMISSION_REDIS_URL"] = _prior_redis_url
-    if _prior_namespace is None:
-        os.environ.pop("TRANSMISSION_NAMESPACE", None)
-    else:
-        os.environ["TRANSMISSION_NAMESPACE"] = _prior_namespace
 
 
 def test_T01_missing_sid_is_422(tc):
@@ -343,24 +327,12 @@ def test_T10_ingress_never_imports_the_harness(tc):
 
     import api_server_v2  # already imported by the fixture
 
-    # 1) The ingress module's OWN namespace must not reference any of the
-    #    synchronous machinery. This checks what api_server_v2 itself bound
-    #    names to, not global sys.modules -- sys.modules is process-wide
-    #    state, so in a full-suite run an unrelated earlier test (e.g.
-    #    anything in Tests/ that imports governance.* for its own reasons)
-    #    leaves those modules loaded before this test ever runs, which is
-    #    not evidence the ingress imported them. Checking api_server_v2's
-    #    own module dict isolates "did the ingress's import chain pull this
-    #    in" from "is this loaded somewhere in the process."
+    # 1) Live module table: importing the ingress must not have loaded any of
+    #    the synchronous machinery into the process.
     forbidden_mods = ("production_harness", "resilient_harness", "sentinel_core")
-    bound = []
-    for name, val in vars(api_server_v2).items():
-        mod_name = getattr(val, "__name__", None)
-        if mod_name is None:
-            continue
-        if mod_name.split(".")[-1] in forbidden_mods or mod_name.startswith("governance"):
-            bound.append(f"{name} -> {mod_name}")
-    assert not bound, f"ingress namespace references forbidden modules: {bound}"
+    loaded = [m for m in sys.modules
+              if m.split(".")[-1] in forbidden_mods or m.startswith("governance")]
+    assert not loaded, f"ingress import pulled in forbidden modules: {loaded}"
 
     # 2) Structural (AST, so the docstring DESCRIBING the old breaker doesn't
     #    trip it): no import of the harness, no construction or naming of a
@@ -727,30 +699,7 @@ def test_L11_frozen_redis_health_stays_alive(ingress, redis_proc, drainer):
         assert not probe_bad, f"/health failed during freeze: {probe_bad[:5]}"
         h_lat = sorted(probe_lat)
         h_max = h_lat[-1]
-        # p99, not the bare max, against the tight 0.25s budget: with
-        # ~100-250 samples collected across the freeze window (0.025s
-        # polling interval against however long the 30-thread submit/poll
-        # load takes to drain), a single sample can land slow purely from
-        # ordinary thread/event-loop scheduling jitter under heavy
-        # concurrent load in a busy shared container -- that's noise, not
-        # evidence the server actually blocked on frozen Redis. A genuine
-        # regression (the health handler synchronously touching Redis and
-        # hanging with it) would show up as a CLUSTER of slow samples
-        # through the freeze window, which p99 still catches; one isolated
-        # spike among many samples does not fail the run. h_max is still
-        # asserted separately against a much higher ceiling so a true
-        # multi-second hang -- the actual failure mode this test exists to
-        # catch -- fails loudly regardless of how it distributes across
-        # samples.
-        h_p99 = h_lat[max(0, int(len(h_lat) * 0.99) - 1)]
-        assert h_p99 < 0.25, (
-            f"/health blocked by frozen Redis (p99={h_p99:.3f}s over "
-            f"{len(h_lat)} samples, max={h_max:.3f}s)"
-        )
-        assert h_max < 2.0, (
-            f"/health hit a hard hang under frozen Redis (max={h_max:.3f}s "
-            f"over {len(h_lat)} samples) -- this is not scheduling jitter"
-        )
+        assert h_max < 0.25, f"/health blocked by frozen Redis (max={h_max:.3f}s)"
 
         for group, outs in (("submit", submit_out), ("poll", poll_out)):
             for r, dt, err in outs:

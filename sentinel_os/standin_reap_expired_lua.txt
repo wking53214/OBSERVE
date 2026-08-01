@@ -1,0 +1,30 @@
+-- KEYS[1]=processing zset, KEYS[2]=pending list, KEYS[3]=dead list
+-- ARGV[1]=limit ARGV[2]=job key prefix
+-- Expired leases (worker crash/stall): rotate claim_token so zombie acks fence out,
+-- redeliver immediately unless attempts exhausted -> dead(process_crash_restart).
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, tonumber(ARGV[1]))
+local requeued, killed = 0, 0
+for _, id in ipairs(expired) do
+  local jk = ARGV[2] .. id
+  redis.call('ZREM', KEYS[1], id)
+  local attempts = tonumber(redis.call('HGET', jk, 'attempts') or '0')
+  local maxa = tonumber(redis.call('HGET', jk, 'max_attempts') or '1')
+  local trail = cjson.decode(redis.call('HGET', jk, 'error_trail') or '[]')
+  trail[#trail + 1] = {attempt = attempts, reason = 'process_crash_restart',
+    error = 'lease expired; worker presumed crashed or stalled', at = now}
+  while #trail > 20 do table.remove(trail, 1) end
+  redis.call('HSET', jk, 'error_trail', cjson.encode(trail), 'updated_at', now,
+    'claim_token', 'reaped:' .. now, 'last_error', 'lease expired')
+  if attempts >= maxa then
+    redis.call('HSET', jk, 'status', 'dead', 'dead_reason', 'process_crash_restart', 'died_at', now)
+    redis.call('RPUSH', KEYS[3], id)
+    killed = killed + 1
+  else
+    redis.call('HSET', jk, 'status', 'pending')
+    redis.call('RPUSH', KEYS[2], id)
+    requeued = requeued + 1
+  end
+end
+return {requeued, killed}

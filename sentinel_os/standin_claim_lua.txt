@@ -1,0 +1,14 @@
+-- KEYS[1]=pending list, KEYS[2]=processing zset
+-- ARGV[1]=worker_id ARGV[2]=lease_seconds ARGV[3]=claim_token ARGV[4]=job key prefix
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local id = redis.call('LPOP', KEYS[1])
+if not id then return nil end
+local jk = ARGV[4] .. id
+local attempts = tonumber(redis.call('HGET', jk, 'attempts') or '0') + 1
+local lease = now + tonumber(ARGV[2])
+redis.call('HSET', jk, 'status', 'processing', 'attempts', attempts,
+  'claimed_by', ARGV[1], 'claim_token', ARGV[3],
+  'lease_expires_at', lease, 'updated_at', now)
+redis.call('ZADD', KEYS[2], lease, id)
+return redis.call('HGETALL', jk)

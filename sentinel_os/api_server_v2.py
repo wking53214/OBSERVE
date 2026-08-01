@@ -125,26 +125,7 @@ logger = _project_logger("IngressV2")
 # lease policy belongs to queue_schema.py defaults and the worker.
 # --------------------------------------------------------------------------
 REDIS_URL = os.getenv("TRANSMISSION_REDIS_URL", "redis://localhost:6379/0")
-
-# Converter, not a handshake (F-J: the ingress and worker used to have
-# two INDEPENDENT queue-identity knobs -- TRANSMISSION_NAMESPACE here,
-# --queue-name/SENTINEL_QUEUE_NAME on the worker -- that had to be set
-# to values which happened to resolve to the same physical Redis key
-# prefix. With stock defaults on both sides they did NOT (confirmed
-# live: a submitted job sat at 'pending' forever, the worker polled an
-# empty keyspace, no error anywhere). A handshake would only catch that
-# mismatch after the fact, at startup. This removes the second knob
-# instead: SENTINEL_QUEUE_ID is the one shared identifier both
-# processes read by default. The worker's queue library (queue_schema.py)
-# already turns a bare name into prefix "sq:{name}" for its dialect;
-# the ingress derives the identical prefix here rather than taking an
-# independently-set raw namespace. TRANSMISSION_NAMESPACE remains as an
-# explicit escape hatch for direct dialect-level control (e.g. running
-# the ingress against a namespace with no worker attached at all), and
-# takes precedence when set -- but nobody has to remember to set it for
-# the common case to work.
-_QUEUE_ID = os.getenv("SENTINEL_QUEUE_ID", "v12")
-NAMESPACE = os.getenv("TRANSMISSION_NAMESPACE") or f"sq:{_QUEUE_ID}"
+NAMESPACE = os.getenv("TRANSMISSION_NAMESPACE", "tq")
 MAX_BODY_BYTES = int(os.getenv("INGRESS_MAX_BODY_BYTES", str(256 * 1024)))
 RETRY_AFTER_S = int(os.getenv("INGRESS_RETRY_AFTER_SECONDS", "5"))
 
@@ -178,29 +159,10 @@ if os.getenv("ICEBERG_API_KEYS") or _REQUIRE_KEYS:
                 f"imported ({exc}); refusing to start an open ingress."
             ) from exc
         logger.warning(f"ingress auth: api_key_auth unavailable ({exc}); starting OPEN")
-
-    # F-F: rate limiting keyed on validated caller identity, never
-    # connecting IP (this ingress sits behind nginx — one IP for every
-    # caller — and never on any payload-supplied identity). Attached
-    # ONLY here, alongside auth: without a validated principal there is
-    # no safe identity to bucket by, and falling back to IP for an
-    # unauthenticated deployment would silently reintroduce the exact
-    # shared-IP defect (F-F) this file exists to fix. Appended after
-    # the auth guard above so it always runs second: an unvalidated key
-    # 401/403s at require_api_key first and never reaches this bucket.
-    try:
-        from rate_limiter_v2 import rate_limit_v2  # type: ignore
-        INGRESS_GUARDS.append(Depends(rate_limit_v2))
-        logger.info("ingress rate limiting: rate_limiter_v2.rate_limit_v2 attached")
-    except Exception as exc:  # pragma: no cover - config error path
-        logger.warning(f"ingress rate limiting: rate_limiter_v2 unavailable ({exc}); starting WITHOUT it")
 else:
     logger.warning(
         "ingress auth: DISABLED (no ICEBERG_API_KEYS set) — dev mode only. "
-        "Set ICEBERG_API_KEYS=key:name to attach the existing guard. "
-        "Rate limiting (rate_limiter_v2) also does not attach in this mode: "
-        "there is no validated caller identity to bucket by without auth, "
-        "and bucketing by connecting IP behind nginx would reintroduce F-F."
+        "Set ICEBERG_API_KEYS=key:name to attach the existing guard."
     )
 
 # --------------------------------------------------------------------------
@@ -458,7 +420,7 @@ if __name__ == "__main__":
         kw["ssl_keyfile"] = os.environ["SSL_KEYFILE"]
     uvicorn.run(
         "api_server_v2:app",
-        host=os.getenv("INGRESS_HOST", "0.0.0.0"),  # nosec B104 -- overridable via INGRESS_HOST; 0.0.0.0 default is for containerized deployment
+        host=os.getenv("INGRESS_HOST", "0.0.0.0"),
         port=int(os.getenv("INGRESS_PORT", "8000")),
         workers=int(os.getenv("INGRESS_WORKERS", "1")),
         **kw,

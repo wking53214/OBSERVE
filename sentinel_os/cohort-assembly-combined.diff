@@ -1,0 +1,1519 @@
+diff --git a/sentinel_os/Tests/test_domain_from_cassette_version.py b/sentinel_os/Tests/test_domain_from_cassette_version.py
+new file mode 100644
+index 0000000..f7f02b8
+--- /dev/null
++++ b/sentinel_os/Tests/test_domain_from_cassette_version.py
+@@ -0,0 +1,31 @@
++"""domain_from_cassette_version is the one place the shipping path turns
++a cassette_version string into the domain cohort assembly groups by.
++cassette_version is always "domain:name:version"
++(cassette_schema.cassette_version_of) -- a fixed, code-generated format,
++never something a caller free-types -- so this is a structural parse, not
++a heuristic, and it is worth pinning down exactly.
++"""
++
++from twin_custody import domain_from_cassette_version
++
++
++def test_extracts_the_domain_segment():
++    assert domain_from_cassette_version("lending:underwriting_cassette:1.0.0") == "lending"
++
++
++def test_a_domain_can_itself_be_unambiguous_even_with_dots_or_dashes_in_name():
++    assert domain_from_cassette_version("insurance:auto-claims_v2:3.1.4") == "insurance"
++
++
++def test_missing_cassette_version_returns_none_not_a_fabricated_label():
++    assert domain_from_cassette_version(None) is None
++    assert domain_from_cassette_version("") is None
++
++
++def test_a_malformed_string_with_no_colon_is_not_silently_treated_as_a_domain():
++    """A string that doesn't match the domain:name:version shape at all
++    still returns something (everything up to the first, absent, colon is
++    the whole string) -- this is a deliberate, honest parse of what's
++    there, not a validity check. bind_cassette_version is what enforces
++    the real shape; this helper only extracts."""
++    assert domain_from_cassette_version("not_a_real_cassette_version") == "not_a_real_cassette_version"
+diff --git a/sentinel_os/Tests/test_obligation_sweep.py b/sentinel_os/Tests/test_obligation_sweep.py
+new file mode 100644
+index 0000000..6002b8f
+--- /dev/null
++++ b/sentinel_os/Tests/test_obligation_sweep.py
+@@ -0,0 +1,352 @@
++"""Cohort assembly: the return path C2 dimensions 4 and 5 have been
++structurally waiting for since to_cohort_decision existed with nothing
++scheduling the sweep that calls it.
++
++Pure logic (bucketing, assembly, review packaging) is tested here with
++no I/O at all. The I/O wrappers (fetch_resolved_obligations,
++fetch_group_distributions, fetch_decision_materials, sweep) are tested
++against a real twin instance, a real sealed channel, and a real ledger
++-- same posture as the rest of this suite: no mocked governance code.
++
++check_statistical_outcome_equity and check_correlation_based_proxy_detection's
++own statistical logic (four-fifths math, Pearson correlation, the
++80%-threshold) is already proven in test_c2_statistical_outcome_equity.py
++and its sibling files. This file is about whether obligation_sweep wires
++resolved obligations into those checks correctly -- not re-proving the
++statistics.
++"""
++
++import base64
++import uuid
++
++import psycopg2
++import pytest
++from fastapi.testclient import TestClient
++
++from governance.ledger_postgres import GovernanceDecisionRecord
++from obligation_sweep import (
++    assemble_cohort,
++    bucket_resolved_obligations,
++    cohort_key,
++    fetch_decision_materials,
++    fetch_group_distributions,
++    fetch_resolved_obligations,
++    review_cohort,
++    subject_of,
++    sweep,
++)
++from regulatory_cassettes.cfpb_reg_b import CFPB_REG_B_PROFILE
++from sealed_demographic_channel import SOURCE_BISG_ESTIMATED, SealedDemographicChannel
++
++DSN = "host=localhost dbname=iceberg user=iceberg password=iceberg"
++PG_KWARGS = dict(host="localhost", dbname="iceberg", user="iceberg", password="iceberg")
++
++
++def _pg_available() -> bool:
++    try:
++        psycopg2.connect(DSN + " connect_timeout=2").close()
++        return True
++    except Exception:
++        return False
++
++
++pytestmark = pytest.mark.skipif(
++    not _pg_available(),
++    reason="obligation_sweep tests need PostgreSQL (iceberg/iceberg@localhost)")
++
++
++# ---------------------------------------------------------------------------
++# Pure logic: cohort_key, bucket_resolved_obligations, subject_of.
++# ---------------------------------------------------------------------------
++
++def _resolved(obligation_id, domain, obligation_kind, decision_hash,
++             favorable=True, subject_id=None, resolved_value=None):
++    return {
++        "obligation_id": obligation_id, "domain": domain,
++        "obligation_kind": obligation_kind, "decision_hash": decision_hash,
++        "state": "RESOLVED", "favorable": favorable, "subject_id": subject_id,
++        "resolved_value": resolved_value or {"status": "x"},
++        "resolved_at": 1_700_000_000.0, "resolution_provenance": "verified",
++        "resolution_method": None, "opened_at": 1_600_000_000.0,
++        "expected_by": 1_700_000_000.0, "reason_code": None, "detail": {},
++    }
++
++
++def test_cohort_key_groups_by_domain_and_obligation_kind():
++    assert cohort_key(_resolved("o1", "lending", "loan_performance", "h1")) == \
++        ("lending", "loan_performance")
++
++
++def test_cohort_key_falls_back_to_unknown_when_absent():
++    assert cohort_key({}) == ("unknown", "unknown")
++
++
++def test_bucket_groups_two_domains_sharing_an_obligation_kind_separately():
++    obligations = [
++        _resolved("o1", "lending", "loan_performance", "h1"),
++        _resolved("o2", "insurance", "loan_performance", "h2"),
++        _resolved("o3", "lending", "loan_performance", "h3"),
++    ]
++    buckets = bucket_resolved_obligations(obligations)
++    assert set(buckets) == {("lending", "loan_performance"),
++                            ("insurance", "loan_performance")}
++    assert len(buckets[("lending", "loan_performance")]) == 2
++    assert len(buckets[("insurance", "loan_performance")]) == 1
++
++
++def test_bucket_refuses_a_non_resolved_obligation():
++    obligation = _resolved("o1", "lending", "loan_performance", "h1")
++    obligation["state"] = "OPEN"
++    with pytest.raises(ValueError, match="non-RESOLVED"):
++        bucket_resolved_obligations([obligation])
++
++
++def test_subject_of_prefers_subject_id_when_present():
++    obligation = _resolved("o1", "lending", "loan_performance", "h1",
++                           subject_id="applicant-42")
++    assert subject_of(obligation) == "applicant-42"
++
++
++def test_subject_of_falls_back_to_decision_hash():
++    obligation = _resolved("o1", "lending", "loan_performance", "h1")
++    assert subject_of(obligation) == "h1"
++
++
++# ---------------------------------------------------------------------------
++# Pure logic: assemble_cohort. No I/O -- distributions/materials are
++# handed in directly.
++# ---------------------------------------------------------------------------
++
++def test_assemble_cohort_builds_both_dimension_cohorts_when_everything_is_on_file():
++    from regulatory_cassette_interface import DecisionMaterial
++
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
++    distributions = {"h1": {"white": 0.6, "black": 0.4}}
++    materials = {"h1": DecisionMaterial(
++        subject_id="h1", domain="lending", reasons=(), input_fields={"income": 50000},
++        mismatched_fields=(), outcome={"approved": True}, source="ledger")}
++    assembled = assemble_cohort("lending", "loan_performance", obligations,
++                                distributions, materials)
++    assert len(assembled.dimension_4_cohort) == 1
++    assert len(assembled.dimension_5_cohort) == 1
++    assert assembled.skipped == []
++    assert assembled.total_resolved == 1
++
++
++def test_assemble_cohort_skips_an_obligation_with_no_group_distribution():
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
++    assembled = assemble_cohort("lending", "loan_performance", obligations, {}, {})
++    assert assembled.dimension_4_cohort == []
++    assert assembled.dimension_5_cohort == []
++    assert len(assembled.skipped) == 1
++    assert "no protected-characteristic estimate" in assembled.skipped[0].reason
++
++
++def test_assemble_cohort_skips_a_genuinely_ambiguous_resolution_for_dimension_4_only():
++    """favorable=None is a real, legitimate resolution (to_cohort_decision
++    refuses to coerce it) -- it should drop out of dimension 4 but can
++    still enter dimension 5, which only needs input_fields, not a
++    favorable call."""
++    from regulatory_cassette_interface import DecisionMaterial
++
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1", favorable=None)]
++    distributions = {"h1": {"white": 0.6, "black": 0.4}}
++    materials = {"h1": DecisionMaterial(
++        subject_id="h1", domain="lending", reasons=(), input_fields={"income": 50000},
++        mismatched_fields=(), outcome={}, source="ledger")}
++    assembled = assemble_cohort("lending", "loan_performance", obligations,
++                                distributions, materials)
++    assert assembled.dimension_4_cohort == []
++    assert len(assembled.dimension_5_cohort) == 1
++    assert len(assembled.skipped) == 1
++    assert "dimension 4" in assembled.skipped[0].reason
++
++
++def test_assemble_cohort_admits_dimension_4_without_dimension_5():
++    """The reverse of the above: a real favorable call with a
++    distribution, but no decision material -- dimension 4 gets it,
++    dimension 5 reports why it doesn't."""
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
++    distributions = {"h1": {"white": 0.6, "black": 0.4}}
++    assembled = assemble_cohort("lending", "loan_performance", obligations,
++                                distributions, {})
++    assert len(assembled.dimension_4_cohort) == 1
++    assert assembled.dimension_5_cohort == []
++    assert len(assembled.skipped) == 1
++    assert "dimension 5" in assembled.skipped[0].reason
++
++
++def test_assemble_cohort_uses_subject_id_to_look_up_distribution_when_present():
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1",
++                             subject_id="applicant-42")]
++    distributions = {"applicant-42": {"white": 0.6, "black": 0.4}}
++    assembled = assemble_cohort("lending", "loan_performance", obligations,
++                                distributions, {})
++    assert len(assembled.dimension_4_cohort) == 1
++    assert assembled.dimension_4_cohort[0].subject_id == "applicant-42"
++
++
++# ---------------------------------------------------------------------------
++# Pure logic: review_cohort. Real check functions, small (sub-30) cohorts
++# to prove INDETERMINATE wiring -- the checks' own statistical logic is
++# proven elsewhere.
++# ---------------------------------------------------------------------------
++
++def test_review_cohort_reports_indeterminate_below_minimum_size():
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
++    distributions = {"h1": {"white": 0.6, "black": 0.4}}
++    assembled = assemble_cohort("lending", "loan_performance", obligations,
++                                distributions, {})
++    review = review_cohort(assembled, CFPB_REG_B_PROFILE)
++    assert review.dimension_4_cohort_size == 1
++    assert len(review.dimension_4_findings) == 1
++    assert review.dimension_4_findings[0]["classification"] == \
++        "indeterminate_insufficient_cohort"
++    # dimension 5 cohort is empty (no decision material) -- its own
++    # size gate reports indeterminate for the same reason, size 0.
++    assert review.dimension_5_cohort_size == 0
++    assert len(review.dimension_5_findings) == 1
++
++
++def test_review_cohort_as_dict_is_json_safe_and_carries_skips():
++    obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
++    assembled = assemble_cohort("lending", "loan_performance", obligations, {}, {})
++    review = review_cohort(assembled, CFPB_REG_B_PROFILE)
++    payload = review.as_dict()
++    assert payload["domain"] == "lending"
++    assert payload["obligation_kind"] == "loan_performance"
++    assert payload["total_resolved"] == 1
++    assert payload["skipped"] == [
++        {"obligation_id": "o1",
++         "reason": "no protected-characteristic estimate on file for this subject"}]
++    import json
++    json.dumps(payload)  # must not raise
++
++
++# ---------------------------------------------------------------------------
++# I/O wrappers, against real infrastructure.
++# ---------------------------------------------------------------------------
++
++_ENVELOPE = {
++    "v": 1, "alg": "x25519-aesgcm", "recipient_fp": "fp",
++    "epk": base64.b64encode(b"\x01" * 32).decode(),
++    "nonce": base64.b64encode(b"\x02" * 12).decode(),
++    "ct": base64.b64encode(b"\x03" * 32).decode(),
++}
++
++
++@pytest.fixture
++def twin():
++    from twin_receiver import build_app
++    client = TestClient(build_app(DSN, site="test"))
++    rid = f"sweep-{uuid.uuid4().hex[:10]}"
++    resp = client.post(f"/replica/{rid}/register", json={
++        "custody_model": "A", "recipient_pub": "x", "recipient_fp": "fp",
++        "customer_sign_pub": "y", "ship_token": "tok"})
++    assert resp.status_code == 200, resp.text
++    client.replica_id = rid
++    client.ship = {"Authorization": "Bearer tok"}
++    return client
++
++
++@pytest.fixture
++def channel():
++    return SealedDemographicChannel(
++        **PG_KWARGS, runtime_user="sealed_channel_writer",
++        runtime_password="sweep_test_pw")
++
++
++def _ship_and_resolve(twin, primary_id, domain, decision_hash, favorable=True):
++    twin.post(f"/replica/{twin.replica_id}/entries", json={
++        "primary_id": primary_id,
++        "previous_hash": "genesis" if primary_id == 1 else f"h{primary_id - 1}",
++        "current_hash": decision_hash, "envelope": _ENVELOPE,
++        "outcome_obligation": "loan_performance@24mo",
++        "decided_at": 1_700_000_000.0, "domain": domain,
++    }, headers=twin.ship)
++    twin.post(f"/replica/{twin.replica_id}/obligations/derive")
++    obligations = twin.get(f"/replica/{twin.replica_id}/obligations").json()["obligations"]
++    oid = next(o["obligation_id"] for o in obligations if o["decision_hash"] == decision_hash)
++    twin.post(f"/replica/{twin.replica_id}/obligations/{oid}/transition", json={
++        "state": "RESOLVED", "resolved_at": 1_700_100_000.0,
++        "resolved_value": {"status": "paid"}, "provenance": "verified",
++        "favorable": favorable,
++    })
++    return oid
++
++
++def test_fetch_resolved_obligations_filters_to_resolved_only(twin):
++    _ship_and_resolve(twin, 1, "lending", "h1")
++    twin.post(f"/replica/{twin.replica_id}/entries", json={
++        "primary_id": 2, "previous_hash": "h1", "current_hash": "h2",
++        "envelope": _ENVELOPE, "outcome_obligation": "loan_performance@24mo",
++        "decided_at": 1_700_000_000.0, "domain": "lending",
++    }, headers=twin.ship)
++    twin.post(f"/replica/{twin.replica_id}/obligations/derive")  # h2 stays OPEN
++    resolved = fetch_resolved_obligations(twin, twin.replica_id)
++    assert len(resolved) == 1
++    assert resolved[0]["decision_hash"] == "h1"
++
++
++def test_fetch_group_distributions_looks_up_each_subject(channel):
++    channel.record_estimate("h1", SOURCE_BISG_ESTIMATED, {"white": 0.7, "black": 0.3})
++    result = fetch_group_distributions(channel, {"h1", "h2"})
++    assert result == {"h1": {"white": 0.7, "black": 0.3}}  # h2 absent, not an error
++
++
++def test_fetch_decision_materials_looks_up_by_hash(test_ledger):
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="lending:test_cassette:1.0.0",
++        input_data={"income": 60000}, policy_parameters={"min_income": 40000}, reasoning="qualifies",
++        output={"approved": True},
++    ))
++    entries = test_ledger.get_entries(limit=1)
++    decision_hash = entries[0]["current_hash"]
++    conn = test_ledger.pool.getconn()
++    try:
++        materials = fetch_decision_materials(conn, {decision_hash, "not-a-real-hash"})
++    finally:
++        test_ledger.pool.putconn(conn)
++    assert set(materials) == {decision_hash}
++    assert materials[decision_hash].input_fields == {"income": 60000}
++
++
++def test_sweep_end_to_end_produces_one_review_per_cohort(twin, channel, test_ledger):
++    """Full wiring: ship two decisions in two different domains, resolve
++    both obligations, record a demographic estimate for one, and confirm
++    sweep() produces one CohortEquityReview per (domain, obligation_kind)
++    bucket -- proving fetch -> bucket -> assemble -> review runs
++    end-to-end without needing a 30-row cohort to prove it."""
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="lending:test_cassette:1.0.0",
++        input_data={"income": 60000}, policy_parameters={"min_income": 40000}, reasoning="qualifies",
++        output={"approved": True}, outcome_obligation="loan_performance@24mo",
++    ))
++    lending_hash = test_ledger.get_entries(limit=1)[0]["current_hash"]
++    _ship_and_resolve(twin, 1, "lending", lending_hash, favorable=True)
++
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="insurance:test_cassette:1.0.0",
++        input_data={"claims": 2}, policy_parameters={"max_claims": 5}, reasoning="qualifies",
++        output={"approved": False}, outcome_obligation="loan_performance@24mo",
++    ))
++    insurance_hash = test_ledger.get_entries(limit=1)[0]["current_hash"]
++    _ship_and_resolve(twin, 2, "insurance", insurance_hash, favorable=False)
++
++    channel.record_estimate(lending_hash, SOURCE_BISG_ESTIMATED, {"white": 0.7, "black": 0.3})
++    channel.record_estimate(insurance_hash, SOURCE_BISG_ESTIMATED, {"white": 0.5, "black": 0.5})
++
++    conn = test_ledger.pool.getconn()
++    try:
++        reviews = sweep(twin, twin.replica_id, conn, channel, CFPB_REG_B_PROFILE)
++    finally:
++        test_ledger.pool.putconn(conn)
++
++    assert len(reviews) == 2
++    keys = {(r.domain, r.obligation_kind) for r in reviews}
++    assert keys == {("lending", "loan_performance"), ("insurance", "loan_performance")}
++    for review in reviews:
++        assert review.total_resolved == 1
++        assert review.dimension_4_cohort_size == 1
++        assert review.dimension_5_cohort_size == 1
++        assert review.skipped == []
+diff --git a/sentinel_os/Tests/test_twin_cohort_reviews.py b/sentinel_os/Tests/test_twin_cohort_reviews.py
+new file mode 100644
+index 0000000..fbb735f
+--- /dev/null
++++ b/sentinel_os/Tests/test_twin_cohort_reviews.py
+@@ -0,0 +1,162 @@
++"""cohort_review_ledger: the twin's tamper-evident store for
++obligation_sweep.py's output. The twin never computes a
++cohort_equity_review -- see obligation_sweep's module docstring -- it
++only receives and chain-links what the primary already computed, same
++posture as every other record kind here.
++"""
++
++import uuid
++
++import psycopg2
++import pytest
++from fastapi.testclient import TestClient
++
++DSN = "host=localhost dbname=iceberg user=iceberg password=iceberg"
++
++
++def _pg_available() -> bool:
++    try:
++        psycopg2.connect(DSN + " connect_timeout=2").close()
++        return True
++    except Exception:
++        return False
++
++
++pytestmark = pytest.mark.skipif(
++    not _pg_available(),
++    reason="cohort review store needs PostgreSQL (iceberg/iceberg@localhost)")
++
++
++@pytest.fixture
++def twin():
++    from twin_receiver import build_app
++
++    client = TestClient(build_app(DSN, site="test"))
++    rid = f"review-{uuid.uuid4().hex[:10]}"
++    resp = client.post(f"/replica/{rid}/register", json={
++        "custody_model": "A", "recipient_pub": "x", "recipient_fp": "fp",
++        "customer_sign_pub": "y", "ship_token": "tok"})
++    assert resp.status_code == 200, resp.text
++    client.replica_id = rid
++    return client
++
++
++def _review(domain="lending", obligation_kind="loan_performance",
++           dimension_4_findings=None, swept_at=1_700_000_000.0):
++    return {
++        "domain": domain, "obligation_kind": obligation_kind,
++        "total_resolved": 1, "dimension_4_cohort_size": 1,
++        "dimension_5_cohort_size": 0,
++        "dimension_4_findings": dimension_4_findings or [
++            {"check": "statistical_outcome_equity", "subject_id": "cohort:1",
++             "regulation": "reg_b", "action": "flag",
++             "classification": "indeterminate_insufficient_cohort",
++             "score": 0.0, "evidence": {}}],
++        "dimension_5_findings": [],
++        "skipped": [], "swept_at": swept_at,
++    }
++
++
++def test_a_review_is_stored_and_returns_seq_one(twin):
++    resp = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["seq"] == 1
++    assert resp.json()["curr_hash"]
++
++
++def test_a_missing_required_field_is_rejected(twin):
++    body = _review()
++    del body["dimension_4_findings"]
++    resp = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=body)
++    assert resp.status_code == 422
++    assert "dimension_4_findings" in resp.json()["detail"]
++
++
++def test_storing_against_an_unregistered_replica_is_refused(twin):
++    resp = twin.post("/replica/never-registered/cohort-reviews", json=_review())
++    assert resp.status_code == 404
++
++
++def test_reviews_chain_by_sequence(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="lending"))
++    second = twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++                       json=_review(domain="insurance"))
++    assert second.json()["seq"] == 2
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT seq, prev_hash, curr_hash FROM cohort_review_ledger
++                           WHERE replica_id=%s ORDER BY seq ASC""", (twin.replica_id,))
++            rows = cur.fetchall()
++    assert rows[0][1] == "genesis"
++    assert rows[1][1] == rows[0][2]  # second row's prev_hash == first row's curr_hash
++
++
++def test_two_reviews_that_differ_only_in_findings_hash_differently(twin):
++    resp_a = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(
++        dimension_4_findings=[{"check": "x", "subject_id": "s", "regulation": "r",
++                               "action": "flag", "classification": "pass",
++                               "score": 0.0, "evidence": {}}]))
++    resp_b = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(
++        dimension_4_findings=[{"check": "x", "subject_id": "s", "regulation": "r",
++                               "action": "flag", "classification": "flag",
++                               "score": 1.0, "evidence": {}}]))
++    assert resp_a.json()["curr_hash"] != resp_b.json()["curr_hash"]
++
++
++def test_reviews_are_never_updated_in_place(twin):
++    """Append-only: a re-sweep of the same cohort is a new row, not an
++    overwrite of the last one, so the history of what a cohort looked
++    like at each sweep survives."""
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews").json()["reviews"]
++    assert len(listed) == 2
++    assert listed[0]["seq"] == 1
++    assert listed[1]["seq"] == 2
++
++
++def test_listing_filters_by_domain(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="lending"))
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="insurance"))
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews",
++                      params={"domain": "lending"}).json()["reviews"]
++    assert len(listed) == 1
++    assert listed[0]["domain"] == "lending"
++
++
++def test_listing_filters_by_obligation_kind(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++             json=_review(obligation_kind="loan_performance"))
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++             json=_review(obligation_kind="coverage_performance"))
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews",
++                      params={"obligation_kind": "coverage_performance"}).json()["reviews"]
++    assert len(listed) == 1
++    assert listed[0]["obligation_kind"] == "coverage_performance"
++
++
++def test_the_cohort_review_table_is_not_obligation_ledger(twin):
++    """A cohort review is not an obligation and doesn't share its
++    state machine -- posting a review must not touch obligation_ledger
++    at all."""
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    obligations = twin.get(f"/replica/{twin.replica_id}/obligations").json()["obligations"]
++    assert obligations == []
++
++
++def test_record_reviews_wires_obligation_sweep_output_into_the_twin(twin):
++    """obligation_sweep.record_reviews posts a CohortEquityReview
++    straight through -- the shape review.as_dict() produces must match
++    what this endpoint actually requires."""
++    from obligation_sweep import CohortEquityReview, record_reviews
++
++    review = CohortEquityReview(
++        domain="lending", obligation_kind="loan_performance", total_resolved=5,
++        dimension_4_cohort_size=5, dimension_5_cohort_size=3,
++        dimension_4_findings=[], dimension_5_findings=[], skipped=[])
++    results = record_reviews(twin, twin.replica_id, [review], swept_at=1_700_000_000.0)
++    assert len(results) == 1
++    assert results[0]["seq"] == 1
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews").json()["reviews"]
++    assert listed[0]["total_resolved"] == 5
++    assert listed[0]["dimension_5_cohort_size"] == 3
+diff --git a/sentinel_os/Tests/test_twin_outcome_obligations.py b/sentinel_os/Tests/test_twin_outcome_obligations.py
+index 04c6aea..ef05045 100644
+--- a/sentinel_os/Tests/test_twin_outcome_obligations.py
++++ b/sentinel_os/Tests/test_twin_outcome_obligations.py
+@@ -66,7 +66,8 @@ def twin():
+     return client
+ 
+ 
+-def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None):
++def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None,
++         domain=None):
+     body = {
+         "primary_id": primary_id,
+         "previous_hash": "genesis" if primary_id == 1 else f"h{primary_id - 1}",
+@@ -74,6 +75,7 @@ def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None)
+         "envelope": _ENVELOPE,
+         "outcome_obligation": declaration,
+         "decided_at": decided_at,
++        "domain": domain,
+     }
+     resp = twin.post(f"/replica/{twin.replica_id}/entries", json=body,
+                      headers=twin.ship)
+@@ -159,6 +161,57 @@ def test_the_obligation_chain_links(twin):
+     assert rows[1][1] == rows[0][2]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Domain: shipped in the clear alongside outcome_obligation/decided_at,
++# so cohort assembly can group obligations by business line rather than by
++# obligation_kind alone -- two unrelated cassettes could legitimately pick
++# the same obligation_kind string.
++# ---------------------------------------------------------------------------
++
++def test_a_shipped_domain_is_derived_onto_the_obligation(twin):
++    _ship(twin, 1, "loan_performance@24mo", domain="lending")
++    _derive(twin)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["domain"] == "lending"
++
++
++def test_domain_falls_back_to_obligation_kind_when_not_shipped(twin):
++    """A row shipped before this fix existed (or by an older shipper)
++    carries no domain. Rather than deriving nothing, or fabricating a
++    domain, the obligation still opens -- with obligation_kind standing in,
++    the same value it would have had if domain never existed as a concept.
++    Nothing regresses for a shipper that hasn't been upgraded yet."""
++    _ship(twin, 1, "loan_performance@24mo", domain=None)
++    _derive(twin)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["domain"] == "loan_performance"
++
++
++def test_two_domains_sharing_an_obligation_kind_stay_distinguishable(twin):
++    """The whole point of shipping domain separately: two cassettes in
++    different business lines that happen to declare the same
++    obligation_kind string produce obligations that are still
++    distinguishable by domain, not silently merged."""
++    _ship(twin, 1, "loan_performance@24mo", domain="lending", current_hash="h1")
++    _ship(twin, 2, "loan_performance@24mo", domain="insurance", current_hash="h2")
++    _derive(twin)
++    domains = {o["domain"] for o in _list(twin)["obligations"]}
++    assert domains == {"lending", "insurance"}
++
++
++def test_changing_domain_on_redelivery_is_refused(twin):
++    """Same immutability rule as outcome_obligation: a redelivery that
++    would change the domain a prior entry declared is a rewrite of
++    history already in the customer's custody, and is refused outright."""
++    _ship(twin, 1, "loan_performance@24mo", domain="lending")
++    resp = twin.post(f"/replica/{twin.replica_id}/entries", json={
++        "primary_id": 1, "previous_hash": "genesis", "current_hash": "h1",
++        "envelope": _ENVELOPE, "outcome_obligation": "loan_performance@24mo",
++        "decided_at": NOW, "domain": "insurance",
++    }, headers=twin.ship)
++    assert resp.status_code == 409
++
++
+ # ---------------------------------------------------------------------------
+ # Overdue is computed here too, never stored.
+ # ---------------------------------------------------------------------------
+@@ -207,6 +260,118 @@ def test_a_resolution_is_recorded_with_its_provenance(twin):
+     assert _list(twin)["summary"]["RESOLVED"] == 1
+ 
+ 
++# ---------------------------------------------------------------------------
++# Regression: a resolution's own content (favorable, resolved_value, etc.)
++# used to be computed and validated but never actually written to the
++# ledger row or the hash chain -- the twin could say RESOLVED but not say
++# how. Cohort assembly needs exactly these fields, so they must round-trip.
++# ---------------------------------------------------------------------------
++
++def test_a_resolution_favorable_call_round_trips_through_the_twin(twin):
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "paid_in_full"},
++               provenance="verified", favorable=True, method=None)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["favorable"] is True
++    assert obligation["resolved_value"] == {"status": "paid_in_full"}
++    assert obligation["resolved_at"] == NOW + 730 * DAY
++    assert obligation["resolution_provenance"] == "verified"
++
++
++def test_a_genuinely_ambiguous_resolution_keeps_favorable_none(twin):
++    """A resolution can legitimately resolve to neither true nor false --
++    to_cohort_decision refuses to coerce that into a bool, so the twin has
++    to preserve the None, not silently drop the whole field."""
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "loan_sold_to_third_party"},
++               provenance="attested", favorable=None,
++               method="unresolvable_after_sale")
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["favorable"] is None
++    assert obligation["resolution_method"] == "unresolvable_after_sale"
++
++
++def test_an_estimated_resolution_persists_its_method(twin):
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "charged_off"},
++               provenance="estimated", favorable=False,
++               method="servicer_bulk_file_reconciliation")
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["resolution_method"] == "servicer_bulk_file_reconciliation"
++
++
++def test_the_resolution_fields_are_covered_by_the_hash_chain(twin):
++    """Not just stored -- tamper-evident. Two otherwise-identical
++    resolutions that disagree on favorable must produce different
++    curr_hash values, or an operator could edit favorable in place
++    without the chain noticing."""
++    oid_a = _one(twin)
++    _transition(twin, oid_a, state="RESOLVED",
++               resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "x"},
++               provenance="verified", favorable=True)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT curr_hash FROM obligation_ledger
++                           WHERE replica_id=%s AND obligation_id=%s
++                           ORDER BY seq DESC LIMIT 1""",
++                       (twin.replica_id, oid_a))
++            hash_favorable_true = cur.fetchone()[0]
++    # A second, independent obligation resolved the same way except for
++    # the favorable call -- same replica, same declared facts otherwise.
++    _ship(twin, 2, "loan_performance@24mo", current_hash="h2")
++    _derive(twin)
++    oid_b = [o["obligation_id"] for o in _list(twin)["obligations"]
++            if o["obligation_id"] != oid_a][0]
++    _transition(twin, oid_b, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "x"}, provenance="verified",
++               favorable=False)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT curr_hash FROM obligation_ledger
++                           WHERE replica_id=%s AND obligation_id=%s
++                           ORDER BY seq DESC LIMIT 1""",
++                       (twin.replica_id, oid_b))
++            hash_favorable_false = cur.fetchone()[0]
++    assert hash_favorable_true != hash_favorable_false
++
++
++def test_resolution_fields_absent_from_the_hash_when_not_present(twin):
++    """Backward compatibility, scoped correctly: the FIVE RESOLUTION fields
++    (favorable, resolved_value, resolved_at, resolution_provenance,
++    resolution_method) enter the hashed payload only when present, so an
++    OPEN-state row -- where all five are still None -- hashes with none of
++    them. domain is NOT part of that backward-compat set: it's a required
++    field on every obligation from this fix forward, so it's always in the
++    payload, including on this OPEN row (falling back to rule.kind, since
++    this ship didn't declare a domain)."""
++    _ship(twin, 1, "loan_performance@24mo")
++    _derive(twin)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT obligation_id, prev_hash, curr_hash
++                           FROM obligation_ledger WHERE replica_id=%s""",
++                       (twin.replica_id,))
++            obligation_id, prev_hash, curr_hash = cur.fetchone()
++    import hashlib
++    from twin_custody import canonical_json
++    expected_payload = {
++        "replica_id": twin.replica_id, "seq": 1,
++        "obligation_id": obligation_id,
++        "decision_hash": "h1",
++        "declaration": "loan_performance@24mo",
++        "domain": "loan_performance",  # no domain shipped -> falls back to rule.kind
++        "obligation_kind": "loan_performance",
++        "opened_at": NOW, "expected_by": NOW + 720 * DAY,
++        "state": "OPEN", "reason_code": "not_yet_due",
++        "prev_hash": prev_hash,
++    }
++    assert curr_hash == hashlib.sha256(canonical_json(expected_payload)).hexdigest()
++
++
+ def test_an_estimated_resolution_without_a_method_is_refused(twin):
+     oid = _one(twin)
+     resp = _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
+diff --git a/sentinel_os/obligation_sweep.py b/sentinel_os/obligation_sweep.py
+new file mode 100644
+index 0000000..2836916
+--- /dev/null
++++ b/sentinel_os/obligation_sweep.py
+@@ -0,0 +1,374 @@
++"""
++obligation_sweep.py -- the return path for resolved obligations.
++
++WHERE THIS RUNS, AND WHY
++-------------------------
++This runs on the PRIMARY, not the twin. Two different things a cohort
++review needs live in two different places:
++
++  - Obligation RESOLUTION STATE (favorable/not, when it resolved) lives
++    on the twin, per outcome_v1's own design: obligations are the
++    twin's independent record of what is owed and how it turned out.
++  - Decision INPUT FIELDS (needed for dimension 5's proxy-correlation
++    screen) already live durably on the primary's own ledger, via
++    regulatory_cassette_interface.material_from_ledger_row.
++
++The twin never computes a cassette's judgment itself anywhere else in
++this codebase -- it receives and independently verifies. Shipping raw
++decision input fields to the twin in the clear just to let it compute
++dimension 5 there would be a much bigger, more sensitive data-sharing
++change than domain ever was (input fields can be real applicant data,
++not a business-line label), and would break that pattern. So: this
++module reads resolved obligations FROM the twin's existing read API,
++reads input fields from the primary's own ledger, computes both C2
++findings here, and the result is handed to the twin's cohort-review
++endpoint afterward purely for tamper-evident storage -- the twin still
++never computes anything, only stores and can independently re-verify.
++
++WHAT COUNTS AS A COHORT
++------------------------
++(domain, obligation_kind), not obligation_kind alone. Two unrelated
++cassettes can legitimately choose the same obligation_kind string
++("loan_performance" means something different to two different
++lenders using two different cassettes); domain is what keeps their
++cohorts from silently merging. See twin_receiver.py's domain field and
++twin_custody.domain_from_cassette_version for how domain gets to the
++twin in the first place.
++
++NO SILENT SKIPS
++----------------
++An obligation that can't enter a cohort test -- no protected-
++characteristic estimate on file, resolved but genuinely ambiguous, no
++decision material found -- is reported in the review's `skipped` list
++with why, never quietly dropped from the count. A cohort too small to
++test (see MIN_COHORT_SIZE_FOR_STATISTICAL_TEST) is not filtered out
++before the checks run; check_statistical_outcome_equity and
++check_correlation_based_proxy_detection each report their own
++INDETERMINATE finding for that case, which is itself the honest answer
++and belongs in the review, not a bucket that silently never appears.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Mapping, Set, Tuple
++
++import psycopg2.extras
++
++from outcome_v1 import (
++    OUTCOME_RESOLVED,
++    OutcomeIntegrityError,
++    OutcomeObligation,
++    to_cohort_decision,
++)
++from regulatory_cassette_interface import DecisionMaterial, material_from_ledger_row
++from regulatory_checks import (
++    CohortDecision,
++    CohortInputDecision,
++    RegulationCheckProfile,
++    check_correlation_based_proxy_detection,
++    check_statistical_outcome_equity,
++)
++
++# ---------------------------------------------------------------------------
++# Bucketing: pure, no I/O.
++# ---------------------------------------------------------------------------
++
++
++def cohort_key(obligation: Mapping[str, Any]) -> Tuple[str, str]:
++    """The bucket a resolved obligation belongs to."""
++    return (str(obligation.get("domain") or "unknown"),
++            str(obligation.get("obligation_kind") or "unknown"))
++
++
++def bucket_resolved_obligations(
++        obligations: List[Mapping[str, Any]],
++        ) -> Dict[Tuple[str, str], List[Mapping[str, Any]]]:
++    """Group RESOLVED obligations by (domain, obligation_kind).
++
++    Refuses (does not silently filter) an obligation that isn't
++    RESOLVED -- the caller is expected to have already filtered to
++    RESOLVED (fetch_resolved_obligations does this against the twin);
++    receiving a non-RESOLVED one here means the caller's filter is
++    broken, and that is cheaper to catch here than downstream where
++    to_cohort_decision would refuse it with a less specific error.
++    """
++    buckets: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {}
++    for obligation in obligations:
++        if obligation.get("state") != OUTCOME_RESOLVED:
++            raise ValueError(
++                f"bucket_resolved_obligations received a non-RESOLVED "
++                f"obligation ({obligation.get('obligation_id')!r}, state="
++                f"{obligation.get('state')!r}) -- filter to RESOLVED before "
++                f"calling this")
++        buckets.setdefault(cohort_key(obligation), []).append(obligation)
++    return buckets
++
++
++def _to_outcome_obligation(obligation: Mapping[str, Any]) -> OutcomeObligation:
++    """Reconstruct the typed OutcomeObligation the outcome_v1 functions
++    expect from the plain dict the twin's read API returns."""
++    return OutcomeObligation(
++        obligation_id=str(obligation["obligation_id"]),
++        decision_hash=str(obligation["decision_hash"]),
++        domain=str(obligation["domain"]),
++        obligation_kind=str(obligation["obligation_kind"]),
++        opened_at=float(obligation["opened_at"]),
++        expected_by=float(obligation["expected_by"]),
++        state=obligation["state"],
++        reason_code=obligation.get("reason_code"),
++        resolved_at=obligation.get("resolved_at"),
++        resolved_value=obligation.get("resolved_value"),
++        resolution_provenance=obligation.get("resolution_provenance"),
++        resolution_method=obligation.get("resolution_method"),
++        favorable=obligation.get("favorable"),
++        subject_id=obligation.get("subject_id"),
++        detail=dict(obligation.get("detail") or {}),
++    )
++
++
++def subject_of(obligation: Mapping[str, Any]) -> str:
++    """The subject identity a cohort test keys on: the obligation's own
++    subject_id if it has one (the twin does not derive one today --
++    see twin_receiver.derive_obligations), else its decision_hash. Same
++    fallback to_cohort_decision itself uses."""
++    return str(obligation.get("subject_id") or obligation["decision_hash"])
++
++
++# ---------------------------------------------------------------------------
++# Assembly: pure, no I/O -- takes already-fetched lookups as plain dicts
++# so this stays testable without a live sealed channel or ledger.
++# ---------------------------------------------------------------------------
++
++
++@dataclass
++class SkippedObligation:
++    """One obligation that could not enter a cohort test, with why.
++    Reported, never silently dropped."""
++    obligation_id: str
++    reason: str
++
++
++@dataclass
++class AssembledCohort:
++    """One (domain, obligation_kind) bucket, converted into the two
++    typed shapes the C2 dimension-4 and dimension-5 checks each need."""
++    domain: str
++    obligation_kind: str
++    dimension_4_cohort: List[CohortDecision]
++    dimension_5_cohort: List[CohortInputDecision]
++    skipped: List[SkippedObligation]
++    total_resolved: int
++
++
++def assemble_cohort(
++        domain: str, obligation_kind: str,
++        obligations: List[Mapping[str, Any]],
++        group_distributions: Mapping[str, Mapping[str, float]],
++        decision_materials: Mapping[str, DecisionMaterial],
++        ) -> AssembledCohort:
++    """Turn one bucket of resolved obligations into the two cohort
++    shapes check_statistical_outcome_equity (dimension 4) and
++    check_correlation_based_proxy_detection (dimension 5) each need.
++
++    group_distributions and decision_materials are both pre-fetched by
++    the caller, keyed by subject_of(obligation) and decision_hash
++    respectively -- this function does no I/O, so it needs no live
++    sealed channel or ledger connection to test.
++
++    The two dimensions have DIFFERENT data requirements and are
++    evaluated INDEPENDENTLY: an obligation can enter dimension 4's
++    cohort without entering dimension 5's (missing decision material),
++    but never the reverse (dimension 5 also needs a group_distribution,
++    same as dimension 4) -- so a per-obligation skip reason is specific
++    to which dimension it affects, not a single pass/fail gate.
++    """
++    dim4: List[CohortDecision] = []
++    dim5: List[CohortInputDecision] = []
++    skipped: List[SkippedObligation] = []
++    for obligation in obligations:
++        subject = subject_of(obligation)
++        obligation_id = str(obligation.get("obligation_id", subject))
++        distribution = group_distributions.get(subject)
++        if distribution is None:
++            skipped.append(SkippedObligation(
++                obligation_id,
++                "no protected-characteristic estimate on file for this subject"))
++            continue
++        try:
++            dim4.append(to_cohort_decision(
++                _to_outcome_obligation(obligation), distribution))
++        except OutcomeIntegrityError as exc:
++            skipped.append(SkippedObligation(
++                obligation_id,
++                f"not usable for dimension 4: {'; '.join(exc.violations)}"))
++        material = decision_materials.get(str(obligation["decision_hash"]))
++        if material is not None:
++            dim5.append(CohortInputDecision(
++                subject_id=subject,
++                input_fields=material.input_fields,
++                group_distribution=distribution,
++            ))
++        else:
++            skipped.append(SkippedObligation(
++                obligation_id,
++                "not usable for dimension 5: no decision material found on "
++                "the primary ledger for this obligation's decision_hash"))
++    return AssembledCohort(
++        domain=domain, obligation_kind=obligation_kind,
++        dimension_4_cohort=dim4, dimension_5_cohort=dim5,
++        skipped=skipped, total_resolved=len(obligations),
++    )
++
++
++@dataclass
++class CohortEquityReview:
++    """The full result of sweeping one (domain, obligation_kind)
++    cohort -- what a caller records on the twin's chain as a
++    cohort_equity_review."""
++    domain: str
++    obligation_kind: str
++    total_resolved: int
++    dimension_4_cohort_size: int
++    dimension_5_cohort_size: int
++    dimension_4_findings: List[Dict[str, Any]]
++    dimension_5_findings: List[Dict[str, Any]]
++    skipped: List[SkippedObligation] = field(default_factory=list)
++
++    def as_dict(self) -> Dict[str, Any]:
++        """JSON-safe form -- what the twin's cohort-review endpoint
++        stores and hashes."""
++        return {
++            "domain": self.domain,
++            "obligation_kind": self.obligation_kind,
++            "total_resolved": self.total_resolved,
++            "dimension_4_cohort_size": self.dimension_4_cohort_size,
++            "dimension_5_cohort_size": self.dimension_5_cohort_size,
++            "dimension_4_findings": self.dimension_4_findings,
++            "dimension_5_findings": self.dimension_5_findings,
++            "skipped": [{"obligation_id": s.obligation_id, "reason": s.reason}
++                       for s in self.skipped],
++        }
++
++
++def review_cohort(assembled: AssembledCohort,
++                  profile: RegulationCheckProfile) -> CohortEquityReview:
++    """Run both cohort-level C2 checks against one assembled cohort.
++
++    Both checks are called regardless of cohort size -- each reports
++    its own INDETERMINATE finding when its cohort is below
++    MIN_COHORT_SIZE_FOR_STATISTICAL_TEST rather than this function
++    pre-filtering small cohorts out. A domain/obligation_kind pair with
++    too few resolved obligations to say anything yet is itself
++    reportable state, not silence.
++    """
++    dim4_findings = check_statistical_outcome_equity(
++        assembled.dimension_4_cohort, profile)
++    dim5_findings = check_correlation_based_proxy_detection(
++        assembled.dimension_5_cohort, profile)
++    return CohortEquityReview(
++        domain=assembled.domain,
++        obligation_kind=assembled.obligation_kind,
++        total_resolved=assembled.total_resolved,
++        dimension_4_cohort_size=len(assembled.dimension_4_cohort),
++        dimension_5_cohort_size=len(assembled.dimension_5_cohort),
++        dimension_4_findings=[f.as_dict() for f in dim4_findings],
++        dimension_5_findings=[f.as_dict() for f in dim5_findings],
++        skipped=assembled.skipped,
++    )
++
++
++# ---------------------------------------------------------------------------
++# I/O wrappers -- thin, and each independently swappable in a test.
++# ---------------------------------------------------------------------------
++
++
++def fetch_resolved_obligations(twin_client, replica_id: str) -> List[Dict[str, Any]]:
++    """Pull the current obligation set from the twin's own read API and
++    return only the RESOLVED ones. The twin is the sole record of
++    resolution state (decision 4: obligations live on the twin, not the
++    primary) -- this never reads a primary-side obligation table
++    because there isn't one. twin_client is anything with an httpx-
++    shaped .get(path) -> Response (a real httpx.Client against the
++    twin's base_url, or a FastAPI TestClient in tests)."""
++    resp = twin_client.get(f"/replica/{replica_id}/obligations")
++    resp.raise_for_status()
++    return [o for o in resp.json()["obligations"] if o["state"] == OUTCOME_RESOLVED]
++
++
++def fetch_group_distributions(sealed_channel, subject_ids: Set[str],
++                              ) -> Dict[str, Dict[str, float]]:
++    """One lookup per subject via the sealed channel's per-subject
++    read (not the cohort-batch read, which is keyed by the channel's
++    OWN cohort_key at estimate time -- a concept this sweep's
++    domain/obligation_kind bucketing does not share). A subject with no
++    recorded estimate is simply absent from the result; the caller
++    reports that as a skip, not an error."""
++    result: Dict[str, Dict[str, float]] = {}
++    for subject_id in subject_ids:
++        estimate = sealed_channel.get_estimate_for_subject(subject_id)
++        if estimate is not None:
++            result[subject_id] = dict(estimate.estimate)
++    return result
++
++
++def fetch_decision_materials(ledger_conn, decision_hashes: Set[str],
++                             ) -> Dict[str, DecisionMaterial]:
++    """Look up decisions by hash on the primary's own ledger and adapt
++    each into DecisionMaterial for dimension 5's input_fields. A hash
++    with no matching row (e.g. retention/deletion since the decision
++    was made) is simply absent from the result; the caller reports that
++    as a skip, not a fabricated empty input_fields."""
++    if not decision_hashes:
++        return {}
++    result: Dict[str, DecisionMaterial] = {}
++    with ledger_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
++        cur.execute(
++            """SELECT id, current_hash, reason, decision_output, input_data,
++                      cassette_version, record_kind
++               FROM ledger_entries
++               WHERE current_hash = ANY(%s) AND record_kind = 'governance_decision'""",
++            (list(decision_hashes),))
++        for row in cur.fetchall():
++            result[row["current_hash"]] = material_from_ledger_row(dict(row))
++    return result
++
++
++def sweep(twin_client, replica_id: str, ledger_conn, sealed_channel,
++          profile: RegulationCheckProfile) -> List[CohortEquityReview]:
++    """The whole sweep, wired to real I/O: fetch resolved obligations
++    from the twin, bucket them, fetch what each bucket needs, and
++    return one CohortEquityReview per bucket -- including buckets too
++    small to test (see review_cohort)."""
++    obligations = fetch_resolved_obligations(twin_client, replica_id)
++    buckets = bucket_resolved_obligations(obligations)
++    reviews: List[CohortEquityReview] = []
++    for (domain, obligation_kind), bucket_obligations in sorted(buckets.items()):
++        subjects = {subject_of(o) for o in bucket_obligations}
++        decision_hashes = {str(o["decision_hash"]) for o in bucket_obligations}
++        group_distributions = fetch_group_distributions(sealed_channel, subjects)
++        decision_materials = fetch_decision_materials(ledger_conn, decision_hashes)
++        assembled = assemble_cohort(domain, obligation_kind, bucket_obligations,
++                                    group_distributions, decision_materials)
++        reviews.append(review_cohort(assembled, profile))
++    return reviews
++
++
++def record_reviews(twin_client, replica_id: str,
++                   reviews: List[CohortEquityReview], swept_at: float,
++                   ) -> List[Dict[str, Any]]:
++    """POST each computed review to the twin's cohort-reviews endpoint
++    for tamper-evident storage. Deliberately separate from sweep()
++    itself: computing a review and recording it are two different
++    steps with two different failure modes (a network error recording
++    review 3 of 5 should not mean reviews 1-2 were never computed), and
++    a caller may want to inspect reviews before deciding to record them
++    at all -- e.g. a dry run."""
++    results = []
++    for review in reviews:
++        body = review.as_dict()
++        body["swept_at"] = swept_at
++        resp = twin_client.post(f"/replica/{replica_id}/cohort-reviews", json=body)
++        resp.raise_for_status()
++        results.append(resp.json())
++    return results
+diff --git a/sentinel_os/twin_custody.py b/sentinel_os/twin_custody.py
+index e653722..13a34d5 100644
+--- a/sentinel_os/twin_custody.py
++++ b/sentinel_os/twin_custody.py
+@@ -218,6 +218,21 @@ SHIPPED_COLUMNS = [
+ ]
+ 
+ 
++def domain_from_cassette_version(cassette_version: Optional[str]) -> Optional[str]:
++    """Extract the domain segment from a cassette_version string.
++
++    cassette_version is always "domain:name:version"
++    (cassette_schema.cassette_version_of) -- a fixed, code-generated
++    format, never free text -- so the domain is reliably everything
++    before the first colon. Returns None when there is nothing to parse,
++    same "not yet known" posture as outcome_obligation/decided_at when
++    a row predates this field.
++    """
++    if not cassette_version:
++        return None
++    return cassette_version.split(":", 1)[0] or None
++
++
+ def _ledger_dumps(obj: Any) -> bytes:
+     # Byte-for-byte the serialization ledger_postgres.py uses at append time:
+     # json.dumps(canonical_entry, sort_keys=True, default=str).encode()
+diff --git a/sentinel_os/twin_receiver.py b/sentinel_os/twin_receiver.py
+index b312c53..461fcad 100644
+--- a/sentinel_os/twin_receiver.py
++++ b/sentinel_os/twin_receiver.py
+@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS replica_entries (
+ CREATE INDEX IF NOT EXISTS idx_replica_entries_sid ON replica_entries (replica_id, call_sid);
+ ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS outcome_obligation TEXT;
+ ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS decided_at DOUBLE PRECISION;
++-- Cohort assembly needs to group obligations by domain, not just by
++-- obligation_kind (two unrelated cassettes could legitimately pick the same
++-- obligation_kind string). Shipped in the clear, same posture as
++-- outcome_obligation/decided_at above: it says which business line a
++-- decision belongs to, nothing about the subject, and the twin needs it
++-- without decryption authority.
++ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS domain TEXT;
+ CREATE INDEX IF NOT EXISTS idx_replica_entries_obligation
+     ON replica_entries (replica_id, outcome_obligation)
+     WHERE outcome_obligation IS NOT NULL;
+@@ -84,11 +91,17 @@ CREATE TABLE IF NOT EXISTS obligation_ledger (
+     primary_id    BIGINT,
+     decision_hash TEXT NOT NULL,
+     declaration   TEXT NOT NULL,
++    domain        TEXT NOT NULL DEFAULT 'unknown',
+     obligation_kind TEXT NOT NULL,
+     opened_at     DOUBLE PRECISION NOT NULL,
+     expected_by   DOUBLE PRECISION NOT NULL,
+     state         TEXT NOT NULL,
+     reason_code   TEXT,
++    resolved_at   DOUBLE PRECISION,
++    resolved_value JSONB,
++    resolution_provenance TEXT,
++    resolution_method TEXT,
++    favorable     BOOLEAN,
+     detail        JSONB NOT NULL DEFAULT '{}'::jsonb,
+     prev_hash     TEXT NOT NULL,
+     curr_hash     TEXT NOT NULL,
+@@ -99,6 +112,41 @@ CREATE TABLE IF NOT EXISTS obligation_ledger (
+ );
+ CREATE INDEX IF NOT EXISTS idx_obligation_ledger_oid
+     ON obligation_ledger (replica_id, obligation_id, seq DESC);
++-- Backfill for a table created before these columns existed (dev/CI reruns
++-- against a persistent volume); a fresh CREATE TABLE above already has them.
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolved_at DOUBLE PRECISION;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolved_value JSONB;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_provenance TEXT;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_method TEXT;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS favorable BOOLEAN;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS domain TEXT NOT NULL DEFAULT 'unknown';
++-- cohort_equity_review: the record kind obligation_sweep.py's output
++-- lands as. The twin never computes this itself (see obligation_sweep's
++-- module docstring) -- it only receives and chain-stores what the
++-- primary already computed, same posture as every other record kind
++-- here. Own table, own vocabulary: not a reuse of obligation_ledger's
++-- OPEN/RESOLVED/ABANDONED state machine, because a cohort review isn't
++-- an obligation and doesn't have one.
++CREATE TABLE IF NOT EXISTS cohort_review_ledger (
++    id            BIGSERIAL PRIMARY KEY,
++    replica_id    TEXT NOT NULL REFERENCES replica_meta(replica_id),
++    seq           INTEGER NOT NULL,
++    domain        TEXT NOT NULL,
++    obligation_kind TEXT NOT NULL,
++    total_resolved INTEGER NOT NULL,
++    dimension_4_cohort_size INTEGER NOT NULL,
++    dimension_5_cohort_size INTEGER NOT NULL,
++    dimension_4_findings JSONB NOT NULL,
++    dimension_5_findings JSONB NOT NULL,
++    skipped       JSONB NOT NULL,
++    swept_at      DOUBLE PRECISION NOT NULL,
++    prev_hash     TEXT NOT NULL,
++    curr_hash     TEXT NOT NULL,
++    at            TIMESTAMPTZ NOT NULL DEFAULT now(),
++    UNIQUE (replica_id, seq)
++);
++CREATE INDEX IF NOT EXISTS idx_cohort_review_ledger_key
++    ON cohort_review_ledger (replica_id, domain, obligation_kind, seq DESC);
+ CREATE TABLE IF NOT EXISTS custody_log (
+     id          BIGSERIAL PRIMARY KEY,
+     replica_id  TEXT NOT NULL REFERENCES replica_meta(replica_id),
+@@ -220,7 +268,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                 cur.execute(
+                     """SELECT primary_id, call_sid, previous_hash, current_hash,
+-                              envelope, outcome_obligation, decided_at
++                              envelope, outcome_obligation, decided_at, domain
+                        FROM replica_entries WHERE replica_id=%s AND primary_id=%s""",
+                     (replica_id, int(body["primary_id"])))
+                 existing = cur.fetchone()
+@@ -230,6 +278,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                         and existing["current_hash"] == body["current_hash"]
+                         and existing["call_sid"] == body.get("call_sid")
+                         and existing["outcome_obligation"] == body.get("outcome_obligation")
++                        and existing["domain"] == body.get("domain")
+                         and canonical_json(existing["envelope"]) == canonical_json(body["envelope"])
+                     )
+                     if same:
+@@ -243,12 +292,14 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 cur.execute(
+                     """INSERT INTO replica_entries
+                          (replica_id, primary_id, call_sid, previous_hash,
+-                          current_hash, envelope, outcome_obligation, decided_at)
+-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
++                          current_hash, envelope, outcome_obligation, decided_at,
++                          domain)
++                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                     (replica_id, int(body["primary_id"]), body.get("call_sid"),
+                      body["previous_hash"], body["current_hash"],
+                      json.dumps(body["envelope"]),
+-                     body.get("outcome_obligation"), body.get("decided_at")))
++                     body.get("outcome_obligation"), body.get("decided_at"),
++                     body.get("domain")))
+         return {"status": "stored", "primary_id": int(body["primary_id"])}
+ 
+     @app.get("/replica/{replica_id}/head")
+@@ -376,27 +427,100 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                        "obligation_id": obligation.obligation_id,
+                        "decision_hash": obligation.decision_hash,
+                        "declaration": declaration,
++                       "domain": obligation.domain,
+                        "obligation_kind": obligation.obligation_kind,
+                        "opened_at": obligation.opened_at,
+                        "expected_by": obligation.expected_by,
+                        "state": obligation.state,
+                        "reason_code": obligation.reason_code,
+                        "prev_hash": prev_hash}
++            # Resolution fields enter the hashed payload ONLY when present --
++            # same "optional hashed field" discipline used for cassette_hash
++            # etc. in ledger_postgres.py. An OPEN-state row (all five None)
++            # hashes exactly as it did before this fix; only a RESOLVED row
++            # picks up the new fields, so nothing already on a chain is
++            # invalidated by adding the capability to record them.
++            resolution_fields = {
++                "resolved_at": obligation.resolved_at,
++                "resolved_value": obligation.resolved_value,
++                "resolution_provenance": obligation.resolution_provenance,
++                "resolution_method": obligation.resolution_method,
++                "favorable": obligation.favorable,
++            }
++            for key, value in resolution_fields.items():
++                if value is not None:
++                    payload[key] = value
+             curr_hash = hashlib.sha256(canonical_json(payload)).hexdigest()
+             cur.execute(
+                 """INSERT INTO obligation_ledger
+                      (replica_id, seq, obligation_id, primary_id, decision_hash,
+-                      declaration, obligation_kind, opened_at, expected_by,
+-                      state, reason_code, detail, prev_hash, curr_hash,
+-                      signature, signer_pub)
+-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
++                      declaration, domain, obligation_kind, opened_at, expected_by,
++                      state, reason_code, resolved_at, resolved_value,
++                      resolution_provenance, resolution_method, favorable,
++                      detail, prev_hash, curr_hash, signature, signer_pub)
++                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 (replica_id, seq, obligation.obligation_id, primary_id,
+-                 obligation.decision_hash, declaration, obligation.obligation_kind,
++                 obligation.decision_hash, declaration, obligation.domain,
++                 obligation.obligation_kind,
+                  obligation.opened_at, obligation.expected_by, obligation.state,
+-                 obligation.reason_code, json.dumps(obligation.detail),
++                 obligation.reason_code, obligation.resolved_at,
++                 None if obligation.resolved_value is None
++                 else json.dumps(obligation.resolved_value),
++                 obligation.resolution_provenance, obligation.resolution_method,
++                 obligation.favorable, json.dumps(obligation.detail),
+                  prev_hash, curr_hash, signature, signer_pub))
+         return seq, curr_hash
+ 
++    def _append_cohort_review(conn, replica_id: str, review: Dict[str, Any]):
++        """Append one cohort_equity_review record to its own hash chain.
++
++        The twin does not compute this -- it stores what
++        obligation_sweep.py already computed on the primary and chain-
++        links it, so a later re-sweep of the same cohort (or a
++        disagreement with a future re-audit) is a detectable NEW row,
++        never a silent overwrite. Same append-only, advisory-locked
++        posture as _append_obligation.
++        """
++        with conn.cursor() as cur:
++            cur.execute(
++                "SELECT pg_advisory_xact_lock(hashtext('cohort_review_ledger_' || %s))",
++                (replica_id,))
++            cur.execute("""SELECT seq, curr_hash FROM cohort_review_ledger
++                           WHERE replica_id=%s ORDER BY seq DESC LIMIT 1""",
++                       (replica_id,))
++            row = cur.fetchone()
++            seq = (row[0] + 1) if row else 1
++            prev_hash = row[1] if row else "genesis"
++            payload = {
++                "replica_id": replica_id, "seq": seq,
++                "domain": review["domain"],
++                "obligation_kind": review["obligation_kind"],
++                "total_resolved": review["total_resolved"],
++                "dimension_4_cohort_size": review["dimension_4_cohort_size"],
++                "dimension_5_cohort_size": review["dimension_5_cohort_size"],
++                "dimension_4_findings": review["dimension_4_findings"],
++                "dimension_5_findings": review["dimension_5_findings"],
++                "skipped": review["skipped"],
++                "swept_at": review["swept_at"],
++                "prev_hash": prev_hash,
++            }
++            curr_hash = hashlib.sha256(canonical_json(payload)).hexdigest()
++            cur.execute(
++                """INSERT INTO cohort_review_ledger
++                     (replica_id, seq, domain, obligation_kind, total_resolved,
++                      dimension_4_cohort_size, dimension_5_cohort_size,
++                      dimension_4_findings, dimension_5_findings, skipped,
++                      swept_at, prev_hash, curr_hash)
++                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
++                (replica_id, seq, review["domain"], review["obligation_kind"],
++                 review["total_resolved"], review["dimension_4_cohort_size"],
++                 review["dimension_5_cohort_size"],
++                 json.dumps(review["dimension_4_findings"]),
++                 json.dumps(review["dimension_5_findings"]),
++                 json.dumps(review["skipped"]), review["swept_at"],
++                 prev_hash, curr_hash))
++        return seq, curr_hash
++
+     def _latest_states(conn, replica_id: str) -> Dict[str, Dict[str, Any]]:
+         """Current state per obligation: the highest-seq row for each id.
+         The chain keeps every transition; this is the read view over it."""
+@@ -404,8 +528,10 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             cur.execute("""
+                 SELECT DISTINCT ON (obligation_id)
+                        obligation_id, primary_id, decision_hash, declaration,
+-                       obligation_kind, opened_at, expected_by, state,
+-                       reason_code, detail, seq, curr_hash
++                       domain, obligation_kind, opened_at, expected_by, state,
++                       reason_code, resolved_at, resolved_value,
++                       resolution_provenance, resolution_method, favorable,
++                       detail, seq, curr_hash
+                 FROM obligation_ledger WHERE replica_id=%s
+                 ORDER BY obligation_id, seq DESC""", (replica_id,))
+             return {row["obligation_id"]: dict(row) for row in cur.fetchall()}
+@@ -425,7 +551,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             _meta(conn, replica_id)
+             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                 cur.execute("""
+-                    SELECT primary_id, current_hash, outcome_obligation, decided_at
++                    SELECT primary_id, current_hash, outcome_obligation, decided_at, domain
+                     FROM replica_entries
+                     WHERE replica_id=%s AND outcome_obligation IS NOT NULL
+                     ORDER BY primary_id ASC""", (replica_id,))
+@@ -456,7 +582,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 obligation = open_obligation(
+                     obligation_id=obligation_id,
+                     decision_hash=row["current_hash"],
+-                    domain=rule.kind,
++                    domain=row.get("domain") or rule.kind,
+                     rule=rule,
+                     opened_at=float(row["decided_at"]),
+                 )
+@@ -501,7 +627,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             existing = OutcomeObligation(
+                 obligation_id=current["obligation_id"],
+                 decision_hash=current["decision_hash"],
+-                domain=current["obligation_kind"],
++                domain=current["domain"],
+                 obligation_kind=current["obligation_kind"],
+                 opened_at=float(current["opened_at"]),
+                 expected_by=float(current["expected_by"]),
+@@ -561,6 +687,54 @@ def build_app(dsn: str, site: str) -> FastAPI:
+         return {"replica_id": replica_id, "as_of": clock,
+                 "summary": summary, "obligations": obligations}
+ 
++    @app.post("/replica/{replica_id}/cohort-reviews")
++    def store_cohort_review(replica_id: str, body: Dict[str, Any]):
++        """Append one cohort_equity_review record -- the output of one
++        run of obligation_sweep.py over one (domain, obligation_kind)
++        cohort. The twin does not recompute the findings; it stores
++        what the primary already computed and chain-links it, same
++        posture as every other record kind here (independent witness,
++        not independent judge)."""
++        required = ("domain", "obligation_kind", "total_resolved",
++                   "dimension_4_cohort_size", "dimension_5_cohort_size",
++                   "dimension_4_findings", "dimension_5_findings",
++                   "skipped", "swept_at")
++        missing = [k for k in required if k not in body]
++        if missing:
++            raise HTTPException(status_code=422,
++                               detail=f"missing fields: {missing}")
++        with db() as conn:
++            _meta(conn, replica_id)
++            seq, curr_hash = _append_cohort_review(conn, replica_id, body)
++        return {"seq": seq, "curr_hash": curr_hash}
++
++    @app.get("/replica/{replica_id}/cohort-reviews")
++    def list_cohort_reviews(replica_id: str, domain: Optional[str] = None,
++                            obligation_kind: Optional[str] = None):
++        """Every recorded review, oldest first, optionally filtered to
++        one cohort's history over time -- an auditor asking 'has
++        lending's loan_performance cohort ever flagged' wants the whole
++        history for that bucket, not just its latest sweep."""
++        with db() as conn:
++            _meta(conn, replica_id)
++            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
++                query = """SELECT seq, domain, obligation_kind, total_resolved,
++                                  dimension_4_cohort_size, dimension_5_cohort_size,
++                                  dimension_4_findings, dimension_5_findings,
++                                  skipped, swept_at, prev_hash, curr_hash
++                           FROM cohort_review_ledger WHERE replica_id=%s"""
++                params = [replica_id]
++                if domain is not None:
++                    query += " AND domain=%s"
++                    params.append(domain)
++                if obligation_kind is not None:
++                    query += " AND obligation_kind=%s"
++                    params.append(obligation_kind)
++                query += " ORDER BY seq ASC"
++                cur.execute(query, params)
++                reviews = [dict(row) for row in cur.fetchall()]
++        return {"replica_id": replica_id, "reviews": reviews}
++
+     @app.exception_handler(Exception)
+     def unhandled(_req: Request, exc: Exception):
+         return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+diff --git a/sentinel_os/twin_shipper.py b/sentinel_os/twin_shipper.py
+index bf26ca9..b637e8c 100644
+--- a/sentinel_os/twin_shipper.py
++++ b/sentinel_os/twin_shipper.py
+@@ -38,7 +38,7 @@ import psycopg2.extras
+ import redis
+ 
+ from queue_schema import TransmissionQueue
+-from twin_custody import SHIPPED_COLUMNS, canonical_json, seal
++from twin_custody import SHIPPED_COLUMNS, canonical_json, domain_from_cassette_version, seal
+ 
+ SYNC_QUEUE_NAME = "twin_sync"
+ CURSOR_KEY = "twin:cursor:{replica_id}"
+@@ -139,6 +139,10 @@ def ship_available(queue: TransmissionQueue, r: redis.Redis,
+                     "outcome_obligation": row.get("outcome_obligation"),
+                     "decided_at": (row["timestamp"].timestamp()
+                                    if row.get("timestamp") is not None else None),
++                    # Cohort assembly groups obligations by domain, not just
++                    # by obligation_kind -- two unrelated cassettes could
++                    # legitimately pick the same obligation_kind string.
++                    "domain": domain_from_cassette_version(row.get("cassette_version")),
+                 }
+                 queue.enqueue(payload, job_id=f"{rid}|{row['id']}")
+                 count += 1
+diff --git a/sentinel_os/twin_sync_worker.py b/sentinel_os/twin_sync_worker.py
+index a74866e..edc2b58 100644
+--- a/sentinel_os/twin_sync_worker.py
++++ b/sentinel_os/twin_sync_worker.py
+@@ -54,6 +54,7 @@ class TwinSyncWorker:
+             "call_sid": p.get("call_sid"),
+             "outcome_obligation": p.get("outcome_obligation"),
+             "decided_at": p.get("decided_at"),
++            "domain": p.get("domain"),
+             "previous_hash": p["previous_hash"],
+             "current_hash": p["current_hash"],
+             "envelope": p["envelope"],

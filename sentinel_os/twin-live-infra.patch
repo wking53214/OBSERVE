@@ -1,0 +1,486 @@
+From 4659471fd507bae9c0814387b2d61b145a39825d Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Thu, 23 Jul 2026 21:42:17 +0000
+Subject: [PATCH] Fix real code-hash bug behind twin-suite flakiness; commit
+ the twin live-infra setup
+
+Root cause (not test flakiness -- a real bug in the production cassette
+loading path): CassetteLoader.load_cassette() dynamically exec'd cassette
+modules via spec_from_file_location/exec_module without ever registering
+them in sys.modules. inspect.getmodule() on any object it produced
+therefore returned None, and cassette_forensics.compute_cassette_code_hash
+silently fell back to an 'UNAVAILABLE_CASSETTE_SOURCE' marker instead of
+the cassette's real source. The SAME cassette class loaded two different
+ways (CassetteLoader, the actual production path, vs a direct import, used
+by some tests) then hashed DIFFERENTLY -- and whichever hash got bound to
+a cassette_version first in the ledger would permanently conflict with the
+other for the life of that ledger, tripping bind_cassette_version's
+tamper-detection tripwire on a false positive. This is what was surfacing
+as a cascade of unrelated-looking failures (ValueError: Cassette version
+binding conflict, followed by 'permission denied for table ledger_entries'
+as later tests failed mid-fixture as a side effect) whenever the full
+suite ran more than once against the same persistent ledger. It also meant
+the code-hash tamper-evidence mechanism was silently non-functional for
+the real production cassette-loading path, independent of testing.
+
+Fix (cassette_loader.py): load from the real cassettes/ package via a
+normal importlib.import_module(cassettes.X) when that's what
+cassette_dir resolves to -- byte-identical to every other import in the
+codebase, so the resulting code hash always matches a direct import of the
+same class. Falls back to the low-level dynamic-loading recipe only for a
+genuinely external cassette_dir, and that fallback now correctly registers
+the module in sys.modules (set before exec_module, matching CPython's own
+import machinery) so inspect.getmodule/getsource resolve it at all.
+
+Also, while root-causing this by chasing every layer of the failure by
+hand:
+
+- test_twin_live.py: fixed a hardcoded REPO path
+  ('/home/claude/sentinel_os/sentinel_os', a leftover from whichever
+  dev container originally built this suite) to compute itself from the
+  file's own location -- broke immediately on any other machine. Fixed a
+  real FEED_DSN password bug: this file hardcoded ledger_reader's
+  password as a literal different from the one conftest.py resets it to
+  every session, so the two suites silently disagreed on a shared
+  credential whenever both ran in one pytest session. FEED_DSN is now
+  built lazily from the same env var conftest.py sets.
+
+- conftest.py: grant sentinelsvc membership in ledger_reader from the
+  same fixture that creates ledger_reader, closing an ordering race
+  against test_twin_live.py's own session-scoped services fixture (the
+  self-heal script only grants membership if ledger_reader already
+  exists at the moment it runs, and fixture order between two
+  independent session-scoped autouse fixtures isn't guaranteed).
+
+- scripts/twin_ensure_services.sh (new): the actual infrastructure this
+  suite needs -- three OS identities (sentinelsvc/twincustomer/
+  twincustodian), matching peer-auth Postgres roles, sentinelsvc granted
+  into ledger_reader -- captured as real, idempotent, committed code.
+  This used to exist only as ad-hoc setup performed once, live, inside
+  whichever dev container originally built the twin, which is exactly
+  why it broke the instant anyone (Wm's Chromebook, this session) tried
+  to run it anywhere else. Install as /usr/local/bin/twin_ensure_services
+  (the path test_twin_live.py's services fixture already calls).
+
+- .github/workflows/tests.yml, README.md: test_twin_live.py is still
+  excluded from the GitHub Actions workflow specifically, but the reason
+  is now accurate: peer auth requires the test process and Postgres to
+  share a Unix domain socket, and this workflow's
+  block is a separate Docker container reached only over TCP -- there's
+  no socket to share. Closing that would mean giving this CI job a
+  natively-installed Postgres instead of the services: container, a
+  separable follow-up, not a one-line fix. The old comment (infra 'never
+  committed to this repo') is stale as of this commit -- it is now.
+
+Verified: full repo suite (no --ignore, all 383 tests: 341 original C2
+baseline + 24 C2 input-side-checker tests + 18 twin-live tests) run twice
+back-to-back from a clean database with zero manual reset in between --
+383/383 both times. Previously this same back-to-back run reliably failed
+the second time with the cascade described above; confirmed reproducible
+before the fix and confirmed gone after it, not just reset away.
+---
+ .github/workflows/tests.yml                 |  30 ++--
+ sentinel_os/README.md                       |   2 +-
+ sentinel_os/cassette_loader.py              |  59 +++++++-
+ sentinel_os/conftest.py                     |  24 +++-
+ sentinel_os/scripts/twin_ensure_services.sh | 149 ++++++++++++++++++++
+ sentinel_os/test_twin_live.py               |  19 ++-
+ 6 files changed, 262 insertions(+), 21 deletions(-)
+ create mode 100755 sentinel_os/scripts/twin_ensure_services.sh
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 5313a96..f587f7b 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -87,14 +87,24 @@ jobs:
+           # queue_schema, api_server_v2, grafts) were previously never
+           # collected or run by CI at all; now they are.
+           #
+-          # test_twin_live.py is explicitly excluded, not silently skipped:
+-          # it requires 3 separately-provisioned OS identities
+-          # (sentinelsvc/twincustomer/twincustodian), real TLS PKI between
+-          # them, and /usr/local/bin/twin_ensure_services -- a self-heal
+-          # script that exists in whatever environment originally built the
+-          # twin but was never committed to this repo. That's real
+-          # infrastructure to reconstruct, not a CI config fix -- tracked
+-          # separately, not blocking this merge.
++          # test_twin_live.py is still explicitly excluded here, but for a
++          # different and narrower reason than before: its OS-identity
++          # (sentinelsvc/twincustomer/twincustodian), peer-auth Postgres
++          # setup is now real, committed, reproducible code --
++          # scripts/twin_ensure_services.sh -- and running it locally (or
++          # in any environment with a NATIVE Postgres install sharing a
++          # Unix socket with the test process) makes this suite pass
++          # 383/383 alongside everything else, verified twice back-to-back
++          # from a clean state. What it can't do is run against THIS
++          # workflow's Postgres specifically: the `services: postgres:`
++          # block above is a separate Docker container reached over TCP,
++          # and peer auth requires the client and server to share the same
++          # Unix domain socket -- there is no socket to share with a
++          # containerized service. Closing this in CI would mean replacing
++          # the services: postgres block with a natively apt-installed
++          # Postgres on the runner for this job, which is a real (and
++          # separable) infra change, not a one-line fix -- flagged as
++          # follow-up, not attempted here.
+           python -m pytest . --ignore=test_twin_live.py -v --tb=short
+ 
+       - name: Summarize results
+@@ -124,4 +134,8 @@ jobs:
+           # have auto-caught the TLS private key committed to git history
+           # earlier -- bandit's B105/B106 hardcoded-secret checks flag that
+           # pattern. Fix the current findings, then make this a real gate.
++          # test_twin_live.py is still excluded here too (kept consistent
++          # with the pytest exclusion above -- it's not run in this
++          # workflow at all, so scanning it here would report on dead code
++          # from this job's point of view).
+           bandit -r . -x ./Tests,./test_twin_live.py || true
+diff --git a/sentinel_os/README.md b/sentinel_os/README.md
+index 9c3ce05..f08e3e7 100644
+--- a/sentinel_os/README.md
++++ b/sentinel_os/README.md
+@@ -164,7 +164,7 @@ python3 sentinel_os/iceberg_complete_simulator.py
+ 
+ **Still open** (see `governance/README.md` and `docs/CHANGELOG.md` for detail):
+ - Bias testing and adverse-action specificity for governance decisions
+-- `test_twin_live.py` requires infrastructure (3 separate OS identities + real TLS PKI between them) not yet reconstructed in CI -- excluded explicitly, not silently skipped
++- `test_twin_live.py` needs a native (non-Docker) Postgres install sharing a Unix socket with the test process, for real OS-identity peer-auth boundaries (`sentinelsvc`/`twincustomer`/`twincustodian` -- provisioned by `scripts/twin_ensure_services.sh`, now committed). Passes 383/383 alongside the rest of the suite locally or in any environment with a native Postgres, verified twice back-to-back from a clean state. Still excluded from the GitHub Actions workflow specifically, because its `services: postgres:` block is a separate Docker container reachable only over TCP -- there's no Unix socket to share, so peer auth structurally can't work there. Closing that gap means giving this CI job a natively-installed Postgres instead of the services: container, a separable follow-up.
+ 
+ **Status:** Core governance logic, test coverage, and both primary deployment paths (Docker Compose, standalone simulator) are live-verified. Production deployment against real call systems has not been attempted.
+ 
+diff --git a/sentinel_os/cassette_loader.py b/sentinel_os/cassette_loader.py
+index 2fb32f6..1db89dc 100644
+--- a/sentinel_os/cassette_loader.py
++++ b/sentinel_os/cassette_loader.py
+@@ -5,6 +5,7 @@ Enables boom box to work with any cassette without code changes
+ """
+ 
+ import importlib.util
++import sys
+ from pathlib import Path
+ from typing import Dict
+ from cassette_interface import Cassette, CassetteRegistry
+@@ -33,13 +34,7 @@ class CassetteLoader:
+         class_name = "".join(word.capitalize() for word in cassette_name.split("_")) + "Cassette"
+         
+         try:
+-            # Dynamic import
+-            spec = importlib.util.spec_from_file_location(
+-                module_name,
+-                self.cassette_dir / f"{module_name}.py"
+-            )
+-            module = importlib.util.module_from_spec(spec)
+-            spec.loader.exec_module(module)
++            module = self._load_module(module_name)
+             
+             # Get class and instantiate
+             class_obj = getattr(module, class_name)
+@@ -53,6 +48,56 @@ class CassetteLoader:
+         validate_cassette(cassette)
+ 
+         return cassette
++
++    def _load_module(self, module_name: str):
++        """Load `module_name` from self.cassette_dir.
++
++        When self.cassette_dir IS the real `cassettes` package shipped with
++        this repo, use a normal `importlib.import_module("cassettes.X")` --
++        the identical import every other caller in the codebase uses (e.g.
++        `from cassettes.banking_cassette import BankingCassette`). This
++        matters beyond style: it's what makes the resulting class's
++        __module__ read "cassettes.X" instead of a bare "X", which is what
++        cassette_forensics.compute_cassette_code_hash labels its hash with.
++        A cassette loaded through THIS loader must hash identically to the
++        same class loaded through a plain import, or the two code paths
++        silently disagree about what the "same" cassette's code hash is --
++        which is exactly what used to happen here (see the fix note below).
++
++        Falls back to the low-level spec_from_file_location + exec_module
++        recipe only for a genuinely custom/external cassette_dir that isn't
++        an importable package member -- the loader's whole point is to also
++        support loading from outside the repo. That fallback still
++        registers the module in sys.modules (set BEFORE exec_module, same
++        as CPython's own import machinery, and needed for inspect.getmodule
++        to resolve it at all -- without this, compute_cassette_code_hash
++        silently fell back to an "UNAVAILABLE_CASSETTE_SOURCE" marker
++        instead of the cassette's real source for every cassette loaded
++        this way, and two different code hashes for the identical class --
++        the real one from a direct import, the marker from here -- would
++        collide the first time both got bound to the same cassette_version
++        in the ledger, tripping bind_cassette_version's content-mismatch
++        tripwire on a false positive).
++        """
++        real_package_dir = Path(__file__).parent / "cassettes"
++        if self.cassette_dir.resolve() == real_package_dir.resolve():
++            return importlib.import_module(f"cassettes.{module_name}")
++
++        spec = importlib.util.spec_from_file_location(
++            module_name,
++            self.cassette_dir / f"{module_name}.py"
++        )
++        module = importlib.util.module_from_spec(spec)
++        sys.modules[module_name] = module
++        try:
++            spec.loader.exec_module(module)
++        except Exception:
++            # Don't leave a half-executed module registered under this
++            # name -- a failed load should look like no load, not a
++            # module future code could accidentally import.
++            sys.modules.pop(module_name, None)
++            raise
++        return module
+     
+     def load_all_cassettes(self, fail_on_invalid: bool = True) -> CassetteRegistry:
+         """Auto-discover and load all cassettes.
+diff --git a/sentinel_os/conftest.py b/sentinel_os/conftest.py
+index 149c1f2..39fc13f 100644
+--- a/sentinel_os/conftest.py
++++ b/sentinel_os/conftest.py
+@@ -36,7 +36,9 @@ def _pg_available() -> bool:
+ 
+ @pytest.fixture(scope="session", autouse=True)
+ def _ensure_default_ledger_runtime_role():
+-    """Once per session: make sure `ledger_reader` has a known password.
++    """Once per session: make sure `ledger_reader` has a known password,
++    and that sentinelsvc (if the twin live-suite's OS identity exists)
++    is a member of it.
+ 
+     The role itself is created idempotently by ledger_immutability.sql
+     (which every PostgreSQLLedger construction applies), but CREATE ROLE
+@@ -46,6 +48,20 @@ def _ensure_default_ledger_runtime_role():
+     must resolve a working non-owner runtime user before it can even
+     open its pool -- doesn't fail on auth before it gets anywhere near
+     the code being tested.
++
++    The sentinelsvc grant lives HERE rather than only in
++    scripts/twin_ensure_services.sh because this fixture is the one
++    place guaranteed to run before ledger_reader is first needed,
++    regardless of collection order -- twin_ensure_services.sh grants
++    membership too (for a bare `twin_ensure_services` run outside
++    pytest), but if test_twin_live.py's own session-scoped `services`
++    fixture happened to run before this one in a given collection
++    order, that script would find no ledger_reader role yet to grant
++    into and silently skip, leaving twin_shipper.py unable to read the
++    ledger for the rest of that session. Doing it here removes the
++    ordering dependency: by the time ANY test in the session needs
++    ledger_reader, both the role and (when applicable) sentinelsvc's
++    membership in it already exist.
+     """
+     if not _pg_available():
+         yield
+@@ -62,6 +78,12 @@ def _ensure_default_ledger_runtime_role():
+         "END IF; END $$;",
+         {"pw": _LEDGER_READER_TEST_PASSWORD},
+     )
++    cur.execute(
++        "DO $$ BEGIN "
++        "IF EXISTS (SELECT FROM pg_roles WHERE rolname='sentinelsvc') THEN "
++        "GRANT ledger_reader TO sentinelsvc; "
++        "END IF; END $$;"
++    )
+     conn.close()
+     yield
+ 
+diff --git a/sentinel_os/scripts/twin_ensure_services.sh b/sentinel_os/scripts/twin_ensure_services.sh
+new file mode 100755
+index 0000000..99e37c1
+--- /dev/null
++++ b/sentinel_os/scripts/twin_ensure_services.sh
+@@ -0,0 +1,149 @@
++#!/usr/bin/env bash
++# twin_ensure_services -- idempotent self-heal for the twin live-integration
++# suite's infrastructure (test_twin_live.py).
++#
++# This is the script test_twin_live.py's `services` fixture calls at the
++# start of every session (via /usr/local/bin/twin_ensure_services). It used
++# to exist only as ad-hoc setup performed once, live, inside whichever dev
++# container originally built the twin -- never captured as code, so every
++# new environment (a fresh dev container, CI, another engineer's machine)
++# hit the exact same "No such file or directory" / "role does not exist"
++# wall the original build session never had to face. This script is that
++# capture: run it once (as root) on any Debian/Ubuntu-family box with
++# Postgres and Redis already installed, and it produces the same
++# infrastructure the original build session had, byte-for-byte:
++#
++#   * three OS identities -- sentinelsvc (Sentinel's own service account),
++#     twincustomer (the customer who owns the replica DB and its keys),
++#     twincustodian (the neutral custodian for custody-model D) -- each
++#     with a real home directory, default useradd permissions (0750,
++#     unreadable by the other two identities -- this is what makes the
++#     "sentinelsvc cannot read the customer's key file" test a genuine OS
++#     permission denial rather than an assumption);
++#   * one matching Postgres role per identity, LOGIN, no password -- peer
++#     auth (`local all all peer` in pg_hba.conf, Postgres's own default for
++#     Unix-socket connections) maps each OS user directly to the
++#     same-named role with no credential to manage, which is what makes
++#     the Sentinel-cannot-connect-to-the-customer-DB test a genuine
++#     Postgres permission denial too;
++#   * sentinelsvc granted membership in the existing ledger_reader role
++#     (see ledger_immutability.sql) so it can read the primary ledger via
++#     its own peer-auth identity when it ships rows -- reusing the read-only
++#     role the rest of the repo already defines rather than duplicating
++#     its grants;
++#   * Postgres and Redis started if they aren't already running.
++#
++# Idempotent and safe to re-run: every step checks for existence first.
++# Matches the "self-heals Postgres/Redis if the VM forked between calls"
++# behavior test_twin_live.py's `services` fixture already documents.
++#
++# Install: copy (or symlink) this file to /usr/local/bin/twin_ensure_services
++# and make it executable, e.g.:
++#   sudo install -m 0755 scripts/twin_ensure_services.sh \
++#       /usr/local/bin/twin_ensure_services
++#
++# Must run as root (useradd, service management, and the initial
++# CREATE ROLE all require it -- consistent with the twin live suite's own
++# documented assumption that the pytest process runs as root).
++
++set -euo pipefail
++
++if [ "$(id -u)" -ne 0 ]; then
++  echo "twin_ensure_services: must run as root" >&2
++  exit 1
++fi
++
++# ---------------------------------------------------------------------------
++# 1. Postgres and Redis running
++# ---------------------------------------------------------------------------
++
++_service_running() {
++  # Works whether the box uses systemd or sysv init scripts (both are seen
++  # across the environments this has been run in: real systemd hosts and
++  # container images where only `service` works).
++  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null; then
++    return 0
++  fi
++  service "$1" status >/dev/null 2>&1
++}
++
++_service_start() {
++  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "^$1"; then
++    systemctl start "$1"
++  else
++    service "$1" start
++  fi
++}
++
++for svc in postgresql redis-server; do
++  if _service_running "$svc"; then
++    echo "twin_ensure_services: $svc already running"
++  else
++    echo "twin_ensure_services: starting $svc"
++    _service_start "$svc"
++  fi
++done
++
++# Wait for Postgres to actually accept connections (service start returning
++# doesn't guarantee the socket is up yet).
++for _ in $(seq 1 30); do
++  if runuser -u postgres -- psql -tAc 'SELECT 1' >/dev/null 2>&1; then
++    break
++  fi
++  sleep 0.5
++done
++
++# ---------------------------------------------------------------------------
++# 2. OS identities
++# ---------------------------------------------------------------------------
++
++for u in sentinelsvc twincustomer twincustodian; do
++  if id "$u" >/dev/null 2>&1; then
++    echo "twin_ensure_services: OS user $u already exists"
++  else
++    echo "twin_ensure_services: creating OS user $u"
++    useradd --create-home --shell /bin/bash "$u"
++  fi
++done
++
++# ---------------------------------------------------------------------------
++# 3. Matching Postgres roles (peer auth, no password) + grants
++# ---------------------------------------------------------------------------
++
++runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
++DO $$
++BEGIN
++  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sentinelsvc') THEN
++    CREATE ROLE sentinelsvc WITH LOGIN;
++  END IF;
++  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'twincustomer') THEN
++    -- CREATEDB: twincustomer needs to be able to own replica databases the
++    -- test suite creates on its behalf (via the postgres identity), and the
++    -- restore drill runs pg_dump/pg_restore as twincustomer directly.
++    CREATE ROLE twincustomer WITH LOGIN CREATEDB;
++  END IF;
++  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'twincustodian') THEN
++    CREATE ROLE twincustodian WITH LOGIN;
++  END IF;
++END
++$$;
++SQL
++
++# sentinelsvc reads the primary ledger via its own peer-auth identity when
++# shipping rows (twin_shipper.py connects as whoever the OS process runs
++# as). Reuses ledger_immutability.sql's existing read-only role instead of
++# duplicating its SELECT/INSERT grants here. Only meaningful once the
++# `iceberg` database and ledger_reader role exist (they're created by the
++# app's own ledger construction path, not this script) -- skip quietly if
++# they don't exist yet rather than failing the whole self-heal over a
++# database this script isn't responsible for provisioning.
++if runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname='iceberg'" | grep -q 1; then
++  runuser -u postgres -- psql -d iceberg -v ON_ERROR_STOP=1 -c \
++    "DO \$\$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname='ledger_reader') THEN GRANT ledger_reader TO sentinelsvc; END IF; END \$\$;"
++else
++  echo "twin_ensure_services: iceberg database not present yet -- skipping" \
++       "the ledger_reader grant (run this again after the ledger has been" \
++       "constructed once, e.g. via the normal test suite)"
++fi
++
++echo "twin_ensure_services: done"
+diff --git a/sentinel_os/test_twin_live.py b/sentinel_os/test_twin_live.py
+index 2a3abc4..ba61542 100644
+--- a/sentinel_os/test_twin_live.py
++++ b/sentinel_os/test_twin_live.py
+@@ -37,10 +37,21 @@ import psycopg2.extras
+ import pytest
+ import redis
+ 
+-REPO = "/home/claude/sentinel_os/sentinel_os"
++REPO = os.path.dirname(os.path.abspath(__file__))
+ PY = "python3"
+ ICEBERG_DSN = dict(host="localhost", dbname="iceberg", user="iceberg", password="iceberg")
+-FEED_DSN = "host=localhost port=5432 dbname=iceberg user=ledger_reader password=reader_hashfeed"
++def _feed_dsn() -> str:
++    """ledger_reader's password is set once per pytest session by the root
++    conftest.py fixture (_ensure_default_ledger_runtime_role), which every
++    test in the repo shares -- reading it here at call time (not as a
++    module-level constant, which would freeze it at import time before that
++    fixture has run) keeps this suite and the rest of the repo agreeing on
++    ledger_reader's actual current password instead of each hardcoding its
++    own and silently drifting apart when both run in one pytest session.
++    The literal fallback only matters for a standalone run of this file
++    where conftest.py's fixture didn't get a chance to run first."""
++    password = os.environ.get("ICEBERG_LEDGER_RUNTIME_PASSWORD", "reader_hashfeed")
++    return f"host=localhost port=5432 dbname=iceberg user=ledger_reader password={password}"
+ REDIS_URL = "redis://localhost:6379/0"
+ 
+ import twin_custody as tc
+@@ -931,7 +942,7 @@ def test_probe_clean_and_seeded_findings(customer_keys, tmp_path):
+ 
+         # run the probe AS THE CUSTOMER
+         pr = run_as("twincustomer", [PY, "twin_probe.py", "--receiver-url", url,
+-                    "--replica-id", r, "--feed-dsn", FEED_DSN,
++                    "--replica-id", r, "--feed-dsn", _feed_dsn(),
+                     "--submission-record", f"{kd}/subrec.jsonl", "--sla-seconds", "5",
+                     "--key-file", f"{kd}/probe.priv"], timeout=90)
+         assert pr.returncode == 2, pr.stdout[-1500:] + pr.stderr[-500:]
+@@ -957,7 +968,7 @@ def test_probe_clean_and_seeded_findings(customer_keys, tmp_path):
+         subrec2 = "\n".join(json.dumps({"sid": x["call_sid"], "t": time.time() - 100}) for x in seed2)
+         run_as("twincustomer", ["bash", "-lc", f"cat > {kd}/subrec2.jsonl <<'EOF'\n{subrec2}\nEOF"])
+         pr2 = run_as("twincustomer", [PY, "twin_probe.py", "--receiver-url", url,
+-                     "--replica-id", r2, "--feed-dsn", FEED_DSN,
++                     "--replica-id", r2, "--feed-dsn", _feed_dsn(),
+                      "--submission-record", f"{kd}/subrec2.jsonl", "--sla-seconds", "5",
+                      "--key-file", f"{kd}/probe.priv"], timeout=90)
+         assert pr2.returncode == 0, pr2.stdout[-1500:] + pr2.stderr[-500:]
+-- 
+2.43.0
+

@@ -1,0 +1,313 @@
+From 5e61d630f0ad67af09e528e33869485011421855 Mon Sep 17 00:00:00 2001
+From: William King <wking53214@gmail.com>
+Date: Sat, 18 Jul 2026 10:30:00 +0000
+Subject: [PATCH 2/2] F-J: converter for queue-identity mismatch between
+ ingress and worker
+
+First live run of ingress+worker together (every prior session tested
+them separately) found they resolve to DIFFERENT Redis key prefixes on
+stock defaults -- TRANSMISSION_NAMESPACE="tq" (ingress) vs --queue-name
+"v12" -> "sq:v12" (worker). A submitted job sat at pending forever,
+worker silently polled an empty keyspace, no error anywhere. Proven
+live before and after the fix.
+
+Chose a converter over a handshake: SENTINEL_QUEUE_ID is now the one
+identifier both processes derive their prefix from by default, instead
+of two independently-set values that happen to need to agree.
+TRANSMISSION_NAMESPACE / SENTINEL_QUEUE_NAME remain as explicit
+escape-hatch overrides for anyone deliberately running isolated queues.
+
+Verified: stock-defaults job now completes in <1s; 20 concurrent calls
+across 2 real workers -> 20/20 done, 14 ledger rows matching 14
+governed calls sent; test_queue_identity_converter.py (4 tests) locks
+in the fix and the negative case (explicit mismatched overrides still
+correctly fail, since those remain intentionally independent knobs).
+
+Full suite 100/100 (67 baseline + 29 breaker/rate-limiter + 4 new),
+three clean runs, each suite its own process.
+---
+ sentinel_os/api_server_v2.py                  |  21 +-
+ ...oadster_breakers_verification_report_v1.md |  18 ++
+ sentinel_os/sentinel_worker.py                |  12 +-
+ sentinel_os/test_queue_identity_converter.py  | 180 ++++++++++++++++++
+ 4 files changed, 228 insertions(+), 3 deletions(-)
+ create mode 100644 sentinel_os/test_queue_identity_converter.py
+
+diff --git a/sentinel_os/api_server_v2.py b/sentinel_os/api_server_v2.py
+index cc3ffad..f7b0991 100644
+--- a/sentinel_os/api_server_v2.py
++++ b/sentinel_os/api_server_v2.py
+@@ -125,7 +125,26 @@ logger = _project_logger("IngressV2")
+ # lease policy belongs to queue_schema.py defaults and the worker.
+ # --------------------------------------------------------------------------
+ REDIS_URL = os.getenv("TRANSMISSION_REDIS_URL", "redis://localhost:6379/0")
+-NAMESPACE = os.getenv("TRANSMISSION_NAMESPACE", "tq")
++
++# Converter, not a handshake (F-J: the ingress and worker used to have
++# two INDEPENDENT queue-identity knobs -- TRANSMISSION_NAMESPACE here,
++# --queue-name/SENTINEL_QUEUE_NAME on the worker -- that had to be set
++# to values which happened to resolve to the same physical Redis key
++# prefix. With stock defaults on both sides they did NOT (confirmed
++# live: a submitted job sat at 'pending' forever, the worker polled an
++# empty keyspace, no error anywhere). A handshake would only catch that
++# mismatch after the fact, at startup. This removes the second knob
++# instead: SENTINEL_QUEUE_ID is the one shared identifier both
++# processes read by default. The worker's queue library (queue_schema.py)
++# already turns a bare name into prefix "sq:{name}" for its dialect;
++# the ingress derives the identical prefix here rather than taking an
++# independently-set raw namespace. TRANSMISSION_NAMESPACE remains as an
++# explicit escape hatch for direct dialect-level control (e.g. running
++# the ingress against a namespace with no worker attached at all), and
++# takes precedence when set -- but nobody has to remember to set it for
++# the common case to work.
++_QUEUE_ID = os.getenv("SENTINEL_QUEUE_ID", "v12")
++NAMESPACE = os.getenv("TRANSMISSION_NAMESPACE") or f"sq:{_QUEUE_ID}"
+ MAX_BODY_BYTES = int(os.getenv("INGRESS_MAX_BODY_BYTES", str(256 * 1024)))
+ RETRY_AFTER_S = int(os.getenv("INGRESS_RETRY_AFTER_SECONDS", "5"))
+ 
+diff --git a/sentinel_os/roadster_breakers_verification_report_v1.md b/sentinel_os/roadster_breakers_verification_report_v1.md
+index 03de5dd..49a3a63 100644
+--- a/sentinel_os/roadster_breakers_verification_report_v1.md
++++ b/sentinel_os/roadster_breakers_verification_report_v1.md
+@@ -76,3 +76,21 @@ Run three times, each suite in its own process (this project's own established c
+ ## Scope confirmation
+ 
+ Delivered: `circuit_breaker.py`, `rate_limiter_v2.py`, `lua/rate_limit.lua`, `test_circuit_breaker.py`, `test_production_harness_breakers.py`, `test_rate_limiter_v2.py`, this report. Also modified, with explicit approval after reviewing an exact diff: `production_harness.py` (breaker instantiation + two call sites wrapped) and `api_server_v2.py` (one guard-seam attachment, made conditional on auth being configured after the regression above). No new dependency added — `requirements.txt` had no unused circuit-breaker or rate-limit library sitting there, so both are hand-rolled, consistent with everything else already in `governance/` and `queue_schema.py`. Not fixed, flagged for a future session: `sid_exists()`'s missing exception handling, and `operational_resilience.py`'s missing log-handler dedup guard.
++
++## Addendum: F-J, found while linking the transmission to the real worker/V12 harness for the first time
++
++Every prior session tested `api_server_v2.py` and `sentinel_worker.py` separately — the ingress suite drains jobs with a test Drainer standing in for the worker, and the worker suite calls `production_harness` directly with no queue in front. Neither had ever been run together as one connected system before this session.
++
++**The defect (F-J).** They have two independent queue-identity settings: the ingress's `TRANSMISSION_NAMESPACE` (default `"tq"`) and the worker's `--queue-name`/`SENTINEL_QUEUE_NAME` (default `"v12"`, which the queue library's "original" dialect prefixes to `"sq:v12"`). With stock defaults on both sides these resolve to **different Redis key prefixes.** Proven live: a call submitted through the real ingress sat at `pending` for 10 straight seconds while a real worker process logged a clean "Worker starting" and polled its own, completely empty keyspace — no error, no warning, anywhere. A job submitted in this configuration would be lost silently, forever, in production.
++
++**The fix — a converter, not a handshake.** William's framing, and the right call: a handshake only detects a mismatch after both sides are already independently configured; a converter removes the second knob so there's nothing to keep in sync. `SENTINEL_QUEUE_ID` is now the one identifier both processes read by default — the ingress derives `f"sq:{SENTINEL_QUEUE_ID}"` instead of taking an independent raw namespace, matching the worker's existing prefix convention exactly. `TRANSMISSION_NAMESPACE` (ingress) and `SENTINEL_QUEUE_NAME` (worker) remain as explicit escape hatches for anyone who deliberately wants direct dialect-level control (e.g. running two isolated queues) and take precedence when set — but the common case now needs zero coordination.
++
++**Verified live, both before and after the fix:**
++- Broken case reproduced first, honestly, before touching anything: stock defaults, job stuck at `pending`, worker never claims it.
++- Fix applied, same stock-defaults scenario re-run: submit → `done` in under a second, real ledger row.
++- Full real stack under load: 2 real worker processes draining 1 real ingress, 20 concurrent calls (mixed governed/ungoverned) → 20/20 done, 0 dead, 0 stuck, ledger row count (14) exactly matching the 14 governed calls sent.
++- `test_queue_identity_converter.py`, 4 tests, locking this in permanently: stock defaults resolve to the same prefix and complete a job; a shared non-default `SENTINEL_QUEUE_ID` keeps both sides aligned; the `TRANSMISSION_NAMESPACE` escape hatch still works when explicitly matched on both sides; and, as an honest negative case, deliberately setting the two escape-hatch knobs to genuinely *different* values still correctly fails to complete — documenting that the escape hatches remain two independent knobs by design, only the default path is now foolproof.
++
++**Regression:** full suite re-run three times after this change, each suite its own process — **100/100** (67 original baseline + 29 breaker/rate-limiter tests + 4 new converter tests).
++
++**NOT verified:** behavior when `SENTINEL_QUEUE_ID` is set on only one side (partial override) — the current design makes this behave as a genuine mismatch (same as the negative test case), which is arguably correct (partial configuration should not silently coerce), but wasn't tested explicitly as its own case. Also not verified: whether an even stronger guarantee (e.g., the ingress refusing to report `ready: true` if no worker has ever been observed draining its queue) would be worth adding — flagged as a possible future defense-in-depth layer, not built.
+diff --git a/sentinel_os/sentinel_worker.py b/sentinel_os/sentinel_worker.py
+index a260916..c7f98db 100644
+--- a/sentinel_os/sentinel_worker.py
++++ b/sentinel_os/sentinel_worker.py
+@@ -234,7 +234,7 @@ class SentinelWorker:
+         self.start_reaper()
+         idle_streak = 0
+         logger.info("Worker starting", extra={"extra_data": {
+-            "worker_id": self.worker_id}})
++            "worker_id": self.worker_id, "queue_prefix": self.queue.prefix}})
+         try:
+             while not self._stop.is_set():
+                 job = self.queue.claim(
+@@ -262,8 +262,16 @@ def main() -> None:
+     parser.add_argument("--worker-id", default=None)
+     parser.add_argument("--redis-url", default=os.getenv(
+         "SENTINEL_REDIS_URL", "redis://localhost:6379/0"))
++    # Converter (see api_server_v2.py's matching comment for the full
++    # story): SENTINEL_QUEUE_ID is the one identifier both this worker
++    # and the ingress read by default, so there is nothing for an
++    # operator to keep in sync across two processes by hand.
++    # SENTINEL_QUEUE_NAME remains available as an explicit override for
++    # anyone who wants this worker on a different queue than the
++    # ingress's default derivation would produce -- it takes precedence
++    # when set.
+     parser.add_argument("--queue-name", default=os.getenv(
+-        "SENTINEL_QUEUE_NAME", "v12"))
++        "SENTINEL_QUEUE_NAME", os.getenv("SENTINEL_QUEUE_ID", "v12")))
+     args = parser.parse_args()
+ 
+     harness = IcebergProductionHarness(_harness_config_from_env())
+diff --git a/sentinel_os/test_queue_identity_converter.py b/sentinel_os/test_queue_identity_converter.py
+new file mode 100644
+index 0000000..7fa59e9
+--- /dev/null
++++ b/sentinel_os/test_queue_identity_converter.py
+@@ -0,0 +1,180 @@
++"""test_queue_identity_converter.py -- live regression lock for F-J:
++the ingress (api_server_v2.py) and worker (sentinel_worker.py) used to
++have two INDEPENDENT queue-identity settings that had to be manually
++kept in sync (TRANSMISSION_NAMESPACE vs --queue-name/SENTINEL_QUEUE_NAME).
++With stock defaults on both sides they silently pointed at different
++Redis key prefixes -- a submitted job sat at 'pending' forever, the
++worker polled an empty keyspace, and nothing anywhere raised an error.
++
++This suite runs both processes together for real (not the Drainer
++test_api_server_v2.py otherwise uses) and proves:
++  1. Stock defaults, nothing configured beyond the Redis URL, resolve
++     to the SAME prefix on both sides and a submitted job actually
++     completes -- this is the converter fix itself, proven live.
++  2. The shared SENTINEL_QUEUE_ID override still keeps both sides
++     aligned when set to a non-default value.
++  3. TRANSMISSION_NAMESPACE remains a working escape hatch for direct
++     ingress-side control.
++
++Run:  python3 -m pytest test_queue_identity_converter.py -v -s
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import time
++import uuid
++
++import httpx
++import pytest
++
++BUILD_DIR = os.path.dirname(os.path.abspath(__file__))
++REDIS_URL = "redis://localhost:6379/0"
++INGRESS_PORT = 8220
++
++
++def wait_for(fn, timeout=15.0, interval=0.1, desc="condition"):
++    deadline = time.monotonic() + timeout
++    last = None
++    while time.monotonic() < deadline:
++        try:
++            out = fn()
++            if out:
++                return out
++        except Exception as exc:  # noqa: BLE001
++            last = exc
++        time.sleep(interval)
++    raise TimeoutError(f"timed out waiting for {desc} (last error: {last})")
++
++
++def sid() -> str:
++    return f"QIC{uuid.uuid4().hex}"
++
++
++def _flush(prefix: str):
++    subprocess.run(
++        f"redis-cli --scan --pattern '{prefix}:*' | xargs -r redis-cli del",
++        shell=True, capture_output=True,
++    )
++
++
++def _spawn(cmd, env_extra, logname):
++    env = os.environ.copy()
++    env.update(env_extra)
++    logf = open(os.path.join(BUILD_DIR, logname), "w")
++    return subprocess.Popen(cmd, cwd=BUILD_DIR, env=env, stdout=logf,
++                            stderr=subprocess.STDOUT, text=True)
++
++
++def _run_pair_and_submit(ingress_env: dict, worker_env: dict, port: int,
++                          timeout_s: float = 8.0) -> str:
++    """Spawn a real ingress + real worker with the given env, submit one
++    real governed call, and return its final polled status."""
++    ingress_env = {**{"TRANSMISSION_REDIS_URL": REDIS_URL, "PYTHONPATH": BUILD_DIR}, **ingress_env}
++    worker_env = {**{"SENTINEL_REDIS_URL": REDIS_URL, "PYTHONPATH": BUILD_DIR}, **worker_env}
++
++    ingress_proc = _spawn(
++        [sys.executable, "-m", "uvicorn", "api_server_v2:app",
++         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
++        ingress_env, f"qic_ingress_{port}.log",
++    )
++    worker_proc = _spawn(
++        [sys.executable, "sentinel_worker.py", "--worker-id", f"qic-{port}"],
++        worker_env, f"qic_worker_{port}.log",
++    )
++    try:
++        wait_for(lambda: httpx.get(f"http://127.0.0.1:{port}/health", timeout=1.0).status_code == 200,
++                 desc=f"ingress /health on :{port}")
++        call_sid = sid()
++        with httpx.Client(timeout=5.0) as c:
++            r = c.post(f"http://127.0.0.1:{port}/submit-call",
++                      json={"sid": call_sid, "status": "completed",
++                            "from": "+15551234567", "duration": 320, "start_time": 0})
++            assert r.status_code == 202, f"submit failed: {r.status_code} {r.text}"
++
++            deadline = time.monotonic() + timeout_s
++            last_status = None
++            while time.monotonic() < deadline:
++                jr = c.get(f"http://127.0.0.1:{port}/job/{call_sid}")
++                last_status = jr.json().get("status")
++                if last_status == "done":
++                    break
++                time.sleep(0.2)
++        return last_status
++    finally:
++        ingress_proc.terminate()
++        worker_proc.terminate()
++        try:
++            ingress_proc.wait(timeout=5)
++            worker_proc.wait(timeout=5)
++        except subprocess.TimeoutExpired:
++            ingress_proc.kill()
++            worker_proc.kill()
++
++
++def test_stock_defaults_resolve_to_same_prefix_and_job_completes():
++    """THE regression this file exists to prevent: nothing configured on
++    either side beyond the Redis URL. Before the converter fix, this
++    left the ingress on 'tq' and the worker on 'sq:v12' -- a job would
++    sit at 'pending' forever. After the fix, both derive 'sq:v12' from
++    the same default and the job must actually complete."""
++    _flush("tq")
++    _flush("sq:v12")
++    status = _run_pair_and_submit(ingress_env={}, worker_env={}, port=INGRESS_PORT)
++    assert status == "done", (
++        f"stock-default ingress/worker pair did not complete a job "
++        f"(got status={status!r}) -- the queue-identity converter may "
++        f"have regressed"
++    )
++
++
++def test_shared_queue_id_override_keeps_both_sides_aligned():
++    """A non-default SENTINEL_QUEUE_ID set on BOTH processes (the
++    supported way to run a second, isolated queue) must still resolve
++    both sides to the same prefix."""
++    _flush("sq:qic_custom")
++    status = _run_pair_and_submit(
++        ingress_env={"SENTINEL_QUEUE_ID": "qic_custom"},
++        worker_env={"SENTINEL_QUEUE_ID": "qic_custom"},
++        port=INGRESS_PORT + 1,
++    )
++    assert status == "done"
++
++
++def test_transmission_namespace_escape_hatch_still_works():
++    """TRANSMISSION_NAMESPACE (ingress-only, direct dialect control)
++    must still take precedence over SENTINEL_QUEUE_ID when explicitly
++    set, for anyone who wants it -- as long as the worker's queue-name
++    is set to match it directly (this is the escape hatch, not the
++    converter; alignment here is the operator's explicit choice, not
++    automatic, which is the whole point of it being an override)."""
++    _flush("manual_ns_match")
++    status = _run_pair_and_submit(
++        ingress_env={"TRANSMISSION_NAMESPACE": "sq:manual_ns_match"},
++        worker_env={"SENTINEL_QUEUE_NAME": "manual_ns_match"},
++        port=INGRESS_PORT + 2,
++    )
++    assert status == "done"
++
++
++def test_mismatched_explicit_overrides_still_silently_fail():
++    """Honest negative case: the escape hatches are still two
++    independent knobs by design (that's what makes them useful for
++    running deliberately separate queues) -- setting them to genuinely
++    different values must NOT complete a job. This documents that the
++    converter protects the DEFAULT path, not manual misuse of the
++    explicit override knobs."""
++    _flush("sq:mismatch_a")
++    _flush("sq:mismatch_b")
++    status = _run_pair_and_submit(
++        ingress_env={"SENTINEL_QUEUE_ID": "mismatch_a"},
++        worker_env={"SENTINEL_QUEUE_NAME": "mismatch_b"},
++        port=INGRESS_PORT + 3,
++        timeout_s=3.0,
++    )
++    assert status != "done", (
++        "expected the job to stay stuck when explicit overrides are "
++        "deliberately set to different values -- if this now completes, "
++        "something changed about how the escape hatches resolve"
++    )
+-- 
+2.43.0
+

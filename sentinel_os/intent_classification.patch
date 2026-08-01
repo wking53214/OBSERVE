@@ -1,0 +1,176 @@
+From 4dc63e6e6ec36481fceaef559340ed87a71dd867 Mon Sep 17 00:00:00 2001
+From: William <wking53214@users.noreply.github.com>
+Date: Mon, 13 Jul 2026 11:45:24 +0000
+Subject: [PATCH] Persist intent classification inline in governance ledger
+
+The Sentinel classifier (SentinelCore.infer_intent -> IntentSignal)
+already produced a cassette-native intent label, confidence, and
+reasoning, and fed them to the Bayesian engine in-flight -- but the
+label never reached the governance ledger, so it could not be audited
+after the fact, and no test asserted on the classification field (the
+very field an earlier bug had dropped).
+
+- production_harness.py: write intent_classification / _confidence /
+  _reasoning into the decision record's input_data, so the intent
+  inference rides inside the same SHA-256 chain as the decision it
+  informed. Answers 'what intent drove this governed call?' with a
+  tamper-evident record. Also surface classification in the return dict.
+- Tests/test_intent_classification_audit.py: 4 tests against the real
+  IvrCassette (no DB) locking in that known queues yield concrete
+  domain labels, unmapped queues degrade to UNKNOWN at low confidence,
+  every defined queue classifies non-trivially, and the persisted audit
+  payload shape is complete and correctly typed.
+---
+ .../Tests/test_intent_classification_audit.py | 109 ++++++++++++++++++
+ sentinel_os/production_harness.py             |  12 ++
+ 2 files changed, 121 insertions(+)
+ create mode 100644 sentinel_os/Tests/test_intent_classification_audit.py
+
+diff --git a/sentinel_os/Tests/test_intent_classification_audit.py b/sentinel_os/Tests/test_intent_classification_audit.py
+new file mode 100644
+index 0000000..f7200c9
+--- /dev/null
++++ b/sentinel_os/Tests/test_intent_classification_audit.py
+@@ -0,0 +1,109 @@
++"""
++Intent classification is produced AND survives to the audit trail.
++
++The classifier (SentinelCore.infer_intent -> IntentSignal) was already
++carrying a cassette-native intent label on its `classification` field,
++but two things went untested/unrecorded:
++
++  1. No test asserted on `classification` itself -- only queue_chosen
++     and confidence -- so a regression that dropped the label (its
++     original bug) would not have been caught.
++  2. The label reached in-flight consumers (Bayes) but was never
++     written to the governance ledger, so it could not be audited
++     after the fact.
++
++These tests lock in (1) directly against the real classifier with the
++real IvrCassette (no database), and lock in the *shape* the harness now
++persists for (2) -- the exact keys that ride inside the ledger's
++SHA-256 chain. They intentionally do NOT require a live PostgreSQL:
++the contract under test is "the classifier yields an auditable label
++and the harness carries it", which is verifiable without one.
++"""
++
++import sys
++import os
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from sentinel_core import SentinelCore, IntentSignal
++from cassettes.ivr_cassette import IvrCassette
++
++
++def test_known_queue_yields_domain_label():
++    """A mapped queue produces a concrete cassette-native label,
++    not the UNKNOWN sentinel, at high confidence."""
++    sentinel = SentinelCore(IvrCassette())
++
++    signal = sentinel.infer_intent(
++        ["root", "intent_menu", "billing_queue"], "billing_queue"
++    )
++
++    assert isinstance(signal, IntentSignal)
++    assert signal.classification == "BILLING"
++    assert signal.classification != "UNKNOWN"
++    assert signal.confidence > 0.8
++    # reasoning is human-readable provenance, not empty boilerplate
++    assert signal.reasoning
++    assert "billing_queue" in signal.reasoning
++    return True
++
++
++def test_unmapped_queue_is_unknown_low_confidence():
++    """An unmapped queue degrades to UNKNOWN with low confidence --
++    the classifier signals doubt rather than inventing an intent."""
++    sentinel = SentinelCore(IvrCassette())
++
++    signal = sentinel.infer_intent(["root", "mystery"], "nonsense_queue")
++
++    assert signal.classification == "UNKNOWN"
++    assert signal.confidence < 0.5
++    return True
++
++
++def test_classification_is_populated_for_every_defined_queue():
++    """Every queue the cassette defines classifies to a non-empty,
++    non-UNKNOWN label. Guards against a queue silently losing its
++    intent mapping."""
++    cassette = IvrCassette()
++    sentinel = SentinelCore(cassette)
++
++    queues = cassette.get_queue_definitions()
++    assert queues, "cassette should define at least one queue"
++
++    for queue_name in queues:
++        signal = sentinel.infer_intent(["root", queue_name], queue_name)
++        assert signal.classification, f"{queue_name} produced empty classification"
++        assert signal.classification != "UNKNOWN", (
++            f"{queue_name} is a defined queue but classified as UNKNOWN"
++        )
++    return True
++
++
++def test_audit_payload_shape_is_complete():
++    """The three intent fields the harness now writes into the ledger's
++    input_data (and thus into the SHA-256 chain) are all present and
++    typed as a regulator's audit query expects.
++
++    This mirrors the payload built in ProductionHarness before
++    ledger.append_decision, without needing a database: if any of these
++    fields regresses to missing/None, an auditor's 'what intent drove
++    this decision?' query silently loses an answer.
++    """
++    sentinel = SentinelCore(IvrCassette())
++    signal = sentinel.infer_intent(
++        ["root", "intent_menu", "billing_queue"], "billing_queue"
++    )
++
++    # The exact keys the harness persists inline in the decision record.
++    audit_payload = {
++        "intent_classification": signal.classification,
++        "intent_confidence": signal.confidence,
++        "intent_reasoning": signal.reasoning,
++    }
++
++    assert audit_payload["intent_classification"] == "BILLING"
++    assert isinstance(audit_payload["intent_confidence"], float)
++    assert 0.0 <= audit_payload["intent_confidence"] <= 1.0
++    assert isinstance(audit_payload["intent_reasoning"], str)
++    assert audit_payload["intent_reasoning"]
++    return True
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index f6aaf1f..e52d021 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -260,6 +260,17 @@ class IcebergProductionHarness:
+                         "governance_trigger": governance_trigger,
+                         "wait_time": journey.total_duration,
+                         "quality_tier": quality_score.quality_tier.value,
++                        # Intent inference that informed this decision.
++                        # Carried inline so the cassette-native intent
++                        # label, its confidence, and its reasoning ride
++                        # inside the same SHA-256 chain as the decision --
++                        # a regulator can ask "what intent did you infer
++                        # for this governed call?" and get a tamper-evident
++                        # answer, not a number the engine computed and
++                        # dropped.
++                        "intent_classification": intent_signal.classification,
++                        "intent_confidence": intent_signal.confidence,
++                        "intent_reasoning": intent_signal.reasoning,
+                     },
+                     policy_parameters=params.snapshot(),
+                     reasoning=claude_decision.get("reasoning", ""),
+@@ -280,6 +291,7 @@ class IcebergProductionHarness:
+             "resolved": journey.resolved,
+             "quality": quality_score.quality_tier.value,
+             "intent": intent_signal.queue_chosen,
++            "intent_classification": intent_signal.classification,
+             "emotion_frustration": emotion.frustration,
+             "claude_safe": claude_decision.get("safe") if claude_decision else None,
+             "governance_required": governed,
+-- 
+2.43.0
+

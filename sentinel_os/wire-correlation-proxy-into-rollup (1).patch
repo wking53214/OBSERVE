@@ -1,0 +1,354 @@
+From 5c61e64c99d523f83907e6e02f3dc2ecb7fcf6d9 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 01:08:22 +0000
+Subject: [PATCH] Wire correlation-based proxy detection into C2 rollup as
+ dimension 5
+
+The correlation-based proxy detector (check_correlation_based_proxy_detection,
+built July 24) was deliberately left unwired to the C2 rollup last session to
+avoid silently changing rollup behavior for existing callers -- it sat in
+regulatory_checks.py but CFPBRegBLens.c2_rollup() didn't know about it. Per
+request, wired it in today.
+
+New constant DIMENSION_CORRELATION_PROXY_SIGNAL added to regulatory_checks.py.
+CFPBRegBLens.c2_rollup() now accepts optional correlation_proxy_findings
+parameter (same interface pattern as statistical_outcome_equity_findings --
+pass [] for "evaluated and clean", [] for "evaluated with findings", None for
+"not yet evaluated" which forces INDETERMINATE). When passed, the correlation
+detection dimension is included in the rollup's AND logic.
+
+Updated cfpb_reg_b.py module docstring to document this as dimension 5
+(cohort-level like dimension 4), its narrow scope (numeric/boolean only,
+string/categorical intentionally unhandled), and how it mitigates the
+declared-name screens' vulnerability to variable renaming. Updated disclosed
+limitations to note the correlation check as a mitigation.
+
+Tests: 4 new c2_rollup-specific tests (empty correlation findings -> PASS,
+flagged correlation findings -> FLAG, None stays INDETERMINATE, proxy screen
+and correlation screen can flag together). Fixed 2 existing
+test_c2_statistical_outcome_equity.py tests and 2 existing
+test_regulatory_cassettes.py tests that were checking dimension counts -- all
+now expect both DIMENSION_CORRELATION_PROXY_SIGNAL and
+DIMENSION_STATISTICAL_OUTCOME_EQUITY in not_evaluated_dimensions when not
+explicitly passed.
+
+Full suite: 456 passed, 6 skipped (452 baseline + 4 new c2_rollup tests),
+run twice back-to-back with zero DB reset. ruff (pinned 0.15.22) and
+bandit -ll both clean.
+
+This closes out the only remaining open decision from July 24's bundle
+delivery: whether to wire the finding-2 correlation mitigation into the
+rollup. Now wired and shipped on main.
+---
+ .../test_c2_statistical_outcome_equity.py     |   8 +-
+ .../Tests/test_regulatory_cassettes.py        | 103 +++++++++++++++++-
+ .../regulatory_cassettes/cfpb_reg_b.py        |  68 ++++++++----
+ sentinel_os/regulatory_checks.py              |   1 +
+ 4 files changed, 153 insertions(+), 27 deletions(-)
+
+diff --git a/sentinel_os/Tests/test_c2_statistical_outcome_equity.py b/sentinel_os/Tests/test_c2_statistical_outcome_equity.py
+index f600033..9fd9182 100644
+--- a/sentinel_os/Tests/test_c2_statistical_outcome_equity.py
++++ b/sentinel_os/Tests/test_c2_statistical_outcome_equity.py
+@@ -190,7 +190,9 @@ def test_c2_rollup_flags_when_precomputed_dimension_4_result_flagged():
+     lens = CFPBRegBLens(version="1.0.0-d4-c")
+     cohort = _cohort(20, rate_a=0.9, rate_b=0.5)
+     d4_findings = check_statistical_outcome_equity(cohort, _PROFILE)
+-    rollup = lens.c2_rollup(_material(), statistical_outcome_equity_findings=d4_findings)
++    rollup = lens.c2_rollup(_material(),
++                            statistical_outcome_equity_findings=d4_findings,
++                            correlation_proxy_findings=[])
+     assert rollup.status == C2_FLAG
+     assert DIMENSION_STATISTICAL_OUTCOME_EQUITY in rollup.flagged_dimensions
+ 
+@@ -201,6 +203,8 @@ def test_c2_rollup_can_reach_pass_only_when_dimension_4_actually_clean():
+     other dimension flagged."""
+     lens = CFPBRegBLens(version="1.0.0-d4-d")
+     material = _material(inputs={"income": 90000})  # nothing proxy-shaped
+-    rollup = lens.c2_rollup(material, statistical_outcome_equity_findings=[])
++    rollup = lens.c2_rollup(material,
++                            statistical_outcome_equity_findings=[],
++                            correlation_proxy_findings=[])
+     from regulatory_checks import C2_PASS
+     assert rollup.status == C2_PASS
+diff --git a/sentinel_os/Tests/test_regulatory_cassettes.py b/sentinel_os/Tests/test_regulatory_cassettes.py
+index 1ac13df..5c09d8d 100644
+--- a/sentinel_os/Tests/test_regulatory_cassettes.py
++++ b/sentinel_os/Tests/test_regulatory_cassettes.py
+@@ -60,6 +60,7 @@ from regulatory_cassette_interface import (
+     RegulatoryCassette,
+     RegulatoryCassetteConfig,
+     RegulatoryCassetteRegistry,
++    RegulatoryFinding,
+     RegulatoryValidationError,
+     material_from_episode,
+     material_from_ledger_row,
+@@ -75,7 +76,10 @@ from regulatory_cassettes.cfpb_reg_b import (
+     CFPBRegBLens,
+ )
+ from regulatory_checks import (
++    C2_FLAG,
+     C2_INDETERMINATE,
++    C2_PASS,
++    DIMENSION_CORRELATION_PROXY_SIGNAL,
+     DIMENSION_INPUT_AUTHORIZATION_TIER,
+     DIMENSION_KNOWN_BAD_VARIABLE_NAMES,
+     DIMENSION_NARRATIVE_LEGITIMACY,
+@@ -925,13 +929,14 @@ def test_both_toggles_off_is_byte_identical_to_default_lens():
+ 
+     rollup = default.c2_rollup(material)
+     assert rollup.evaluated_dimensions == (DIMENSION_KNOWN_BAD_VARIABLE_NAMES,)
+-    assert rollup.not_evaluated_dimensions == (DIMENSION_STATISTICAL_OUTCOME_EQUITY,)
++    assert rollup.not_evaluated_dimensions == (DIMENSION_CORRELATION_PROXY_SIGNAL,
++                                               DIMENSION_STATISTICAL_OUTCOME_EQUITY)
+     # Dimensions 2/3 never appear at all -- omitted, not None.
+     assert DIMENSION_INPUT_AUTHORIZATION_TIER not in rollup.evaluated_dimensions
+     assert DIMENSION_INPUT_AUTHORIZATION_TIER not in rollup.not_evaluated_dimensions
+     assert DIMENSION_NARRATIVE_LEGITIMACY not in rollup.evaluated_dimensions
+     assert DIMENSION_NARRATIVE_LEGITIMACY not in rollup.not_evaluated_dimensions
+-    assert rollup.status == C2_INDETERMINATE  # dimension 4 always pending
++    assert rollup.status == C2_INDETERMINATE  # dimensions 4 & 5 always pending
+ 
+ 
+ def test_tier_screen_on_alone_wires_dimension_2_only():
+@@ -998,7 +1003,10 @@ def test_both_c2_toggles_on_wires_both_dimensions():
+         DIMENSION_INPUT_AUTHORIZATION_TIER,
+         DIMENSION_NARRATIVE_LEGITIMACY,
+     }
+-    assert rollup.not_evaluated_dimensions == (DIMENSION_STATISTICAL_OUTCOME_EQUITY,)
++    assert set(rollup.not_evaluated_dimensions) == {
++        DIMENSION_CORRELATION_PROXY_SIGNAL,
++        DIMENSION_STATISTICAL_OUTCOME_EQUITY,
++    }
+     assert rollup.status == C2_INDETERMINATE
+ 
+ 
+@@ -1031,3 +1039,92 @@ def test_toggling_either_c2_setting_bumps_content_hash():
+                            version=shared_version)
+     with pytest.raises(ValueError, match="binding conflict"):
+         RegulatoryDeck(L).insert(altered, MODE_OBSERVER, inserted_by="auditor:b")
++
++
++# ==========================================================================
++# 7. C2 rollup with correlation-based proxy detection
++# ==========================================================================
++
++def test_c2_rollup_with_empty_correlation_findings_passes():
++    """When correlation-based proxy detection has no findings (clean
++    cohort), c2_rollup includes the dimension as evaluated and clean."""
++    lens = CFPBRegBLens()
++    material = material_from_episode(_lending_episode(GENERIC_REASON,
++                                                       inputs={"amount": 5000}))
++    rollup = lens.c2_rollup(material,
++                            statistical_outcome_equity_findings=[],
++                            correlation_proxy_findings=[])
++    assert rollup.status == C2_PASS
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL in rollup.evaluated_dimensions
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL not in rollup.flagged_dimensions
++
++
++def test_c2_rollup_with_correlation_findings_flags():
++    """When correlation-based proxy detection has findings, c2_rollup
++    includes the dimension as flagged."""
++    lens = CFPBRegBLens()
++    episode = _lending_episode(GENERIC_REASON, inputs={"amount": 5000})
++    material = material_from_episode(episode)
++    # Manually create a correlation finding (simulating what the check would produce)
++    correlation_finding = RegulatoryFinding(
++        check="correlation_screen",
++        subject_id=episode.episode_id,
++        regulation="CFPB Reg B",
++        action="flag",
++        classification="correlation_based_proxy_signal",
++        score=0.75,
++        evidence={
++            "variable": "zip_code",
++            "group": "group_0",
++            "correlation": 0.75,
++            "threshold": 0.5,
++            "detail": "suspicious proxy pattern detected by value correlation",
++        },
++    )
++    rollup = lens.c2_rollup(material,
++                            statistical_outcome_equity_findings=[],
++                            correlation_proxy_findings=[correlation_finding])
++    assert rollup.status == C2_FLAG
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL in rollup.evaluated_dimensions
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL in rollup.flagged_dimensions
++    assert correlation_finding in rollup.findings
++
++
++def test_c2_rollup_correlation_none_stays_indeterminate():
++    """When correlation_proxy_findings is None (not yet evaluated),
++    c2_rollup stays INDETERMINATE."""
++    lens = CFPBRegBLens()
++    material = material_from_episode(_lending_episode(GENERIC_REASON,
++                                                       inputs={"amount": 5000}))
++    rollup = lens.c2_rollup(material,
++                            statistical_outcome_equity_findings=[],
++                            correlation_proxy_findings=None)
++    assert rollup.status == C2_INDETERMINATE
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL in rollup.not_evaluated_dimensions
++
++
++def test_c2_rollup_proxy_screen_and_correlation_both_flag():
++    """Dimension 1 (declared-name proxy) and dimension 5 (correlation
++    proxy) can flag together."""
++    lens = CFPBRegBLens()
++    episode = _lending_episode(GENERIC_REASON, inputs={"zip_code": "60601"})
++    material = material_from_episode(episode)
++    
++    correlation_finding = RegulatoryFinding(
++        check="correlation_screen",
++        subject_id=episode.episode_id,
++        regulation="CFPB Reg B",
++        action="flag",
++        classification="correlation_based_proxy_signal",
++        score=0.65,
++        evidence={"variable": "some_number", "detail": "test"},
++    )
++    rollup = lens.c2_rollup(material,
++                            statistical_outcome_equity_findings=[],
++                            correlation_proxy_findings=[correlation_finding])
++    
++    # Both dimension 1 (proxy/declared-name) and dimension 5 (correlation)
++    # should be in flagged_dimensions
++    assert DIMENSION_KNOWN_BAD_VARIABLE_NAMES in rollup.flagged_dimensions
++    assert DIMENSION_CORRELATION_PROXY_SIGNAL in rollup.flagged_dimensions
++    assert rollup.status == C2_FLAG
+diff --git a/sentinel_os/regulatory_cassettes/cfpb_reg_b.py b/sentinel_os/regulatory_cassettes/cfpb_reg_b.py
+index 6e79383..9ca9eb5 100644
+--- a/sentinel_os/regulatory_cassettes/cfpb_reg_b.py
++++ b/sentinel_os/regulatory_cassettes/cfpb_reg_b.py
+@@ -2,7 +2,8 @@
+ CFPB / ECOA / Regulation B lens -- the reference regulatory cassette.
+ 
+ Checks lending-shaped decisions against two Reg B expectations by
+-default, plus two independent OPT-IN C2 bias-identification screens:
++default, plus three independent C2 bias-identification screens (two per-
++decision OPT-IN, one cohort-level):
+ 
+ 1. Adverse-action reason SPECIFICITY (12 CFR 1002.9): when an outcome
+    differs from what was requested, the stated reasons must be
+@@ -51,7 +52,22 @@ default, plus two independent OPT-IN C2 bias-identification screens:
+    narrative_field for a specific deployment is, again, a data
+    decision left to whoever configures that deployment.
+ 
+-Both C2 opt-in screens are wired the same way block_on_placeholder
++5. Correlation-based proxy detection (C2 dimension 5, COHORT-LEVEL):
++   detects renamed proxies that evade declared-name screening by
++   analyzing input variable VALUES instead of names. For numeric and
++   boolean variables across a cohort, computes Pearson correlation
++   between each variable's value and sealed-channel group membership
++   probabilities; a high correlation (|r| >= 0.5, default threshold)
++   flags a suspicious proxy pattern. Like dimension 4 (statistical
++   outcome equity), this is cohort-level, not per-decision -- the
++   c2_rollup method accepts it as an optional parameter only. See
++   regulatory_checks.check_correlation_based_proxy_detection. Scope is
++   deliberately narrow and disclosed: numeric/boolean variables only;
++   string/categorical values are NOT screened this session, a real
++   remaining gap.
++
++The two per-decision C2 opt-in screens (dimensions 2 & 3) are wired the
++same way block_on_placeholder
+ already is: independent booleans that live in get_profile()'s
+ returned dict, so enabling either automatically changes this lens's
+ content hash (no new hashing logic needed -- see
+@@ -65,11 +81,15 @@ non-opted-in caller's rollup status to INDETERMINATE, which is exactly
+ the silent behavior change this lens avoids.
+ 
+ DISCLOSED LIMITATIONS (also documented in regulatory_checks, repeated
+-here because they apply directly to how this lens screens): renaming a
+-bad, proxy, or undeclared-tier variable to an innocuous name defeats
+-both the proxy screen and the tier screen alike. The narrative screen
+-cannot catch a sufficiently disconnected fabricated reason, and its
+-phrase matching is English-only to start.
++here because they apply directly to how this lens screens): the declared-
++name proxy screen (dimension 1) and declared-name tier screen (dimension 2)
++are both defeated by renaming a bad, proxy, or undeclared-tier variable
++to an innocuous name. The correlation-based proxy screen (dimension 5),
++when enabled, mitigates this by screening variable VALUES instead, so a
++simple rename no longer defeats detection -- but it requires cohort data
++and does not apply to string/categorical variables. The narrative screen
++(dimension 3) cannot catch a sufficiently disconnected fabricated reason,
++and its phrase matching is English-only to start.
+ 
+ FUTURE BLOCKING VARIANTS: block_on_placeholder shows the pattern for
+ granting a live insertion blocking behavior -- escalate a SPECIFIC
+@@ -109,6 +129,7 @@ from regulatory_cassette_interface import (
+     RegulatoryFinding,
+ )
+ from regulatory_checks import (
++    DIMENSION_CORRELATION_PROXY_SIGNAL,
+     DIMENSION_INPUT_AUTHORIZATION_TIER,
+     DIMENSION_KNOWN_BAD_VARIABLE_NAMES,
+     DIMENSION_NARRATIVE_LEGITIMACY,
+@@ -314,6 +335,7 @@ class CFPBRegBLens(RegulatoryCassette):
+ 
+     def c2_rollup(self, material: DecisionMaterial,
+                   statistical_outcome_equity_findings: Optional[List[RegulatoryFinding]] = None,
++                  correlation_proxy_findings: Optional[List[RegulatoryFinding]] = None,
+                   ) -> C2Rollup:
+         """Combine this lens's findings into one C2 bias-identification
+         status via rollup_c2_bias_identification.
+@@ -330,21 +352,20 @@ class CFPBRegBLens(RegulatoryCassette):
+         the silent default-behavior change this lens's opt-in design
+         avoids (see the class and module docstrings).
+ 
+-        Dimension 4 (statistical_outcome_equity) is COHORT-level, not
+-        per-decision (see regulatory_checks.check_statistical_outcome_
+-        equity's own docstring for why) -- this single-`material` method
+-        has no cohort of its own to compute it from. Default None:
+-        exactly the same "unbuilt/no data" posture as before dimension 4
+-        existed, so a caller who does nothing differently sees identical
+-        behavior. A caller that HAS already run
+-        check_statistical_outcome_equity against the relevant cohort
+-        (reading sealed-channel data -- never the live decision) may pass
+-        its findings list here (an empty list for a clean cohort result,
+-        a non-empty list for flagged groups) to have it included for
+-        real. Passing None still means "not yet evaluated" and keeps the
+-        rollup INDETERMINATE -- this method never runs the cohort check
+-        itself, so it cannot silently fabricate a result the caller
+-        didn't actually compute.
++        Dimension 4 (statistical_outcome_equity) and Dimension 5
++        (correlation_proxy_signal) are both COHORT-level, not per-decision
++        (see regulatory_checks.check_statistical_outcome_equity and
++        check_correlation_based_proxy_detection docstrings for why) --
++        this single-`material` method has no cohort of its own to compute
++        either from. Both default None: exactly the same "unbuilt/no data"
++        posture as before these dimensions existed, so a caller who does
++        nothing differently sees identical behavior. A caller that HAS
++        already run either check against the relevant cohort may pass its
++        findings list here (empty list for clean result, non-empty for
++        flagged) to have it included for real. Passing None still means
++        "not yet evaluated" and keeps the rollup INDETERMINATE -- this
++        method never runs cohort checks itself, so it cannot silently
++        fabricate a result the caller didn't actually compute.
+         """
+         dimension_findings: Dict[str, Any] = {
+             DIMENSION_KNOWN_BAD_VARIABLE_NAMES: check_proxy_variables(
+@@ -368,6 +389,9 @@ class CFPBRegBLens(RegulatoryCassette):
+         dimension_findings[DIMENSION_STATISTICAL_OUTCOME_EQUITY] = (
+             statistical_outcome_equity_findings
+         )
++        dimension_findings[DIMENSION_CORRELATION_PROXY_SIGNAL] = (
++            correlation_proxy_findings
++        )
+         return rollup_c2_bias_identification(dimension_findings)
+ 
+     def validate(self) -> bool:
+diff --git a/sentinel_os/regulatory_checks.py b/sentinel_os/regulatory_checks.py
+index cc6677e..9413f99 100644
+--- a/sentinel_os/regulatory_checks.py
++++ b/sentinel_os/regulatory_checks.py
+@@ -1293,6 +1293,7 @@ DIMENSION_KNOWN_BAD_VARIABLE_NAMES = "known_bad_variable_names"
+ DIMENSION_INPUT_AUTHORIZATION_TIER = "input_authorization_tier"
+ DIMENSION_NARRATIVE_LEGITIMACY = "narrative_legitimacy"
+ DIMENSION_STATISTICAL_OUTCOME_EQUITY = "statistical_outcome_equity"
++DIMENSION_CORRELATION_PROXY_SIGNAL = "correlation_proxy_signal"
+ 
+ C2_DIMENSIONS = (
+     DIMENSION_KNOWN_BAD_VARIABLE_NAMES,
+-- 
+2.43.0
+

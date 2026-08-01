@@ -1,0 +1,25 @@
+-- KEYS[1]=processing zset, KEYS[2]=scheduled zset, KEYS[3]=dead list
+-- ARGV[1]=job_id ARGV[2]=claim_token ARGV[3]=reason ARGV[4]=error_text
+-- ARGV[5]=backoff_base ARGV[6]=backoff_cap ARGV[7]=force_dead(0/1) ARGV[8]=job key prefix
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local jk = ARGV[8] .. ARGV[1]
+if redis.call('HGET', jk, 'claim_token') ~= ARGV[2] then return {'fenced'} end
+if redis.call('HGET', jk, 'status') ~= 'processing' then return {'fenced'} end
+local attempts = tonumber(redis.call('HGET', jk, 'attempts'))
+local maxa = tonumber(redis.call('HGET', jk, 'max_attempts'))
+local trail = cjson.decode(redis.call('HGET', jk, 'error_trail') or '[]')
+trail[#trail + 1] = {attempt = attempts, reason = ARGV[3], error = string.sub(ARGV[4], 1, 2000), at = now}
+while #trail > 20 do table.remove(trail, 1) end
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('HSET', jk, 'error_trail', cjson.encode(trail), 'updated_at', now, 'last_error', string.sub(ARGV[4], 1, 2000))
+if ARGV[7] == '1' or attempts >= maxa then
+  redis.call('HSET', jk, 'status', 'dead', 'dead_reason', ARGV[3], 'died_at', now)
+  redis.call('RPUSH', KEYS[3], ARGV[1])
+  return {'dead'}
+end
+local delay = math.min(tonumber(ARGV[6]), tonumber(ARGV[5]) * (2 ^ (attempts - 1)))
+local due = now + delay
+redis.call('HSET', jk, 'status', 'scheduled', 'scheduled_for', due)
+redis.call('ZADD', KEYS[2], due, ARGV[1])
+return {'scheduled', tostring(due)}

@@ -1,0 +1,476 @@
+From 672fcfd1b4a42e652ec45dcd59fae5bb5934865b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 11:55:05 +0000
+Subject: [PATCH] Fix Bayes learning-loop key mismatch; persist beliefs across
+ restarts
+
+production_harness.py was calling BayesianIntentEngine.observe_outcome()
+with intent_signal.queue_chosen (e.g. "billing_queue") while
+intent_stats is keyed by the cassette's short intent label (e.g.
+"billing"). observe_outcome() silently no-ops on an unmapped key, so
+every observation was dropped -- the belief state never changed no
+matter how many calls ran, with nothing anywhere recording that this
+was happening. Flagged by an independent repository review (24 Jul
+2026, commit 67eea1d9), verified directly against this code before
+any change was made.
+
+- production_harness.py: pass intent_signal.classification.lower()
+  instead of queue_chosen -- verified to match intent_stats for every
+  queue the IVR cassette defines.
+- queue_staffing_bayes_integration.py:
+  - observe_outcome() now logs a warning on an unmapped intent instead
+    of silently discarding it (same 'no silent pass' posture used
+    elsewhere in this repo).
+  - BayesianIntentEngine now persists observations to Redis
+    (SENTINEL_REDIS_URL / BAYES_REDIS_URL, same convention as every
+    other Redis-backed module here) via a per-resource CircuitBreaker,
+    and hydrates its starting beliefs from Redis on construction --
+    state now survives a worker restart and is shared across worker
+    processes instead of living only in one process's memory.
+  - When Redis is unreachable, fails open to the original in-memory-
+    only behavior (same exponential moving average as before) --
+    single-process, no-Redis deployments are unaffected.
+  - get_posterior() computes avg_handling_time as a plain running mean
+    of the persisted total when Redis is the shared source of truth,
+    not the local EMA -- an EMA can't be correctly resumed after a
+    restart or merged across worker processes, so this is a necessary
+    consequence of making the state durable, not a scope add.
+- Tests/test_bayes_learning_loop.py (new): regression coverage for the
+  key-mismatch bug generalized across every cassette queue (not just
+  billing_queue by hand), the unmapped-intent logging, fail-open
+  behavior with no Redis, and belief state surviving a simulated
+  restart via a dedicated throwaway redis-server.
+- Tests/test_queue_staffing_bayes.py: existing exact-value Bayes test
+  now forces in-memory-only (unreachable redis_url) so it stays
+  deterministic now that a real Redis is available in CI/sandbox.
+
+443 passed, 6 skipped, twice back-to-back (438 baseline + 5 new).
+ruff (0.15.22) clean, bandit -ll clean.
+---
+ sentinel_os/Tests/test_bayes_learning_loop.py | 147 +++++++++++++++
+ .../Tests/test_queue_staffing_bayes.py        |   6 +-
+ sentinel_os/production_harness.py             |  12 +-
+ .../queue_staffing_bayes_integration.py       | 178 +++++++++++++++---
+ 4 files changed, 319 insertions(+), 24 deletions(-)
+ create mode 100644 sentinel_os/Tests/test_bayes_learning_loop.py
+
+diff --git a/sentinel_os/Tests/test_bayes_learning_loop.py b/sentinel_os/Tests/test_bayes_learning_loop.py
+new file mode 100644
+index 0000000..e4b068a
+--- /dev/null
++++ b/sentinel_os/Tests/test_bayes_learning_loop.py
+@@ -0,0 +1,147 @@
++"""
++Regression coverage for the learning-loop bug flagged by the 24 July
++2026 independent repository review: production_harness.py was calling
++BayesianIntentEngine.observe_outcome() with the raw queue name (e.g.
++"billing_queue") while intent_stats is keyed by the cassette's short
++intent label (e.g. "billing"). observe_outcome() silently no-ops on an
++unrecognized key, so every observation was dropped -- the belief state
++never changed no matter how many calls ran, and nothing anywhere
++recorded that this was happening.
++
++Two things needed proving, so two things are tested here:
++
++  1. The actual key match, generalized across every queue the cassette
++     defines -- not just "billing_queue" was fixed by hand while a
++     sibling queue quietly has the same problem.
++  2. That state now survives a restart / is visible to a second worker,
++     via Redis -- previously it lived only in one process's memory.
++
++A third thing (a dropped/unmapped intent is now logged instead of
++silently discarded) is checked with a fresh in-memory-only engine,
++since it doesn't need Redis at all.
++"""
++
++import subprocess
++import sys
++import os
++import time
++
++import pytest
++import redis as redis_lib
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from sentinel_core import SentinelCore
++from cassettes.ivr_cassette import IvrCassette
++from queue_staffing_bayes_integration import BayesianIntentEngine
++
++PORT = 6404
++
++
++@pytest.fixture(scope="module")
++def redis_url(tmp_path_factory):
++    d = tmp_path_factory.mktemp("redis-bayes")
++    proc = subprocess.Popen(
++        ["redis-server", "--port", str(PORT), "--dir", str(d),
++         "--save", "", "--appendonly", "no",
++         "--logfile", str(d / "redis.log")])
++    c = redis_lib.Redis(port=PORT, socket_connect_timeout=0.5)
++    deadline = time.monotonic() + 10
++    while time.monotonic() < deadline:
++        try:
++            if c.ping():
++                break
++        except redis_lib.exceptions.RedisError:
++            time.sleep(0.1)
++    else:
++        raise RuntimeError("redis-server never came up for Bayes tests")
++    c.close()
++    yield f"redis://localhost:{PORT}/0"
++    proc.terminate()
++    proc.wait(timeout=5)
++
++
++@pytest.fixture(autouse=True)
++def _clean_db(redis_url):
++    """Every test starts against an empty store -- a shared module-scoped
++    redis-server means state would otherwise leak between tests."""
++    c = redis_lib.Redis.from_url(redis_url)
++    c.flushdb()
++    c.close()
++    yield
++
++
++def test_every_defined_queue_produces_a_key_bayes_recognizes():
++    """The general form of the bug: for every queue the cassette
++    defines, the label the harness now hands to observe_outcome must
++    actually be a key BayesianIntentEngine tracks. This would have
++    caught the original bug (and catches a future cassette adding a
++    queue without a matching Bayes entry)."""
++    cassette = IvrCassette()
++    sentinel = SentinelCore(cassette)
++    bayes = BayesianIntentEngine(redis_url="redis://localhost:1/0")  # unreachable -> in-memory only
++
++    for queue_name in cassette.get_queue_definitions():
++        signal = sentinel.infer_intent(["root", queue_name], queue_name)
++        key = signal.classification.lower()
++        if signal.classification == "UNKNOWN":
++            continue  # no Bayes bucket for unmapped queues -- that's expected
++        assert key in bayes.intent_stats, (
++            f"queue '{queue_name}' classifies to '{key}', which "
++            f"BayesianIntentEngine doesn't track -- its observations "
++            f"would be silently dropped exactly like the original bug"
++        )
++
++
++def test_observation_actually_changes_belief_state():
++    """The literal regression: calling observe_outcome with the label
++    the harness now sends must move the posterior, not no-op."""
++    bayes = BayesianIntentEngine(redis_url="redis://localhost:1/0")
++
++    before = bayes.get_posterior("billing")
++    assert before.confidence == 0.0  # nothing observed yet
++
++    for _ in range(10):
++        bayes.observe_outcome("billing", True, 4.0)
++
++    after = bayes.get_posterior("billing")
++    assert after.confidence > before.confidence
++    assert after.success_rate == 1.0
++
++
++def test_unmapped_intent_is_logged_not_silently_dropped(caplog):
++    bayes = BayesianIntentEngine(redis_url="redis://localhost:1/0")
++
++    with caplog.at_level("WARNING"):
++        bayes.observe_outcome("billing_queue", True, 4.0)  # the old (wrong) key
++
++    assert any("dropped outcome" in rec.message for rec in caplog.records)
++    # and it must not have been silently credited to anything
++    assert bayes.get_posterior("billing").confidence == 0.0
++
++
++def test_belief_survives_a_restart(redis_url):
++    """The durability half of the fix: a second engine instance,
++    constructed fresh (simulating a worker restart, or a second
++    worker process), must inherit what the first one learned."""
++    engine_a = BayesianIntentEngine(redis_url=redis_url)
++    for _ in range(12):
++        engine_a.observe_outcome("technical", True, 6.0)
++    for _ in range(4):
++        engine_a.observe_outcome("technical", False, 9.0)
++
++    # New instance = new process, simulating a restart
++    engine_b = BayesianIntentEngine(redis_url=redis_url)
++    posterior = engine_b.get_posterior("technical")
++
++    assert posterior.success_rate == 0.75  # 12 of 16 resolved
++    assert posterior.confidence > 0.0
++
++
++def test_fails_open_when_redis_unreachable():
++    """No real Redis at all -- must behave exactly like the original
++    in-memory-only engine, not raise."""
++    bayes = BayesianIntentEngine(redis_url="redis://localhost:1/0")
++    bayes.observe_outcome("sales", True, 3.0)
++    posterior = bayes.get_posterior("sales")
++    assert posterior.success_rate == 1.0
+diff --git a/sentinel_os/Tests/test_queue_staffing_bayes.py b/sentinel_os/Tests/test_queue_staffing_bayes.py
+index efba15b..553c820 100644
+--- a/sentinel_os/Tests/test_queue_staffing_bayes.py
++++ b/sentinel_os/Tests/test_queue_staffing_bayes.py
+@@ -52,7 +52,11 @@ def test_staffing_adjustment():
+ 
+ def test_bayes_intent():
+     print("\n[TEST 3] Bayesian intent learning")
+-    bayes = BayesianIntentEngine()
++    # Unreachable URL -> forces in-memory-only, so this stays deterministic
++    # regardless of whether a real Redis happens to be available (CI now
++    # runs one; see Tests/test_bayes_learning_loop.py for the Redis-backed
++    # persistence coverage).
++    bayes = BayesianIntentEngine(redis_url="redis://localhost:1/0")
+     
+     # Simulate 20 billing calls: 15 resolved, 5 not
+     for i in range(15):
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 11cae5a..2c857f0 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -318,8 +318,18 @@ class IcebergProductionHarness:
+                 self.metrics.record_drift_detection(first_queue, 0.2)
+ 
+             # 6. Bayes: Update intent success rates
++            #
++            # Previously passed intent_signal.queue_chosen (e.g.
++            # "billing_queue"), but BayesianIntentEngine.intent_stats is
++            # keyed by the cassette's short intent labels (e.g. "billing").
++            # observe_outcome() silently no-ops on an unrecognized key, so
++            # every single observation was dropped -- the belief state
++            # never updated no matter how many calls ran. classification
++            # is the cassette-native label ("BILLING", "UNKNOWN", ...);
++            # lowercased it matches intent_stats exactly for every mapped
++            # queue.
+             self.bayes.observe_outcome(
+-                intent_signal.queue_chosen,
++                intent_signal.classification.lower(),
+                 journey.resolved,
+                 journey.total_duration
+             )
+diff --git a/sentinel_os/queue_staffing_bayes_integration.py b/sentinel_os/queue_staffing_bayes_integration.py
+index f9a6d58..aa80c5b 100644
+--- a/sentinel_os/queue_staffing_bayes_integration.py
++++ b/sentinel_os/queue_staffing_bayes_integration.py
+@@ -5,8 +5,25 @@ Connects governance signals → staffing adjustments → queue dynamics → Baye
+ """
+ 
+ from dataclasses import dataclass
+-from typing import Dict, List, Optional
++from typing import Dict, List, Optional, Tuple
+ import math
++import os
++
++import redis
++
++from operational_resilience import setup_logging
++from circuit_breaker import CircuitBreaker
++
++logger = setup_logging("BayesianIntentEngine")
++
++# Same env-var convention every other Redis-backed module in this repo
++# uses (sentinel_worker.py, twin_shipper.py, queue_schema.py, ...).
++# BAYES_REDIS_URL is an override for cases where the Bayes store should
++# live on a separate instance from the queue/twin traffic; falls back to
++# the shared default like everything else.
++_REDIS_URL = os.getenv(
++    "BAYES_REDIS_URL", os.getenv("SENTINEL_REDIS_URL", "redis://localhost:6379/0")
++)
+ 
+ @dataclass
+ class QueueState:
+@@ -130,53 +147,170 @@ class StaffingCoordinator:
+         )
+ 
+ class BayesianIntentEngine:
+-    """Updates P(resolution | intent) based on call outcomes"""
+-    
+-    def __init__(self):
++    """Updates P(resolution | intent) based on call outcomes.
++
++    State is durable and shared across worker processes when Redis is
++    reachable: every observation is written to a per-intent Redis hash
++    (best-effort, never blocking or raising into the caller), and a
++    fresh instance hydrates its starting beliefs from whatever the
++    other workers have already recorded instead of starting at zero.
++    If Redis is unreachable at construction or degrades mid-flight,
++    this falls back to the original in-memory-only behavior -- fails
++    open, same as every other Redis-backed component in this repo
++    (rate_limiter_v2, PostgreSQLLedger via its circuit breaker, etc.).
++    """
++
++    _DEFAULTS = {
++        "billing": {"resolved": 0, "total": 0, "avg_handle": 5.0},
++        "technical": {"resolved": 0, "total": 0, "avg_handle": 8.0},
++        "sales": {"resolved": 0, "total": 0, "avg_handle": 10.0},
++        "cancel": {"resolved": 0, "total": 0, "avg_handle": 6.0},
++        "upgrade": {"resolved": 0, "total": 0, "avg_handle": 7.0},
++        "complaint": {"resolved": 0, "total": 0, "avg_handle": 12.0},
++        "general": {"resolved": 0, "total": 0, "avg_handle": 4.0},
++    }
++
++    def __init__(self, redis_url: Optional[str] = None):
+         self.intent_stats = {
+-            "billing": {"resolved": 0, "total": 0, "avg_handle": 5.0},
+-            "technical": {"resolved": 0, "total": 0, "avg_handle": 8.0},
+-            "sales": {"resolved": 0, "total": 0, "avg_handle": 10.0},
+-            "cancel": {"resolved": 0, "total": 0, "avg_handle": 6.0},
+-            "upgrade": {"resolved": 0, "total": 0, "avg_handle": 7.0},
+-            "complaint": {"resolved": 0, "total": 0, "avg_handle": 12.0},
+-            "general": {"resolved": 0, "total": 0, "avg_handle": 4.0},
++            intent: dict(stats) for intent, stats in self._DEFAULTS.items()
+         }
+-    
++
++        self._redis: Optional["redis.Redis"] = None
++        self._breaker = CircuitBreaker(
++            name="bayes_redis", failure_threshold=3, reset_timeout_s=15,
++        )
++
++        url = redis_url or _REDIS_URL
++        try:
++            client = redis.Redis.from_url(
++                url, socket_timeout=2.0, socket_connect_timeout=2.0,
++                decode_responses=True,
++            )
++            client.ping()
++            self._redis = client
++            self._hydrate_from_redis()
++        except (redis.exceptions.RedisError, OSError) as exc:
++            logger.warning(
++                f"Bayes: Redis unavailable at startup ({exc}) -- "
++                "running in-memory only, beliefs will not survive a restart"
++            )
++            self._redis = None
++
++    @staticmethod
++    def _redis_key(intent: str) -> str:
++        return f"bayes:intent:{intent}"
++
++    def _hydrate_from_redis(self) -> None:
++        """Pull in whatever the collective belief already is, so a
++        freshly started worker doesn't act like nothing has ever been
++        learned about any intent."""
++        for intent in self.intent_stats:
++            raw = self._redis.hgetall(self._redis_key(intent))
++            if not raw:
++                continue
++            total = int(raw.get("total", 0))
++            resolved = int(raw.get("resolved", 0))
++            handle_sum = float(raw.get("handle_sum", 0.0))
++            self.intent_stats[intent]["total"] = total
++            self.intent_stats[intent]["resolved"] = resolved
++            if total > 0:
++                self.intent_stats[intent]["avg_handle"] = handle_sum / total
++
++    def _persist_observation(self, intent: str, resolved: bool, handle_time: float) -> None:
++        key = self._redis_key(intent)
++        pipe = self._redis.pipeline()
++        pipe.hincrby(key, "total", 1)
++        if resolved:
++            pipe.hincrby(key, "resolved", 1)
++        pipe.hincrbyfloat(key, "handle_sum", handle_time)
++        pipe.execute()
++
++    def _read_remote_stats(self, intent: str) -> Optional[Tuple[int, int, float]]:
++        raw = self._redis.hgetall(self._redis_key(intent))
++        if not raw:
++            return None
++        return (
++            int(raw.get("total", 0)),
++            int(raw.get("resolved", 0)),
++            float(raw.get("handle_sum", 0.0)),
++        )
++
+     def observe_outcome(self, intent: str, resolved: bool, handle_time: float):
+         """Update beliefs based on call outcome"""
+-        
++
+         if intent not in self.intent_stats:
++            # Previously a silent no-op -- a caller passing the wrong key
++            # (e.g. a queue name instead of an intent label) lost the
++            # observation with no trace anywhere. Now it's visible.
++            logger.warning(
++                f"Bayes: dropped outcome for unmapped intent '{intent}' -- "
++                f"no matching entry in intent_stats (known: {sorted(self.intent_stats)})"
++            )
+             return
+-        
++
++        # In-memory update -- always happens, regardless of Redis. This
++        # is the only state used when Redis is unavailable, and is
++        # exactly the pre-existing behavior (same exponential moving
++        # average) so a single-process, no-Redis deployment behaves
++        # identically to before this change.
+         self.intent_stats[intent]["total"] += 1
+         if resolved:
+             self.intent_stats[intent]["resolved"] += 1
+-        
+-        # Update avg handle time (exponential moving average)
+         old_avg = self.intent_stats[intent]["avg_handle"]
+         self.intent_stats[intent]["avg_handle"] = 0.9 * old_avg + 0.1 * handle_time
+-    
++
++        if self._redis is not None:
++            try:
++                self._breaker.call(self._persist_observation, intent, resolved, handle_time)
++            except Exception as exc:
++                logger.debug(
++                    f"Bayes: Redis persistence skipped for this observation "
++                    f"('{intent}'): {exc}. In-memory belief still updated."
++                )
++
+     def get_posterior(self, intent: str) -> BayesUpdate:
+         """Get current belief about intent"""
+-        
++
+         if intent not in self.intent_stats:
+             return BayesUpdate(intent, 0.5, 5.0, 0.0)
+-        
++
+         stats = self.intent_stats[intent]
+         total = stats["total"]
+-        
++        avg_handle = stats["avg_handle"]
++
++        if self._redis is not None:
++            try:
++                remote = self._breaker.call(self._read_remote_stats, intent)
++                if remote is not None:
++                    remote_total, remote_resolved, handle_sum = remote
++                    total = remote_total
++                    stats["total"] = remote_total
++                    stats["resolved"] = remote_resolved
++                    if remote_total > 0:
++                        # Plain running mean of what's actually been
++                        # observed across every worker -- not the local
++                        # EMA, which (by design) can't be correctly
++                        # resumed after a restart or merged across
++                        # processes. Only used when Redis is the shared
++                        # source of truth; the in-memory EMA above is
++                        # untouched and is exactly what's used when
++                        # Redis is unavailable.
++                        avg_handle = handle_sum / remote_total
++                        stats["avg_handle"] = avg_handle
++            except Exception as exc:
++                logger.debug(f"Bayes: Redis read skipped for '{intent}': {exc}. Using local state.")
++
+         if total == 0:
+             success_rate = 0.5
+             confidence = 0.0
+         else:
+             success_rate = stats["resolved"] / total
+             confidence = min(total / 100, 1.0)  # Confidence grows to 100 samples
+-        
++
+         return BayesUpdate(
+             intent=intent,
+             success_rate=success_rate,
+-            avg_handling_time=stats["avg_handle"],
++            avg_handling_time=avg_handle,
+             confidence=confidence
+         )
+ 
+-- 
+2.43.0
+

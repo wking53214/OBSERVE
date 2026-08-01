@@ -1,0 +1,2524 @@
+From 96d5ca3efcd00dfa7f33c8f770c8ed2c1c1a9fe4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 23 Jul 2026 02:14:35 +0000
+Subject: [PATCH] Cassette kernel/capability split: domain-blind kernel +
+ opt-in capability modules
+
+KERNEL (every cassette, every industry): identity, typed parameter
+declarations, judge(episode) -> QualityResult with cassette-owned
+cutoffs, explain(episode) -> factor-level reasons, and a CAPABILITIES
+manifest. Kernel-required parameters: governance_trigger only.
+
+CAPABILITIES (opt-in, each owns its parameters and methods):
+- telephony_ingest: twilio_* thresholds, long_wait_threshold,
+  score_outcome_quality / diagnose_abandonment / get_friction_thresholds
+- routing_topology: get_queue_definitions / _infer_intent_to_label
+- rl: compute_reward
+- self_healing: get_healing_bounds, expected_wait_bounds
+
+Load-time validation (schema 2.0.0) checks kernel + union of enabled
+capabilities, verifies enabled capabilities' methods exist, and
+REJECTS any declared parameter owned by a disabled capability (the
+anti-placeholder rule). Snapshots record the manifest.
+
+episode.py: kernel ground-truth record. Invariants enforced at
+validation, before any judgment path: (1) a reason is owed on ANY
+requested-vs-actual mismatch -- paid-but-reduced counts, not just
+formal denials; (2) actor self-report is cross-checked against the
+observed record (twin posture) and never read by judgment;
+divergences are prepended to every explanation.
+
+IVR: reference implementation, all four capabilities, judge proven
+arithmetically identical to score_outcome_quality (equivalence sweep).
+Banking: routing + rl + self_healing; placeholder twilio thresholds
+removed; judgment moved to kernel surface, arithmetic unchanged;
+refused at the door by telephony pipelines (SentinelCore, harnesses,
+Twilio ingest all guard at construction). Both cassettes 2.0.0: code
+hash changed, binding enforcement requires a new version identity.
+
+Pre-existing defect fixed: serialize_cassette_for_ledger duplicated
+snapshot serialization and had drifted; now delegates to
+GovernanceParameters.snapshot().
+
+Tests: 307 passed (279 baseline + 28 new), including a kernel-only
+cassette with zero telephony surface that loads, validates, and
+judges episodes.
+---
+ docs/CHANGELOG.md                             |  43 +++
+ .../Tests/test_cassette_capabilities.py       | 257 ++++++++++++++++
+ .../Tests/test_cassette_snapshot_forensics.py |   6 +-
+ .../Tests/test_cassette_source_of_truth.py    |  20 +-
+ sentinel_os/Tests/test_cassette_system.py     |  72 +++--
+ sentinel_os/Tests/test_episode.py             | 243 +++++++++++++++
+ sentinel_os/Tests/test_phase2_limitations.py  |   8 +-
+ sentinel_os/cassette_capabilities.py          | 209 +++++++++++++
+ sentinel_os/cassette_forensics.py             |  25 +-
+ sentinel_os/cassette_harness.py               |  21 ++
+ sentinel_os/cassette_interface.py             | 135 ++++----
+ sentinel_os/cassette_schema.py                | 160 +++++++---
+ sentinel_os/cassettes/banking_cassette.py     | 277 ++++++++++-------
+ sentinel_os/cassettes/ivr_cassette.py         | 146 ++++++++-
+ sentinel_os/episode.py                        | 287 ++++++++++++++++++
+ sentinel_os/production_harness.py             |  29 ++
+ sentinel_os/sentinel_core.py                  |  17 ++
+ sentinel_os/twilio_log_ingestion.py           |  18 ++
+ 18 files changed, 1724 insertions(+), 249 deletions(-)
+ create mode 100644 sentinel_os/Tests/test_cassette_capabilities.py
+ create mode 100644 sentinel_os/Tests/test_episode.py
+ create mode 100644 sentinel_os/cassette_capabilities.py
+ create mode 100644 sentinel_os/episode.py
+
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index fd0dc04..5d455b3 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -3,6 +3,49 @@
+ Dated, human-readable summary of notable changes. Git history has the
+ full detail; this is the skim version.
+ 
++## 2026-07-23
++
++- **Cassette kernel/capability split** — the cassette contract is no
++  longer IVR-shaped. A minimal domain-blind KERNEL (identity, typed
++  parameter declarations, `judge(episode)` / `explain(episode)`) plus
++  four opt-in CAPABILITY modules (`telephony_ingest`,
++  `routing_topology`, `rl`, `self_healing`), each owning its own
++  parameters and methods. A cassette declares a `CAPABILITIES`
++  manifest; load-time validation checks kernel + the union of enabled
++  capabilities, and **rejects any parameter owned by a disabled
++  capability** — the anti-placeholder rule. Schema `2.0.0`; snapshots
++  now record the manifest.
++- **Episode ground-truth record** (`episode.py`) — kernel-level record
++  of requested vs. actual outcome with two enforced invariants: a
++  reason is owed on ANY outcome mismatch (paid-but-reduced counts,
++  not just formal denials), and the actor's self-report is always
++  cross-checked against the observed record (twin posture), with
++  divergences surfaced ahead of the cassette's own factors in every
++  explanation. No judgment path admits an unvalidated episode.
++- **Banking cassette is honest now** — declares
++  routing + rl + self_healing only; the three flagged placeholder
++  `twilio_*` thresholds are gone (validation would now refuse them),
++  and its judgment moved to the kernel surface with arithmetic
++  unchanged. Consequence: banking is refused by the telephony
++  pipelines at the door (legible capability error at construction)
++  instead of pretending Twilio-readiness it never had.
++- **IVR is the reference implementation** — enables all four
++  capabilities; kernel `judge` proven arithmetically identical to the
++  legacy `score_outcome_quality` by an equivalence sweep. Version
++  `2.0.0` (identity, not behavior: the code hash changed, and binding
++  enforcement correctly refuses a changed hash under an old version).
++- **Engines guard their doors** — `SentinelCore`, `CassetteHarness`,
++  `IcebergProductionHarness` (construction and swap), and Twilio
++  ingest each refuse a cassette missing the capabilities they read,
++  at construction rather than mid-call.
++- **Pre-existing defect fixed** — `serialize_cassette_for_ledger`
++  duplicated the snapshot serialization and had silently drifted from
++  `GovernanceParameters.snapshot()`; it now delegates to the single
++  source of truth.
++- Full suite: 307 passed (279 baseline + 28 new proof tests, including
++  a kernel-only cassette with zero telephony surface that loads,
++  validates, and judges — the shape a hiring cassette starts from).
++
+ ## 2026-07-22
+ 
+ - **Phase 2 merged** — closed 6 of 7 Known Limitations: cassette
+diff --git a/sentinel_os/Tests/test_cassette_capabilities.py b/sentinel_os/Tests/test_cassette_capabilities.py
+new file mode 100644
+index 0000000..e9542e1
+--- /dev/null
++++ b/sentinel_os/Tests/test_cassette_capabilities.py
+@@ -0,0 +1,257 @@
++"""
++test_cassette_capabilities -- kernel/capability split proof suite.
++
++Proves the manifest is the contract: required parameters are kernel +
++the union of enabled capabilities; enabling a capability obligates its
++methods; declaring a parameter owned by a DISABLED capability is
++refused (the anti-placeholder rule); every telephony-shaped engine
++refuses a non-telephony cassette at the door; and -- the point of the
++whole split -- a kernel-only cassette with zero call-center surface
++loads, validates, and judges episodes.
++"""
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from cassette_capabilities import (
++    CAPABILITIES,
++    CAPABILITY_RL,
++    CAPABILITY_ROUTING_TOPOLOGY,
++    CAPABILITY_SELF_HEALING,
++    CAPABILITY_TELEPHONY_INGEST,
++    CapabilityError,
++    PARAMETER_OWNERS,
++    require_capabilities,
++)
++from cassette_interface import Cassette, CassetteConfig, QualityResult
++from cassette_schema import (
++    CassetteValidationError,
++    KERNEL_REQUIRED_PARAMETERS,
++    required_parameters_for,
++    validate_cassette,
++)
++from cassettes.banking_cassette import BankingCassette
++from cassettes.ivr_cassette import IvrCassette
++from episode import judge_episode, make_episode
++
++
++# ---------------------------------------------------------------------------
++# The manifests as shipped.
++# ---------------------------------------------------------------------------
++
++def test_ivr_is_the_full_reference_implementation():
++    assert sorted(IvrCassette.CAPABILITIES) == [
++        CAPABILITY_RL, CAPABILITY_ROUTING_TOPOLOGY,
++        CAPABILITY_SELF_HEALING, CAPABILITY_TELEPHONY_INGEST]
++
++
++def test_banking_does_not_enable_telephony():
++    assert CAPABILITY_TELEPHONY_INGEST not in BankingCassette.CAPABILITIES
++
++
++def test_parameter_ownership_map():
++    """Every capability-owned parameter names exactly one owner; the
++    kernel set and the owned sets are disjoint."""
++    assert PARAMETER_OWNERS["twilio_long_duration_threshold"] == CAPABILITY_TELEPHONY_INGEST
++    assert PARAMETER_OWNERS["long_wait_threshold"] == CAPABILITY_TELEPHONY_INGEST
++    assert PARAMETER_OWNERS["expected_wait_bounds"] == CAPABILITY_SELF_HEALING
++    assert not set(KERNEL_REQUIRED_PARAMETERS) & set(PARAMETER_OWNERS)
++
++
++def test_required_set_is_kernel_plus_enabled_union():
++    assert required_parameters_for(()) == KERNEL_REQUIRED_PARAMETERS
++    with_tel = required_parameters_for((CAPABILITY_TELEPHONY_INGEST,))
++    assert set(with_tel) == {"governance_trigger", "long_wait_threshold",
++                             "twilio_long_duration_threshold",
++                             "twilio_medium_duration_threshold",
++                             "twilio_short_duration_threshold"}
++    everything = required_parameters_for(tuple(CAPABILITIES))
++    assert set(everything) == set(with_tel) | {"expected_wait_bounds"}
++
++
++# ---------------------------------------------------------------------------
++# Manifest validation is fail-closed in every direction.
++# ---------------------------------------------------------------------------
++
++def test_unknown_capability_refused():
++    class MysteryCassette(IvrCassette):
++        CAPABILITIES = ("telepathy_ingest",)
++
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(MysteryCassette())
++    assert any("telepathy_ingest" in v for v in exc.value.violations)
++
++
++def test_missing_manifest_refused():
++    class UndeclaredCassette(IvrCassette):
++        CAPABILITIES = None
++
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(UndeclaredCassette())
++    assert any("no CAPABILITIES manifest" in v for v in exc.value.violations)
++
++
++def test_enabled_capability_requires_its_methods():
++    """A manifest that promises telephony without implementing its
++    judgment surface is a load-time violation, not a runtime surprise."""
++    class OverpromisingCassette(BankingCassette):
++        CAPABILITIES = BankingCassette.CAPABILITIES + (CAPABILITY_TELEPHONY_INGEST,)
++
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(OverpromisingCassette())
++    joined = "\n".join(exc.value.violations)
++    assert "telephony_ingest" in joined
++    assert "score_outcome_quality" in joined  # names the missing method
++    assert "long_wait_threshold" in joined    # and the missing parameters
++
++
++def test_owned_parameter_without_capability_refused():
++    """The anti-placeholder rule: declaring a twilio_* threshold while
++    telephony_ingest is disabled is refused outright -- flagged fake
++    values to satisfy an unused surface cannot quietly return."""
++    class PlaceholderRelapse(BankingCassette):
++        def get_governance_parameters(self):
++            params = super().get_governance_parameters()
++            params["twilio_long_duration_threshold"] = {
++                "value": 450, "type": "int", "min": 1, "max": 3600,
++                "unit": "seconds", "description": "placeholder again",
++                "metadata": {"approval_date": None,
++                             "justification": "PLACEHOLDER",
++                             "last_reviewed": None},
++            }
++            return params
++
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(PlaceholderRelapse())
++    assert any("owned by capability 'telephony_ingest'" in v
++               and "placeholder" in v.lower()
++               for v in exc.value.violations)
++
++
++# ---------------------------------------------------------------------------
++# Engine doors: every telephony-shaped pipeline refuses banking with a
++# legible capability error at construction, never a KeyError mid-call.
++# ---------------------------------------------------------------------------
++
++_OFFLINE = {"postgres_host": None, "claude_api_key": None,
++            "twilio_account_sid": None}
++
++
++def test_sentinel_core_refuses_non_telephony_cassette():
++    from sentinel_core import SentinelCore
++    with pytest.raises(CapabilityError) as exc:
++        SentinelCore(BankingCassette())
++    msg = str(exc.value)
++    assert "SentinelCore" in msg and "telephony_ingest" in msg and "banking" in msg
++
++
++def test_cassette_harness_refuses_non_telephony_cassette():
++    from cassette_harness import CassetteHarness
++    with pytest.raises(CapabilityError) as exc:
++        CassetteHarness("banking", _OFFLINE, require_cassette_binding=False)
++    assert "CassetteHarness" in str(exc.value)
++
++
++def test_production_harness_swap_refuses_non_telephony_cassette():
++    from production_harness import IcebergProductionHarness
++    harness = IcebergProductionHarness(dict(_OFFLINE),
++                                       require_cassette_binding=False)
++    with pytest.raises(CapabilityError) as exc:
++        harness.swap_cassette(BankingCassette())
++    assert "swap_cassette" in str(exc.value)
++    # The refused swap must not have replaced the governing cassette.
++    assert harness.cassette.get_config().domain == "ivr"
++
++
++def test_twilio_ingest_refuses_non_telephony_cassette():
++    from twilio_log_ingestion import TwilioLogParser
++    with pytest.raises(ValueError) as exc:
++        TwilioLogParser()._count_friction(
++            {"duration": 250, "status": "completed"}, [],
++            cassette=BankingCassette())
++    assert "telephony_ingest" in str(exc.value)
++
++
++def test_require_capabilities_passes_the_full_manifest():
++    require_capabilities(IvrCassette(), tuple(CAPABILITIES), consumer="test")
++
++
++# ---------------------------------------------------------------------------
++# The unlock: a kernel-only cassette. No queues, no calls, no rewards,
++# no healing -- and it loads, validates, and judges. This is the shape
++# a hiring (or any non-telephony) domain starts from.
++# ---------------------------------------------------------------------------
++
++class KernelOnlyCassette(Cassette):
++    """Minimal legitimate cassette: kernel contract only."""
++
++    CAPABILITIES = ()
++
++    _GOVERNANCE_PARAMETERS = {
++        "governance_trigger": {
++            "value": 1, "type": "int", "min": 0, "max": 100,
++            "unit": "adverse events",
++            "description": "Episodes with this many adverse events go to the governor.",
++            "metadata": {"approval_date": None,
++                         "justification": "strictest sensible default for a new domain",
++                         "last_reviewed": None},
++        },
++    }
++
++    def get_config(self):
++        return CassetteConfig(name="kernel-only", version="0.1.0",
++                              description="minimal non-telephony domain",
++                              domain="minimal")
++
++    def get_governance_parameters(self):
++        import copy
++        return copy.deepcopy(self._GOVERNANCE_PARAMETERS)
++
++    def judge(self, episode):
++        # Toy rule: full marks when the outcome matched the request;
++        # otherwise judged by whether a reason is on file (validation
++        # guarantees it is) and how many fields drifted.
++        drifted = sum(1 for k, v in episode.requested.items()
++                      if episode.actual.get(k) != v)
++        score = max(0.0, 1.0 - 0.3 * drifted)
++        tier = ("excellent" if score > 0.85 else
++                "good" if score > 0.65 else
++                "poor" if score > 0.35 else "failed")
++        return QualityResult(score=score, tier=tier)
++
++    def explain(self, episode):
++        return [{"factor": "request_fulfillment",
++                 "detail": "score reflects requested fields honored as asked"}]
++
++    def validate(self):
++        return True
++
++
++def test_kernel_only_cassette_validates_and_judges():
++    cassette = KernelOnlyCassette()
++    params = validate_cassette(cassette)
++    assert params.names() == ["governance_trigger"]
++    assert params.capabilities == ()
++
++    matched = make_episode("K-1", "minimal",
++                           requested={"granted": True}, actual={"granted": True})
++    assert judge_episode(cassette, matched).tier == "excellent"
++
++    adjusted = make_episode(
++        "K-2", "minimal",
++        requested={"granted": True, "amount": 500.0},
++        actual={"granted": True, "amount": 350.0},
++        outcome_reasons=("amount capped by program ceiling",),
++    )
++    assert judge_episode(cassette, adjusted).tier == "good"
++
++
++def test_kernel_only_cassette_registers_in_the_registry():
++    from cassette_interface import CassetteRegistry
++    registry = CassetteRegistry()
++    registry.register(KernelOnlyCassette())
++    assert registry.get("minimal").get_config().name == "kernel-only"
+diff --git a/sentinel_os/Tests/test_cassette_snapshot_forensics.py b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+index 6fd1e23..92564a1 100644
+--- a/sentinel_os/Tests/test_cassette_snapshot_forensics.py
++++ b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+@@ -69,8 +69,12 @@ class TestCassetteSnapshot:
+         snapshot = decision_row["cassette_snapshot"]
+ 
+         # Verify snapshot structure
+-        assert snapshot["schema_version"] == "1.0.0"
++        assert snapshot["schema_version"] == "2.0.0"
+         assert snapshot["cassette_version"] == cassette_version_of(test_cassette)
++        # 2.0.0: the snapshot also records WHICH capability surfaces
++        # existed at decision time, not just the parameter values.
++        assert sorted(snapshot["capabilities"]) == [
++            "rl", "routing_topology", "self_healing", "telephony_ingest"]
+         assert "parameters" in snapshot
+         assert isinstance(snapshot["parameters"], dict)
+ 
+diff --git a/sentinel_os/Tests/test_cassette_source_of_truth.py b/sentinel_os/Tests/test_cassette_source_of_truth.py
+index 2508123..997d73e 100644
+--- a/sentinel_os/Tests/test_cassette_source_of_truth.py
++++ b/sentinel_os/Tests/test_cassette_source_of_truth.py
+@@ -71,7 +71,7 @@ def test_ivr_cassette_passes_validation():
+     """The reference IVR cassette validates and reads back its declared
+     values (30.0 / 2 / (4, 120))."""
+     params = validate_cassette(IvrCassette())
+-    assert params.cassette_version == "ivr:standard-ivr:1.1.0"
++    assert params.cassette_version == "ivr:standard-ivr:2.0.0"
+     assert params.float_value("long_wait_threshold") == 30.0
+     assert params.int_value("governance_trigger") == 2
+     assert params.range_value("expected_wait_bounds") == (4.0, 120.0)
+@@ -79,11 +79,23 @@ def test_ivr_cassette_passes_validation():
+ 
+ def test_banking_cassette_passes_validation():
+     """Banking validates with its OWN different values -- two domains,
+-    two policies, one schema."""
++    two policies, one schema. Its parameter contract is now exactly
++    what its manifest obligates: kernel + self_healing. The three
++    flagged placeholder twilio_* thresholds (and long_wait_threshold)
++    are GONE, because telephony_ingest is no longer enabled -- the
++    whole point of capability-scoped requirements."""
+     params = validate_cassette(BankingCassette())
+-    assert params.cassette_version == "banking:banking-v1:1.1.0"
+-    assert params.float_value("long_wait_threshold") == 45.0
++    assert params.cassette_version == "banking:banking-v1:2.0.0"
+     assert params.range_value("expected_wait_bounds") == (15.0, 300.0)
++    assert params.int_value("governance_trigger") == 2
++    assert sorted(params.capabilities) == [
++        "rl", "routing_topology", "self_healing"]
++    for placeholder in ("twilio_long_duration_threshold",
++                        "twilio_medium_duration_threshold",
++                        "twilio_short_duration_threshold",
++                        "long_wait_threshold"):
++        assert placeholder not in params.names(), \
++            f"banking must no longer declare '{placeholder}'"
+ 
+ 
+ def test_missing_required_parameter_is_named():
+diff --git a/sentinel_os/Tests/test_cassette_system.py b/sentinel_os/Tests/test_cassette_system.py
+index 35db738..fba60ff 100644
+--- a/sentinel_os/Tests/test_cassette_system.py
++++ b/sentinel_os/Tests/test_cassette_system.py
+@@ -87,20 +87,31 @@ def test_cassette_swapping():
+     assert ivr_info["domain"] == "ivr"
+     assert "billing_queue" in ivr_info["queues"]
+     
+-    # Load Banking harness (SAME CODE, DIFFERENT CASSETTE)
+-    banking_harness = CassetteHarness("banking", config, require_cassette_binding=False)
+-    banking_info = banking_harness.get_cassette_info()
+-    
+-    assert banking_info["domain"] == "banking"
+-    assert "fraud_detection_queue" in banking_info["queues"]
+-    
+-    # Verify they're different
+-    assert ivr_info["queues"] != banking_info["queues"], "Different cassettes should have different queues"
+-    assert ivr_info["domain"] != banking_info["domain"], "Different domains"
++    # Banking no longer enables telephony_ingest, so the TELEPHONY
++    # boom box refuses it AT THE DOOR -- fail-closed with a legible
++    # capability error, not a KeyError mid-call. (Under the old
++    # universal contract this "worked" only because banking declared
++    # flagged placeholder Twilio thresholds to satisfy validation.)
++    from cassette_capabilities import CapabilityError
++    try:
++        CassetteHarness("banking", config, require_cassette_binding=False)
++        assert False, "telephony harness must refuse a non-telephony cassette"
++    except CapabilityError as e:
++        assert "telephony_ingest" in str(e)
++        assert "banking" in str(e)
++
++    # Banking's routing surface is still real and still different from
++    # IVR's -- swappability now shows up at the KERNEL surface (see
++    # test_call_processing_different_cassettes), not by forcing every
++    # domain through the telephony pipeline.
++    from cassette_loader import CassetteLoader
++    banking = CassetteLoader().load_cassette("banking")
++    assert "fraud_detection_queue" in banking.get_queue_definitions()
++    assert ivr_info["queues"] != list(banking.get_queue_definitions().keys())
+     
+     print("  ✓ PASSED - Boom box works with multiple cassettes")
+     print(f"             IVR domain: {ivr_info['domain']}, queues: {len(ivr_info['queues'])}")
+-    print(f"             Banking domain: {banking_info['domain']}, queues: {len(banking_info['queues'])}")
++    print(f"             Banking (kernel-judged domain): correctly refused by telephony harness")
+     return True
+ 
+ def test_call_processing_different_cassettes():
+@@ -120,7 +131,7 @@ def test_call_processing_different_cassettes():
+         "to": "+billing"
+     }
+     
+-    # Process with IVR
++    # Process with IVR through the telephony boom box -- unchanged.
+     ivr_harness = CassetteHarness("ivr", config, require_cassette_binding=False)
+     ivr_result = ivr_harness.process_call(call)
+     
+@@ -128,15 +139,34 @@ def test_call_processing_different_cassettes():
+     assert "intent" in ivr_result
+     assert "quality_tier" in ivr_result
+     
+-    # Process same call with banking
+-    banking_harness = CassetteHarness("banking", config, require_cassette_binding=False)
+-    banking_result = banking_harness.process_call(call)
+-    
+-    assert banking_result["domain"] == "banking"
+-    
+-    print("  ✓ PASSED - Same call, different cassettes")
+-    print(f"             IVR: intent={ivr_result.get('intent')}, quality={ivr_result.get('quality_tier')}")
+-    print(f"             Banking: intent={banking_result.get('intent')}, quality={banking_result.get('quality_tier')}")
++    # The SAME facts judged by banking now flow through the kernel
++    # surface: one Episode, two domains, two verdicts by design.
++    from cassette_loader import CassetteLoader
++    from cassettes.ivr_cassette import IvrCassette
++    from episode import make_episode, judge_episode
++
++    banking = CassetteLoader().load_cassette("banking")
++    episode = make_episode(
++        episode_id=call["sid"], domain="any",
++        requested={"resolved": True},
++        actual={"resolved": call["status"] == "completed"},
++        attributes={"duration": float(call["duration"]), "friction_count": 0,
++                    "emotion": {"frustration": 0.3}},
++    )
++    banking_verdict = judge_episode(banking, episode)
++    ivr_verdict = judge_episode(IvrCassette(), episode)
++
++    assert banking_verdict.tier in ["excellent", "good", "poor", "failed"]
++    # Same episode, different cutoffs and weights: the domains are
++    # allowed -- expected -- to disagree. (150s is "fast enough" for
++    # banking's 180s band but not IVR's 120s band.)
++    assert banking_verdict.score != ivr_verdict.score, \
++        "two domains judging identically would mean the cassette layer does nothing"
++    
++    print("  ✓ PASSED - Same facts, different domain judgments")
++    print(f"             IVR (harness): intent={ivr_result.get('intent')}, quality={ivr_result.get('quality_tier')}")
++    print(f"             IVR (kernel): {ivr_verdict.tier} {ivr_verdict.score:.2f}")
++    print(f"             Banking (kernel): {banking_verdict.tier} {banking_verdict.score:.2f}")
+     return True
+ 
+ def test_cassette_validates():
+diff --git a/sentinel_os/Tests/test_episode.py b/sentinel_os/Tests/test_episode.py
+new file mode 100644
+index 0000000..1345503
+--- /dev/null
++++ b/sentinel_os/Tests/test_episode.py
+@@ -0,0 +1,243 @@
++"""
++test_episode -- kernel ground-truth record proof suite.
++
++Proves the two kernel invariants and the judgment entry points:
++
++1. REASON ON ANY MISMATCH: an episode whose actual outcome differs from
++   what was requested does not validate without an outcome reason --
++   including the paid-but-reduced shape (no denial anywhere) that
++   denial-triggered reason rules structurally miss.
++2. NEVER TRUST THE ACTOR: the acting system's self-report is always
++   cross-checked against the observed record; divergence is surfaced
++   as a first-class finding, and judgment reads only the observed
++   record.
++3. No judgment path admits an unvalidated episode (judge_episode /
++   explain_episode validate first).
++4. Behavior preservation: IVR's kernel judge is arithmetically
++   identical to its telephony score_outcome_quality, and banking's
++   kernel judge reproduces its old scoring exactly.
++"""
++
++import itertools
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from cassettes.banking_cassette import BankingCassette
++from cassettes.ivr_cassette import IvrCassette
++from episode import (
++    EpisodeIntegrityError,
++    UNOBSERVED,
++    actor_discrepancies,
++    explain_episode,
++    judge_episode,
++    make_episode,
++    outcome_mismatches,
++    validate_episode,
++)
++
++
++def _call_episode(resolved=True, duration=100.0, friction=0, frustration=0.0,
++                  reasons=(), **overrides):
++    kwargs = dict(
++        episode_id="EP-1", domain="test",
++        requested={"resolved": True},
++        actual={"resolved": resolved},
++        outcome_reasons=reasons if reasons else (
++            () if resolved else ("caller abandoned before resolution",)),
++        attributes={"duration": duration, "friction_count": friction,
++                    "emotion": {"frustration": frustration}},
++    )
++    kwargs.update(overrides)
++    return make_episode(**kwargs)
++
++
++# ---------------------------------------------------------------------------
++# Invariant 1: reason owed on ANY outcome mismatch, not just denials.
++# ---------------------------------------------------------------------------
++
++def test_reduced_payment_without_reason_refused():
++    """The insurance downcoding shape: claim PAID, amount reduced, no
++    denial anywhere -- and still refused without a reason on file.
++    This is the case denial-triggered reason rules structurally miss."""
++    ep = make_episode(
++        "CLM-77", "insurance",
++        requested={"outcome": "paid", "amount": 1200.0},
++        actual={"outcome": "paid", "amount": 900.0},
++    )
++    with pytest.raises(EpisodeIntegrityError) as exc:
++        validate_episode(ep)
++    joined = "\n".join(exc.value.violations)
++    assert "amount" in joined
++    assert "not only on formal denials" in joined
++
++
++def test_reduced_payment_with_reason_validates():
++    ep = make_episode(
++        "CLM-78", "insurance",
++        requested={"outcome": "paid", "amount": 1200.0},
++        actual={"outcome": "paid", "amount": 900.0},
++        outcome_reasons=("adjusted to fee schedule 12.4 for code 99214",),
++    )
++    report = validate_episode(ep)
++    assert [m.name for m in report.mismatches] == ["amount"]
++
++
++def test_requested_field_absent_from_actual_is_a_mismatch():
++    """An outcome that never materialized is not a match."""
++    ep = make_episode("EP-2", "test",
++                      requested={"delivered": True}, actual={})
++    with pytest.raises(EpisodeIntegrityError):
++        validate_episode(ep)
++    assert [m.name for m in outcome_mismatches(ep)] == ["delivered"]
++
++
++def test_matching_outcome_needs_no_reason():
++    ep = make_episode("EP-3", "test",
++                      requested={"resolved": True}, actual={"resolved": True})
++    report = validate_episode(ep)
++    assert report.mismatches == ()
++
++
++def test_blank_reason_is_no_reason():
++    ep = make_episode("EP-4", "test",
++                      requested={"resolved": True}, actual={"resolved": False},
++                      outcome_reasons=("   ",))
++    with pytest.raises(EpisodeIntegrityError) as exc:
++        validate_episode(ep)
++    assert any("blank reason" in v for v in exc.value.violations)
++
++
++# ---------------------------------------------------------------------------
++# Invariant 2: the actor's self-report is cross-checked, never trusted.
++# ---------------------------------------------------------------------------
++
++def test_actor_divergence_is_surfaced():
++    ep = _call_episode(resolved=False,
++                       actor_report={"resolved": True})
++    report = validate_episode(ep)
++    assert len(report.discrepancies) == 1
++    d = report.discrepancies[0]
++    assert (d.name, d.kind) == ("resolved", "DIVERGE")
++    assert d.actor_claimed is True and d.observed is False
++
++
++def test_actor_claim_with_no_observation_is_extra():
++    ep = _call_episode(actor_report={"customer_satisfied": True})
++    (d,) = actor_discrepancies(ep)
++    assert (d.name, d.kind, d.observed) == ("customer_satisfied", "EXTRA", UNOBSERVED)
++
++
++def test_judgment_reads_observed_record_not_actor_report():
++    """Actor says resolved; observation says not. Judgment must score
++    the OBSERVED unresolved outcome (banking base 0.2, not 0.7)."""
++    ep = make_episode(
++        "EP-5", "banking",
++        requested={"resolved": True},
++        actual={"resolved": False},
++        actor_report={"resolved": True},
++        outcome_reasons=("escalated to human fraud review",),
++        attributes={"duration": 60.0, "friction_count": 0, "emotion": {}},
++    )
++    result = judge_episode(BankingCassette(), ep)
++    assert result.score == pytest.approx(0.2 + 0.2)  # unresolved base + fast
++    assert result.tier == "poor"
++
++
++def test_explain_prepends_kernel_findings():
++    """Verification findings ride ahead of the cassette's own factors,
++    guaranteed by the kernel, not by cassette courtesy."""
++    ep = make_episode(
++        "EP-6", "ivr",
++        requested={"resolved": True},
++        actual={"resolved": False},
++        actor_report={"resolved": True},
++        outcome_reasons=("dropped at verification step",),
++        attributes={"duration": 200.0, "friction_count": 3,
++                    "emotion": {"frustration": 0.8},
++                    "journey": ["entry", "billing_queue", "billing_queue"]},
++    )
++    factors = explain_episode(IvrCassette(), ep)
++    kinds = [f["factor"] for f in factors]
++    assert kinds[0] == "actor_report_divergence"
++    assert "outcome_mismatch" in kinds
++    assert kinds.index("outcome_mismatch") < kinds.index("resolved")
++    assert "abandonment_diagnosis" in kinds  # IVR's own vocabulary rides along
++
++
++# ---------------------------------------------------------------------------
++# Invariant 3: no judgment path admits an unvalidated episode.
++# ---------------------------------------------------------------------------
++
++def test_judge_episode_validates_first():
++    class SpyCassette:
++        def __init__(self):
++            self.judged = 0
++        def judge(self, episode):
++            self.judged += 1
++
++    spy = SpyCassette()
++    bad = make_episode("EP-7", "test",
++                       requested={"resolved": True}, actual={"resolved": False})
++    with pytest.raises(EpisodeIntegrityError):
++        judge_episode(spy, bad)
++    assert spy.judged == 0, "an invalid episode must never reach the cassette"
++
++
++# ---------------------------------------------------------------------------
++# Behavior preservation: the kernel surface changes WHERE judgment is
++# invoked, never WHAT the domains conclude.
++# ---------------------------------------------------------------------------
++
++def test_ivr_judge_identical_to_score_outcome_quality():
++    """Zero behavior change for IVR, pinned: judge(episode) and the
++    telephony score_outcome_quality produce identical (score, tier)
++    across a full sweep of inputs -- one arithmetic, two entrances."""
++    ivr = IvrCassette()
++    sweep = itertools.product([True, False], [50.0, 119.9, 150.0, 299.9, 400.0],
++                              [0, 1, 2, 5], [0.0, 0.3, 0.7, 1.0])
++    for resolved, duration, friction, frustration in sweep:
++        ep = _call_episode(resolved=resolved, duration=duration,
++                           friction=friction, frustration=frustration)
++        via_kernel = judge_episode(ivr, ep)
++        via_telephony = ivr.score_outcome_quality(
++            resolved, duration, friction, {"frustration": frustration})
++        assert (via_kernel.score, via_kernel.tier) == \
++               (via_telephony.score, via_telephony.tier), \
++            (resolved, duration, friction, frustration)
++
++
++def test_banking_judge_preserves_old_arithmetic():
++    """Banking's judgment moved to the kernel surface with its
++    arithmetic intact: same weights, same 0.80 excellent cutoff.
++    Pinned against hand-computed values of the pre-split formula."""
++    bank = BankingCassette()
++
++    # resolved, 150s, 0 friction, 0.1 frustration:
++    # 0.7 + 0.2 - 0 - 0.01 = 0.89 -> excellent (banking's 0.80 bar)
++    r = judge_episode(bank, _call_episode(True, 150.0, 0, 0.1))
++    assert r.score == pytest.approx(0.89) and r.tier == "excellent"
++
++    # unresolved, 400s, 2 friction, 0.6 frustration:
++    # 0.2 + 0.05 - min(2*0.25, 0.4) - 0.06 = -0.21 -> clamp 0.0 -> failed
++    r = judge_episode(bank, _call_episode(False, 400.0, 2, 0.6))
++    assert r.score == 0.0 and r.tier == "failed"
++
++    # unresolved fast clean call: 0.2 + 0.2 = 0.4 -> poor (escalation
++    # is acceptable in banking, still not "resolved" -- the documented
++    # open decision on fraud escalations is deliberately unchanged)
++    r = judge_episode(bank, _call_episode(False, 60.0, 0, 0.0))
++    assert r.score == pytest.approx(0.4) and r.tier == "poor"
++
++
++def test_domains_may_disagree_on_the_same_episode():
++    """The point of the cassette layer, restated at the kernel surface:
++    one episode, two domains, two legitimate verdicts."""
++    ep = _call_episode(True, 150.0, 0, 0.1)
++    ivr_r = judge_episode(IvrCassette(), ep)
++    bank_r = judge_episode(BankingCassette(), ep)
++    assert ivr_r.score != bank_r.score
++    assert (ivr_r.tier, bank_r.tier) == ("good", "excellent")
+diff --git a/sentinel_os/Tests/test_phase2_limitations.py b/sentinel_os/Tests/test_phase2_limitations.py
+index 1c20e68..edeaf39 100644
+--- a/sentinel_os/Tests/test_phase2_limitations.py
++++ b/sentinel_os/Tests/test_phase2_limitations.py
+@@ -157,9 +157,9 @@ def test_code_hash_distinguishes_logic_with_identical_params():
+     assert compute_cassette_code_hash(c1) == h1  # deterministic
+ 
+     src = open(base).read()
+-    mutated = src.replace(
+-        "            score += 0.7\n        else:\n            score += 0.1",
+-        "            score += 0.1\n        else:\n            score += 0.7", 1)
++    # Swap the resolved/unresolved base weights inside _score_call --
++    # identical parameters, different decision logic (the F-H case).
++    mutated = src.replace("            score += 0.7\n", "            score += 0.1\n", 1)
+     assert mutated != src, "could not construct a logic mutation"
+     mpath = f"/tmp/ivr_mut_{uuid.uuid4().hex[:6]}.py"
+     open(mpath, "w").write(mutated)
+@@ -353,7 +353,7 @@ def test_harness_binds_cassette_on_load_by_default():
+ 
+     L = _ledger()
+     row = [r for r in _rows(conn) if r["record_kind"] == "cassette_binding"
+-           and r["cassette_version"] == "ivr:standard-ivr:1.1.0"]
++           and r["cassette_version"] == "ivr:standard-ivr:2.0.0"]
+     assert row, "expected a cassette_binding row for the loaded cassette's version"
+     assert recompute_current_hash(row[-1]) == row[-1]["current_hash"]
+ 
+diff --git a/sentinel_os/cassette_capabilities.py b/sentinel_os/cassette_capabilities.py
+new file mode 100644
+index 0000000..1ed906e
+--- /dev/null
++++ b/sentinel_os/cassette_capabilities.py
+@@ -0,0 +1,209 @@
++"""
++Cassette capabilities -- opt-in modules, each owning its own contract.
++
++The kernel (cassette_interface.Cassette) is domain-blind: identity,
++typed parameter declaration, judge(episode), explain(episode). Every
++domain-SHAPED obligation lives here instead, as a capability a
++cassette explicitly enables in its manifest (Cassette.CAPABILITIES):
++
++  telephony_ingest -- this domain ingests phone calls. Owns the
++      Twilio duration thresholds and long_wait_threshold, and the
++      call-shaped judgment surface (score_outcome_quality,
++      diagnose_abandonment, get_friction_thresholds) whose fixed
++      (resolved, duration, friction_count, emotion_data) signature
++      used to be forced on every domain.
++  routing_topology -- this domain routes work through named queues.
++      Owns queue definitions and intent labeling.
++  rl -- this domain trains against a reward signal. Owns
++      compute_reward.
++  self_healing -- this domain lets the governor adjust its own
++      parameters inside declared bounds. Owns get_healing_bounds and
++      the expected_wait_bounds clamp band.
++
++Load-time validation (cassette_schema.validate_cassette) checks the
++kernel contract plus the UNION of the enabled capabilities' contracts:
++methods present, parameters declared with the right types. It is
++fail-closed in both directions -- enabling a capability without
++implementing its contract is a violation, and declaring a parameter
++OWNED by a capability the cassette did not enable is also a violation.
++The second rule exists because of a real incident: the banking
++cassette once declared three placeholder Twilio thresholds, explicitly
++flagged as fake, purely to satisfy a universal required-parameter list.
++A contract that forces fake declarations is worse than no contract;
++capability-scoped requirements make the honest declaration ("I don't
++ingest telephony") expressible.
++
++Engines guard their entry points with require_capabilities() so a
++cassette missing what a pipeline needs is refused at construction with
++a clear error, not discovered mid-call as a KeyError.
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from typing import Dict, List, Tuple
++
++# Manifest names -- stable strings, these ride in ledger snapshots.
++CAPABILITY_TELEPHONY_INGEST = "telephony_ingest"
++CAPABILITY_ROUTING_TOPOLOGY = "routing_topology"
++CAPABILITY_RL = "rl"
++CAPABILITY_SELF_HEALING = "self_healing"
++
++
++class CapabilityError(Exception):
++    """An engine needed capabilities the loaded cassette does not
++    enable. Raised at construction/swap time -- fail-closed at the
++    door, not mid-call."""
++
++
++class TelephonyIngest(ABC):
++    """Contract for domains that ingest phone calls.
++
++    Owns the ingest thresholds AND the call-shaped judgment surface.
++    A domain that enables this capability judges calls with the fixed
++    (resolved, duration, friction_count, emotion_data) signature; a
++    domain that doesn't is judged only through the kernel's
++    judge(episode) and never has to fake call-center parameters.
++    """
++
++    NAME = CAPABILITY_TELEPHONY_INGEST
++    REQUIRED_PARAMETERS: Dict[str, str] = {
++        # A wait longer than this, at any node, is one friction event.
++        "long_wait_threshold": "float",
++        # Twilio ingest: calls longer than this contribute 2 friction points.
++        "twilio_long_duration_threshold": "int",
++        # Twilio ingest: calls longer than this contribute 1 friction point.
++        "twilio_medium_duration_threshold": "int",
++        # Twilio ingest: non-completed calls shorter than this are dropped-call friction.
++        "twilio_short_duration_threshold": "int",
++    }
++    REQUIRED_METHODS: Tuple[str, ...] = (
++        "score_outcome_quality",
++        "diagnose_abandonment",
++        "get_friction_thresholds",
++    )
++
++    @abstractmethod
++    def score_outcome_quality(self, resolved: bool, duration: float,
++                              friction_count: int, emotion_data: Dict):
++        """Score one call with this domain's own rules; returns
++        QualityResult (the cassette owns score arithmetic AND tier
++        cutoffs -- see cassette_interface.QualityResult)."""
++
++    @abstractmethod
++    def diagnose_abandonment(self, journey: List[str], friction: List,
++                             emotion: Dict, resolved: bool) -> Dict:
++        """Name, in domain vocabulary, why a call abandoned."""
++
++    @abstractmethod
++    def get_friction_thresholds(self) -> Dict[str, float]:
++        """Domain-specific friction detection thresholds."""
++
++
++class RoutingTopology(ABC):
++    """Contract for domains that route work through named queues."""
++
++    NAME = CAPABILITY_ROUTING_TOPOLOGY
++    REQUIRED_PARAMETERS: Dict[str, str] = {}
++    REQUIRED_METHODS: Tuple[str, ...] = (
++        "get_queue_definitions",
++        "_infer_intent_to_label",
++    )
++
++    @abstractmethod
++    def get_queue_definitions(self) -> Dict[str, Dict]:
++        """Return queue names and properties (non-empty)."""
++
++    @abstractmethod
++    def _infer_intent_to_label(self, queue_name: str, caller_data: Dict) -> str:
++        """Map a queue choice to an intent label."""
++
++
++class ReinforcementLearning(ABC):
++    """Contract for domains that train against a reward signal."""
++
++    NAME = CAPABILITY_RL
++    REQUIRED_PARAMETERS: Dict[str, str] = {}
++    REQUIRED_METHODS: Tuple[str, ...] = ("compute_reward",)
++
++    @abstractmethod
++    def compute_reward(self, outcome: Dict) -> float:
++        """RL reward signal for this domain."""
++
++
++class SelfHealing(ABC):
++    """Contract for domains that allow governed self-adjustment.
++
++    Opt-in on purpose: judge-mode deployments (Sentinel as witness,
++    not actor) have no healing surface at all, and a cassette that
++    doesn't enable this capability gives the governor no bounds to
++    move anything within."""
++
++    NAME = CAPABILITY_SELF_HEALING
++    REQUIRED_PARAMETERS: Dict[str, str] = {
++        # Self-healing clamp band for the expected_wait parameter.
++        "expected_wait_bounds": "range",
++    }
++    REQUIRED_METHODS: Tuple[str, ...] = ("get_healing_bounds",)
++
++    @abstractmethod
++    def get_healing_bounds(self) -> Dict[str, tuple]:
++        """Domain-specific parameter bounds for self-healing."""
++
++
++# The registry load-time validation walks. An unknown name in a
++# cassette's manifest is a violation, not a shrug.
++CAPABILITIES: Dict[str, type] = {
++    cap.NAME: cap
++    for cap in (TelephonyIngest, RoutingTopology, ReinforcementLearning, SelfHealing)
++}
++
++# Reverse map: which capability OWNS a given governance parameter.
++# Used to reject parameters declared without their owning capability
++# enabled (the anti-placeholder rule described in the module docstring).
++PARAMETER_OWNERS: Dict[str, str] = {
++    param: cap.NAME
++    for cap in CAPABILITIES.values()
++    for param in cap.REQUIRED_PARAMETERS
++}
++
++
++def enabled_capabilities(cassette) -> Tuple[str, ...]:
++    """The cassette's declared manifest, normalized. Raises
++    CapabilityError if the declaration is missing or malformed --
++    a cassette that cannot state what it is does not run. (Full
++    manifest validation with the complete violation list happens in
++    cassette_schema.validate_cassette; this accessor is for engines
++    that need the manifest after validation has already passed.)"""
++    declared = getattr(cassette, "CAPABILITIES", None)
++    if declared is None:
++        raise CapabilityError(
++            f"{type(cassette).__name__} declares no CAPABILITIES manifest; "
++            f"every cassette must declare one (an empty tuple means "
++            f"kernel-only, and must be said explicitly)"
++        )
++    if isinstance(declared, str) or not isinstance(declared, (tuple, list)):
++        raise CapabilityError(
++            f"{type(cassette).__name__}.CAPABILITIES must be a tuple/list of "
++            f"capability names, got {type(declared).__name__}"
++        )
++    return tuple(str(name) for name in declared)
++
++
++def require_capabilities(cassette, required: Tuple[str, ...], consumer: str) -> None:
++    """Engine-side guard: refuse, at the door, a cassette that does not
++    enable everything this pipeline reads. The error names the
++    consumer, what it needs, and what the cassette enables, so the fix
++    is legible from the message alone."""
++    enabled = set(enabled_capabilities(cassette))
++    missing = [name for name in required if name not in enabled]
++    if missing:
++        label = getattr(getattr(cassette, "get_config", lambda: None)(), "domain",
++                        type(cassette).__name__)
++        raise CapabilityError(
++            f"{consumer} requires capabilities {sorted(required)} but cassette "
++            f"'{label}' enables {sorted(enabled) or '[] (kernel-only)'}; "
++            f"missing: {missing}. This pipeline cannot run this cassette -- "
++            f"use a judgment path built on the kernel (judge/explain over "
++            f"episodes) or load a cassette that enables the capability."
++        )
+diff --git a/sentinel_os/cassette_forensics.py b/sentinel_os/cassette_forensics.py
+index 530ea70..7a97fd4 100644
+--- a/sentinel_os/cassette_forensics.py
++++ b/sentinel_os/cassette_forensics.py
+@@ -34,8 +34,10 @@ from typing import Any, Dict
+ # the hash covers the cassette's own code and the shared governance code it runs
+ # on, not code outside this boundary. COMPLIANCE.md states this scope honestly.
+ _GOVERNANCE_CODE_MODULES = (
+-    "cassette_interface",  # base Cassette: score_outcome_quality, _infer_intent_to_label
+-    "cassette_schema",     # parameter bounds/validation that constrain decisions
++    "cassette_interface",      # kernel Cassette ABC: judge/explain, identity, manifest
++    "cassette_schema",         # parameter bounds/validation that constrain decisions
++    "cassette_capabilities",   # capability contracts: which surfaces exist and what they require
++    "episode",                 # the ground-truth record + its integrity invariants
+ )
+ 
+ 
+@@ -107,17 +109,14 @@ def serialize_cassette_for_ledger(governance_params: Any) -> Dict[str, Any]:
+     cryptographically linked via the hash chain. It answers:
+     "What policy governed this decision?"
+     """
+-    # governance_params is a GovernanceParameters from cassette_schema.py
+-    # It has cassette_version and _parameters attributes
+-    snapshot = {
+-        "schema_version": governance_params.snapshot()["schema_version"],
+-        "cassette_version": governance_params.cassette_version,
+-        "parameters": {
+-            name: spec.as_snapshot()
+-            for name, spec in sorted(governance_params._parameters.items())
+-        },
+-    }
+-    return snapshot
++    # One source of truth: GovernanceParameters.snapshot() IS the
++    # policy snapshot shape. This function used to hand-build the same
++    # dict field-by-field -- a second serializer that silently drifted
++    # the moment snapshot() gained a field (the 2.0.0 capability
++    # manifest), which is exactly the two-places-that-can-quietly-
++    # disagree pattern the cassette system exists to end. Pre-existing
++    # duplication, fixed here rather than patched around.
++    return governance_params.snapshot()
+ 
+ 
+ def compute_cassette_hash(cassette_snapshot: Dict[str, Any]) -> str:
+diff --git a/sentinel_os/cassette_harness.py b/sentinel_os/cassette_harness.py
+index 06e0568..fb76192 100644
+--- a/sentinel_os/cassette_harness.py
++++ b/sentinel_os/cassette_harness.py
+@@ -44,6 +44,27 @@ class CassetteHarness:
+         except Exception as e:
+             logger.error(f"Failed to load cassette: {e}")
+             raise
++
++        # This harness IS the full telephony boom box: it counts call
++        # friction (telephony), infers intent from queues (routing),
++        # computes rewards (rl), and reports healing bounds
++        # (self_healing). A cassette that doesn't enable all four is
++        # refused here with a legible error rather than failing
++        # mid-call. Kernel-only or partial-manifest domains are judged
++        # through episode.judge_episode, not this pipeline.
++        from cassette_capabilities import (
++            CAPABILITY_RL,
++            CAPABILITY_ROUTING_TOPOLOGY,
++            CAPABILITY_SELF_HEALING,
++            CAPABILITY_TELEPHONY_INGEST,
++            require_capabilities,
++        )
++        require_capabilities(
++            self.cassette,
++            (CAPABILITY_TELEPHONY_INGEST, CAPABILITY_ROUTING_TOPOLOGY,
++             CAPABILITY_RL, CAPABILITY_SELF_HEALING),
++            consumer="CassetteHarness",
++        )
+         
+         # Initialize resilient harness (boom box)
+         self.harness = ResilientHarness(
+diff --git a/sentinel_os/cassette_interface.py b/sentinel_os/cassette_interface.py
+index d4bab24..1b7a65e 100644
+--- a/sentinel_os/cassette_interface.py
++++ b/sentinel_os/cassette_interface.py
+@@ -1,12 +1,38 @@
+ """
+-Cassette Interface - Abstract base for domain-specific implementations
++Cassette Interface -- the domain-blind KERNEL contract.
+ 
+-Allows any industry to plug in their own cassette without touching boom box
++Every cassette, in every industry, implements exactly this:
++
++  - identity          (get_config -- names the policy a ledger row cites)
++  - typed declaration (get_governance_parameters -- the schema-validated
++                       parameter contract; see cassette_schema)
++  - judgment          (judge(episode) -> QualityResult -- score AND tier,
++                       cassette-owned cutoffs)
++  - explanation       (explain(episode) -> factor-level reasons)
++  - self-check        (validate)
++  - manifest          (CAPABILITIES -- which opt-in capability modules
++                       this domain enables; see cassette_capabilities)
++
++Nothing call-center-shaped remains here. Queue definitions, intent
++labeling, the fixed (resolved, duration, friction_count, emotion_data)
++scoring signature, abandonment diagnosis, reward signals, and healing
++bounds all moved into opt-in capability contracts
++(cassette_capabilities.py) that a cassette enables only when the
++domain genuinely has that surface. The IVR cassette enables all of
++them and is the REFERENCE IMPLEMENTATION of kernel + capabilities --
++not the template other domains contort into.
++
++Sentinel's role at this layer is JUDGE, not ACTOR: a cassette judges
++an Episode (episode.py) -- the ground-truth record of what was
++requested, what observably happened, and what the acting system
++claims -- after the fact. It does not drive the decision.
+ """
+ 
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import Dict, List
++from typing import Any, Dict, List, Tuple
++
++from episode import Episode
+ 
+ @dataclass
+ class CassetteConfig:
+@@ -32,76 +58,83 @@ class QualityResult:
+     tier: str  # "excellent" | "good" | "poor" | "failed"
+ 
+ class Cassette(ABC):
+-    """Abstract base: all cassettes implement this"""
+-    
++    """Abstract base: the KERNEL every cassette implements.
++
++    Domain-shaped surfaces (telephony scoring, queues, rewards,
++    healing) are NOT here -- they are capability contracts a concrete
++    cassette additionally subclasses and lists in CAPABILITIES.
++    """
++
++    # The capability manifest. REQUIRED on every concrete cassette:
++    # a tuple of names from cassette_capabilities.CAPABILITIES. An
++    # empty tuple is a legitimate declaration ("kernel-only domain")
++    # and must be made explicitly -- there is no default, because a
++    # cassette that never said what it is would validate by accident.
++    CAPABILITIES: Tuple[str, ...]
++
+     @abstractmethod
+     def get_config(self) -> CassetteConfig:
+         """Return cassette metadata"""
+         pass
+-    
+-    @abstractmethod
+-    def get_queue_definitions(self) -> Dict[str, Dict]:
+-        """Return queue names and properties"""
+-        pass
+-    
+-    @abstractmethod
+-    def _infer_intent_to_label(self, queue_name: str, caller_data: Dict) -> str:
+-        """Map queue choice to caller intent"""
+-        pass
+-    
+-    @abstractmethod
+-    def score_outcome_quality(self, resolved: bool, duration: float, 
+-                             friction_count: int, emotion_data: Dict) -> QualityResult:
+-        """Score the outcome with this domain's own rules.
+-
+-        Returns QualityResult(score, tier). The cassette owns its tier
+-        cutoffs; callers read .tier and .score, never re-bucket .score.
+-        """
+-        pass
+-    
+-    @abstractmethod
+-    def diagnose_abandonment(self, journey: List[str], friction: List, 
+-                            emotion: Dict, resolved: bool) -> Dict:
+-        """Diagnose why call abandoned"""
+-        pass
+-    
+-    @abstractmethod
+-    def get_friction_thresholds(self) -> Dict[str, float]:
+-        """Domain-specific friction detection thresholds"""
+-        pass
+ 
+     @abstractmethod
+     def get_governance_parameters(self) -> Dict[str, Dict]:
+         """The typed governance declaration this domain runs under.
+ 
+-        Shape and required parameters are defined by cassette_schema
+-        (SCHEMA_VERSION). Every value the engine reads on the
+-        governance path comes from here -- validated on load, read at
+-        decision time. See cassette_schema.validate_cassette.
++        Shape is defined by cassette_schema (SCHEMA_VERSION). The
++        REQUIRED set is the kernel's parameters plus the union of the
++        enabled capabilities' parameters -- a cassette declares what
++        its manifest obligates it to, no more (parameters owned by a
++        capability it did not enable are rejected) and no less. Every
++        value the engine reads on the governance path comes from
++        here -- validated on load, read at decision time. See
++        cassette_schema.validate_cassette.
+         """
+         pass
+-    
++
+     @abstractmethod
+-    def get_healing_bounds(self) -> Dict[str, tuple]:
+-        """Domain-specific parameter bounds for self-healing"""
++    def judge(self, episode: Episode) -> QualityResult:
++        """Judge one validated Episode with this domain's own rules.
++
++        Returns QualityResult(score, tier); the cassette owns its tier
++        cutoffs. Judgment reads episode.actual (the observed record)
++        and episode.attributes -- NEVER episode.actor_report, which is
++        the acting system's unverified story about itself. Callers go
++        through episode.judge_episode so no judgment path admits an
++        unvalidated episode.
++        """
+         pass
+-    
++
+     @abstractmethod
+-    def compute_reward(self, outcome: Dict) -> float:
+-        """RL reward signal for this domain"""
++    def explain(self, episode: Episode) -> List[Dict[str, Any]]:
++        """Factor-level reasons behind this domain's judgment of the
++        episode: a list of dicts, each naming one factor and its
++        contribution, in the domain's own vocabulary. The kernel entry
++        point (episode.explain_episode) prepends its own verification
++        findings (actor-report divergences, outcome mismatches), so a
++        cassette explains its judgment and the kernel guarantees the
++        integrity findings ride along.
++        """
+         pass
+-    
++
+     @abstractmethod
+     def validate(self) -> bool:
+         """Verify cassette is valid and complete"""
+         pass
+ 
++    def capabilities(self) -> Tuple[str, ...]:
++        """The declared manifest, normalized. See
++        cassette_capabilities.enabled_capabilities for the guard
++        engines use."""
++        from cassette_capabilities import enabled_capabilities
++        return enabled_capabilities(self)
++
+ class CassetteRegistry:
+     """Load and manage multiple cassettes"""
+-    
++
+     def __init__(self):
+         self.cassettes = {}
+-    
++
+     def register(self, cassette: Cassette):
+         """Register a cassette (fail-loud).
+ 
+@@ -118,14 +151,14 @@ class CassetteRegistry:
+         validate_cassette(cassette)
+ 
+         self.cassettes[key] = cassette
+-    
++
+     def get(self, domain: str) -> Cassette:
+         """Get cassette by domain"""
+         for key, cassette in self.cassettes.items():
+             if key.startswith(domain):
+                 return cassette
+         raise KeyError(f"No cassette found for domain: {domain}")
+-    
++
+     def list_all(self) -> Dict:
+         """List all registered cassettes"""
+         return {
+diff --git a/sentinel_os/cassette_schema.py b/sentinel_os/cassette_schema.py
+index 0c767b3..1bb29ed 100644
+--- a/sentinel_os/cassette_schema.py
++++ b/sentinel_os/cassette_schema.py
+@@ -25,7 +25,14 @@ import copy
+ from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Tuple
+ 
+-SCHEMA_VERSION = "1.0.0"
++# 1.0.0 -> 2.0.0: the required-parameter set is no longer one universal
++# list. It is the KERNEL set below plus the union of the parameter
++# contracts of the capabilities the cassette's manifest enables
++# (cassette_capabilities). Snapshots now also record the manifest, so a
++# ledger row states not just which values governed but which capability
++# surfaces existed at decision time. Rows written under 1.0.0 remain
++# interpretable: their stored snapshots carry their own schema_version.
++SCHEMA_VERSION = "2.0.0"
+ 
+ # Forensic metadata slots. Item #3 scope: the slots must EXIST on every
+ # parameter (keys present); enforcement of their contents (approval
+@@ -34,34 +41,40 @@ METADATA_SLOTS = ("approval_date", "justification", "last_reviewed")
+ 
+ ALLOWED_TYPES = ("float", "int", "range")
+ 
+-# Parameters the governance path cannot run without. A cassette may
+-# declare more; it may not declare fewer.
+-#
+-# The twilio_* thresholds were added after finding a cassette (banking)
+-# that passed this contract and validate_cassette(), loaded, and swapped
+-# in cleanly -- then raised ValueError on every single process_call,
+-# because twilio_log_ingestion._count_friction reads these three
+-# fail-loud and they were never part of the declared contract. A
+-# cassette that satisfies REQUIRED_GOVERNANCE_PARAMETERS must now be
+-# able to actually run a call, not just pass schema validation.
+-REQUIRED_GOVERNANCE_PARAMETERS: Dict[str, str] = {
+-    # A wait longer than this, at any node, is one friction event.
+-    "long_wait_threshold": "float",
+-    # friction_count >= this value routes the call to the governor
+-    # (inclusive semantics -- the cassette declares the line, the
+-    # engine stands on it).
++# Parameters NO cassette can run without, in any industry. Everything
++# domain-shaped -- long_wait_threshold, the twilio_* ingest thresholds,
++# expected_wait_bounds -- moved to the capability that owns it
++# (cassette_capabilities.*.REQUIRED_PARAMETERS). History that forced
++# this split: the twilio_* thresholds were once universally required
++# here after the banking cassette validated cleanly but raised
++# ValueError on every call at Twilio ingest; making them universal
++# fixed banking's crash by forcing banking to declare three PLACEHOLDER
++# values it never had real data for. Capability-scoped requirements
++# keep the original lesson (a cassette that validates must actually be
++# able to run its enabled surfaces) without forcing fake declarations
++# on domains that don't have the surface at all.
++KERNEL_REQUIRED_PARAMETERS: Dict[str, str] = {
++    # Accumulated adverse events >= this value route the episode to the
++    # governor (inclusive semantics -- the cassette declares the line,
++    # the engine stands on it). Domain-blind: every domain has SOME
++    # notion of "enough went wrong that governance must look".
+     "governance_trigger": "int",
+-    # Self-healing clamp band for the expected_wait parameter.
+-    "expected_wait_bounds": "range",
+-    # Twilio ingest: calls longer than this contribute 2 friction points.
+-    "twilio_long_duration_threshold": "int",
+-    # Twilio ingest: calls longer than this contribute 1 friction point.
+-    "twilio_medium_duration_threshold": "int",
+-    # Twilio ingest: non-completed calls shorter than this are dropped-call friction.
+-    "twilio_short_duration_threshold": "int",
+ }
+ 
+ 
++def required_parameters_for(capabilities) -> Dict[str, str]:
++    """The full required set for a given manifest: kernel plus the
++    union of each enabled capability's own parameter contract."""
++    from cassette_capabilities import CAPABILITIES
++
++    required = dict(KERNEL_REQUIRED_PARAMETERS)
++    for name in capabilities:
++        cap = CAPABILITIES.get(name)
++        if cap is not None:
++            required.update(cap.REQUIRED_PARAMETERS)
++    return required
++
++
+ class CassetteValidationError(Exception):
+     """A cassette failed schema validation. Carries the full violation
+     list so one load attempt reports every problem at once."""
+@@ -111,9 +124,11 @@ class GovernanceParameters:
+     second place the value's meaning could live.
+     """
+ 
+-    def __init__(self, cassette_version: str, parameters: Dict[str, ParameterSpec]):
++    def __init__(self, cassette_version: str, parameters: Dict[str, ParameterSpec],
++                 capabilities=()):
+         self.cassette_version = cassette_version
+         self._parameters = dict(parameters)
++        self.capabilities = tuple(capabilities)
+ 
+     def names(self) -> List[str]:
+         return sorted(self._parameters)
+@@ -149,6 +164,7 @@ class GovernanceParameters:
+         return {
+             "schema_version": SCHEMA_VERSION,
+             "cassette_version": self.cassette_version,
++            "capabilities": sorted(self.capabilities),
+             "parameters": {
+                 name: spec.as_snapshot()
+                 for name, spec in sorted(self._parameters.items())
+@@ -255,24 +271,83 @@ def validate_governance_parameters(cassette) -> GovernanceParameters:
+     nothing is repaired: the cassette is either the source of truth or
+     it does not load.
+     """
++    from cassette_capabilities import CAPABILITIES, PARAMETER_OWNERS
++
+     label = cassette_version_of(cassette)
+     violations: List[str] = []
+ 
+-    getter = getattr(cassette, "get_governance_parameters", None)
+-    if not callable(getter):
++    # --- Manifest first: without it the required set cannot even be
++    # computed. Missing, malformed, or unknown-name manifests are
++    # violations in their own right (fail-closed: a cassette that
++    # cannot state what it is does not load).
++    declared_caps = getattr(cassette, "CAPABILITIES", None)
++    if declared_caps is None:
+         raise CassetteValidationError(
+-            label, ["cassette does not implement get_governance_parameters()"]
++            label,
++            ["cassette declares no CAPABILITIES manifest; every cassette must "
++             "declare one (an empty tuple means kernel-only, said explicitly)"],
+         )
++    if isinstance(declared_caps, str) or not isinstance(declared_caps, (tuple, list)):
++        raise CassetteValidationError(
++            label,
++            [f"CAPABILITIES must be a tuple/list of capability names, got "
++             f"{type(declared_caps).__name__}"],
++        )
++    manifest = tuple(str(name) for name in declared_caps)
++    unknown = [name for name in manifest if name not in CAPABILITIES]
++    if unknown:
++        raise CassetteValidationError(
++            label,
++            [f"unknown capability '{name}' in manifest; known: "
++             f"{sorted(CAPABILITIES)}" for name in unknown],
++        )
++    enabled = set(manifest)
++
++    # --- Each enabled capability's METHOD contract must be met: a
++    # manifest that promises a surface the class doesn't implement is
++    # a violation, not a runtime surprise.
++    for cap_name in sorted(enabled):
++        for method in CAPABILITIES[cap_name].REQUIRED_METHODS:
++            if not callable(getattr(cassette, method, None)):
++                violations.append(
++                    f"capability '{cap_name}' is enabled but required method "
++                    f"'{method}()' is missing or not callable"
++                )
++
++    getter = getattr(cassette, "get_governance_parameters", None)
++    if not callable(getter):
++        violations.append("cassette does not implement get_governance_parameters()")
++        raise CassetteValidationError(label, violations)
+ 
+     raw_params = getter()
+     if not isinstance(raw_params, dict):
+-        raise CassetteValidationError(
+-            label, [f"get_governance_parameters() must return a dict, got {type(raw_params).__name__}"]
++        violations.append(
++            f"get_governance_parameters() must return a dict, got {type(raw_params).__name__}"
+         )
++        raise CassetteValidationError(label, violations)
+ 
+     specs: Dict[str, ParameterSpec] = {}
+ 
+-    for name, expected_type in REQUIRED_GOVERNANCE_PARAMETERS.items():
++    # --- The anti-placeholder rule, in both directions: the manifest
++    # decides the parameter contract. Required = kernel + union of
++    # enabled capabilities; a parameter OWNED by a capability that is
++    # NOT enabled is rejected outright, because a declared-but-unowned
++    # value is exactly how the banking cassette's flagged placeholder
++    # Twilio thresholds happened.
++    required = required_parameters_for(manifest)
++
++    for name in sorted(raw_params):
++        owner = PARAMETER_OWNERS.get(name)
++        if owner is not None and owner not in enabled:
++            violations.append(
++                f"parameter '{name}' is owned by capability '{owner}', which "
++                f"this cassette does not enable -- enable the capability or "
++                f"remove the parameter (declaring placeholder values to "
++                f"satisfy a surface the domain doesn't have is the failure "
++                f"this rule exists to prevent)"
++            )
++
++    for name, expected_type in required.items():
+         if name not in raw_params:
+             violations.append(f"missing required governance parameter '{name}' ({expected_type})")
+             continue
+@@ -299,7 +374,7 @@ def validate_governance_parameters(cassette) -> GovernanceParameters:
+     if violations:
+         raise CassetteValidationError(label, violations)
+ 
+-    return GovernanceParameters(label, specs)
++    return GovernanceParameters(label, specs, capabilities=manifest)
+ 
+ 
+ def validate_cassette(cassette) -> GovernanceParameters:
+@@ -314,12 +389,25 @@ def validate_cassette(cassette) -> GovernanceParameters:
+     label = cassette_version_of(cassette)
+     violations: List[str] = []
+ 
++    from cassette_capabilities import CAPABILITY_ROUTING_TOPOLOGY
++
+     config = cassette.get_config()
+     if config is None:
+         violations.append("get_config() returned None")
+-    queues = cassette.get_queue_definitions()
+-    if not queues:
+-        violations.append("get_queue_definitions() returned no queues")
++    # Kernel judgment surface: every cassette, in every industry.
++    for kernel_method in ("judge", "explain"):
++        if not callable(getattr(cassette, kernel_method, None)):
++            violations.append(
++                f"kernel method '{kernel_method}(episode)' is missing or not callable"
++            )
++    # Queue structure is a routing_topology obligation, not a kernel
++    # one: only a cassette that enables routing must define queues.
++    declared_caps = getattr(cassette, "CAPABILITIES", ()) or ()
++    if (not isinstance(declared_caps, str)
++            and CAPABILITY_ROUTING_TOPOLOGY in tuple(declared_caps)):
++        queues = cassette.get_queue_definitions()
++        if not queues:
++            violations.append("get_queue_definitions() returned no queues")
+     try:
+         if cassette.validate() is not True:
+             violations.append("cassette.validate() self-check did not return True")
+diff --git a/sentinel_os/cassettes/banking_cassette.py b/sentinel_os/cassettes/banking_cassette.py
+index 32611f1..77f43b5 100644
+--- a/sentinel_os/cassettes/banking_cassette.py
++++ b/sentinel_os/cassettes/banking_cassette.py
+@@ -1,42 +1,67 @@
+ """
+ Banking Cassette - Domain-specific implementation for financial services
+ 
+-Same boom box, completely different rules for banking context
++Same boom box, completely different rules for banking context.
++
++First cassette to use the kernel/capability split honestly: banking
++enables routing_topology, rl, and self_healing -- and does NOT enable
++telephony_ingest, because this domain has never had real banking call
++data behind Twilio ingest thresholds. Under the old universal
++parameter contract, that forced three explicitly-flagged PLACEHOLDER
++twilio_* values into this file just to load; under capability-scoped
++contracts, the honest declaration ("no telephony ingest yet") is
++simply made, and the placeholders are gone. Judgment happens through
++the kernel surface: judge/explain over episodes.
+ """
+ 
+ import copy
+ 
+ from cassette_interface import Cassette, CassetteConfig, QualityResult
+-from typing import Dict, List
++from cassette_capabilities import (
++    CAPABILITY_RL,
++    CAPABILITY_ROUTING_TOPOLOGY,
++    CAPABILITY_SELF_HEALING,
++    ReinforcementLearning,
++    RoutingTopology,
++    SelfHealing,
++)
++from episode import Episode
++from typing import Any, Dict, List
+ 
+-class BankingCassette(Cassette):
++class BankingCassette(Cassette, RoutingTopology, ReinforcementLearning,
++                      SelfHealing):
+     """Banking/financial services cassette"""
+-    
++
++    # The manifest. telephony_ingest is deliberately ABSENT: enabling
++    # it obligates real, reviewed values for long_wait_threshold and
++    # the three twilio_* duration thresholds, and this domain has none
++    # yet. When real banking call data exists, enable the capability
++    # and declare reviewed values -- prior working intent, for the
++    # record: long_wait_threshold 45.0s ("security verification steps
++    # legitimately hold banking callers longer than a standard IVR",
++    # ~1.5x the IVR tolerance), and the removed twilio_* placeholders
++    # were 450/180/15, scaled by that same ratio, never reviewed
++    # against real data. Validation now REJECTS declaring any of those
++    # four parameters while the capability is off, so the placeholder
++    # hack cannot quietly return.
++    CAPABILITIES = (
++        CAPABILITY_ROUTING_TOPOLOGY,
++        CAPABILITY_RL,
++        CAPABILITY_SELF_HEALING,
++    )
++
+     # THE declaration site for banking governance numbers (see
+-    # cassette_schema). Banking judges the same call differently by
+-    # design: longer wait tolerance (security verification), same
+-    # inclusive trigger.
++    # cassette_schema). Banking judges the same episode differently by
++    # design; the kernel trigger and healing band are its only
++    # parameter obligations under the enabled manifest.
+     _GOVERNANCE_PARAMETERS = {
+-        "long_wait_threshold": {
+-            "value": 45.0,
+-            "type": "float",
+-            "min": 1.0,
+-            "max": 600.0,
+-            "unit": "seconds",
+-            "description": "A wait longer than this at any node counts as one friction event.",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "Security verification steps legitimately hold banking callers longer than a standard IVR.",
+-                "last_reviewed": None,
+-            },
+-        },
+         "governance_trigger": {
+             "value": 2,
+             "type": "int",
+             "min": 0,
+             "max": 100,
+             "unit": "friction events",
+-            "description": "Calls with friction_count >= this value are routed to the governor (inclusive).",
++            "description": "Episodes with friction_count >= this value are routed to the governor (inclusive).",
+             "metadata": {
+                 "approval_date": None,
+                 "justification": "Matches the prior min_friction_for_governance=2 declaration for this domain.",
+@@ -56,55 +81,6 @@ class BankingCassette(Cassette):
+                 "last_reviewed": None,
+             },
+         },
+-        # PLACEHOLDER VALUES -- scaled from the IVR cassette's 300/120/10
+-        # by the same ~1.5x long-wait-tolerance ratio banking already
+-        # uses above (45.0 vs ivr's 30.0), NOT derived from real banking
+-        # call data. Added because these three are now required
+-        # (cassette_schema.REQUIRED_GOVERNANCE_PARAMETERS) and, before
+-        # that, their absence made every banking call raise ValueError
+-        # at the Twilio ingest step -- this cassette validated and
+-        # loaded cleanly but could not process a single call. Needs
+-        # review against real banking-IVR call data before deploying
+-        # this domain.
+-        "twilio_long_duration_threshold": {
+-            "value": 450,
+-            "type": "int",
+-            "min": 1,
+-            "max": 3600,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls longer than this duration contribute 2 friction points.",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "PLACEHOLDER: 300s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
+-                "last_reviewed": None,
+-            },
+-        },
+-        "twilio_medium_duration_threshold": {
+-            "value": 180,
+-            "type": "int",
+-            "min": 1,
+-            "max": 3600,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls longer than this duration contribute 1 friction point.",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "PLACEHOLDER: 120s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
+-                "last_reviewed": None,
+-            },
+-        },
+-        "twilio_short_duration_threshold": {
+-            "value": 15,
+-            "type": "int",
+-            "min": 1,
+-            "max": 60,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls shorter than this duration with non-completed status indicate dropped calls (1 friction point).",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "PLACEHOLDER: 10s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
+-                "last_reviewed": None,
+-            },
+-        },
+     }
+ 
+     def get_config(self) -> CassetteConfig:
+@@ -112,7 +88,14 @@ class BankingCassette(Cassette):
+             name="banking-v1",
+             # 1.0.0 -> 1.1.0: governance parameters became typed schema
+             # declarations (Item #3).
+-            version="1.1.0",
++            # 1.1.0 -> 2.0.0: kernel/capability split. telephony_ingest
++            # dropped from the manifest, and with it the three flagged
++            # placeholder twilio_* thresholds and long_wait_threshold;
++            # judgment moved to the kernel surface (judge/explain over
++            # episodes) with the SAME scoring arithmetic and tier
++            # cutoffs the old score_outcome_quality used. New code
++            # hash => new version (binding enforcement).
++            version="2.0.0",
+             description="Financial services & banking",
+             domain="banking"
+         )
+@@ -143,14 +126,43 @@ class BankingCassette(Cassette):
+             "compliance_queue": "COMPLIANCE",
+         }
+         return mapping.get(queue_name, "UNKNOWN")
+-    
+-    def score_outcome_quality(self, resolved: bool, duration: float,
+-                             friction_count: int, emotion_data: Dict) -> QualityResult:
+-        """Score banking call quality (DIFFERENT from IVR).
+ 
+-        Deliberately keeps its own 0.80 "excellent" cutoff and its own
+-        weights -- banking judging the same call differently than IVR
+-        is the point of the cassette system, not a bug to normalize.
++    # ---- Kernel judgment surface ----
++    #
++    # Banking's judgment arithmetic is the SAME as its old
++    # score_outcome_quality -- same weights, same 0.80 excellent
++    # cutoff -- relocated to the kernel surface. Banking judging the
++    # same episode differently than IVR is the point of the cassette
++    # system, not a bug to normalize.
++    #
++    # Field convention this cassette reads (fail-loud on absence):
++    # episode.actual["resolved"] (an OUTCOME -- read from the observed
++    # record, never from actor_report); episode.attributes "duration",
++    # "friction_count", optional "emotion" (dict), and optional
++    # "journey"/"friction_events" for explanation.
++
++    def _episode_facts(self, episode: Episode):
++        try:
++            resolved = bool(episode.actual["resolved"])
++        except KeyError:
++            raise KeyError(
++                "banking judgment requires episode.actual['resolved'] -- the "
++                "OBSERVED resolution outcome (actor_report is never read)"
++            )
++        try:
++            duration = float(episode.attributes["duration"])
++            friction_count = int(episode.attributes["friction_count"])
++        except KeyError as missing:
++            raise KeyError(
++                f"banking judgment requires episode.attributes[{missing.args[0]!r}]; "
++                f"declared attributes: {sorted(episode.attributes)}"
++            )
++        emotion_data = dict(episode.attributes.get("emotion", {}))
++        return resolved, duration, friction_count, emotion_data
++
++    def _score_components(self, resolved: bool, duration: float,
++                          friction_count: int, emotion_data: Dict):
++        """THE banking scoring arithmetic, in one place (see judge).
+ 
+         NOTE (open decision, not silently changed): a *correct* fraud
+         escalation to a human still scores as unresolved here, even
+@@ -158,34 +170,59 @@ class BankingCassette(Cassette):
+         proper escalation counts as a success needs an explicit call
+         before this cassette grows an escalation carve-out.
+         """
+-        
++
+         score = 0.0
+-        
++        factors: List[Dict[str, Any]] = []
++
+         # For banking: escalation to human is GOOD (not bad)
+         # Fraud alerts MUST go to human (automatic escalation = success)
+         if resolved:
+             score += 0.7  # Higher baseline for resolution
++            factors.append({"factor": "resolved", "value": True,
++                            "contribution": +0.7,
++                            "detail": "resolved without human escalation"})
+         else:
+             score += 0.2  # Escalation to human is acceptable
+-        
++            factors.append({"factor": "resolved", "value": False,
++                            "contribution": +0.2,
++                            "detail": "not resolved in-system; escalation to a "
++                                      "human is acceptable in banking"})
++
+         # Duration: banking calls typically longer (compliance, security)
+         # 3min is acceptable, 10min is concerning
+         if duration < 180:
+             score += 0.2
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": +0.2,
++                            "detail": "within normal banking handling time (< 180s)"})
+         elif duration < 600:
+             score += 0.05
+-        
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": +0.05,
++                            "detail": "long but tolerable for compliance/security (< 600s)"})
++        else:
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": 0.0,
++                            "detail": "concerning duration (>= 600s)"})
++
+         # Friction: repeats are worse in banking (security risk)
+         friction_penalty = min(friction_count * 0.25, 0.4)  # Stricter
+         score -= friction_penalty
+-        
++        factors.append({"factor": "friction", "value": friction_count,
++                        "contribution": -friction_penalty,
++                        "detail": "0.25 per friction event (stricter than IVR), capped at 0.4"})
++
+         # Emotion: frustration is acceptable if fraud is caught
+         # Don't penalize as heavily
+         frustration_penalty = emotion_data.get("frustration", 0) * 0.1
+         score -= frustration_penalty
+-        
++        factors.append({"factor": "frustration",
++                        "value": emotion_data.get("frustration", 0),
++                        "contribution": -frustration_penalty,
++                        "detail": "0.1 x measured frustration (lighter than IVR)"})
++
+         score = max(0.0, min(1.0, score))
+-        
++
+         if score > 0.80:
+             tier = "excellent"
+         elif score > 0.60:
+@@ -194,53 +231,79 @@ class BankingCassette(Cassette):
+             tier = "poor"
+         else:
+             tier = "failed"
+-        
+-        return QualityResult(score=score, tier=tier)
+-    
+-    def diagnose_abandonment(self, journey: List[str], friction: List,
+-                            emotion: Dict, resolved: bool) -> Dict:
+-        """Diagnose banking abandonment (security-focused)"""
+-        
++
++        return QualityResult(score=score, tier=tier), factors
++
++    def judge(self, episode: Episode) -> QualityResult:
++        """Judge one validated episode with banking's own rules.
++
++        Deliberately keeps its own 0.80 "excellent" cutoff and its own
++        weights (see _score_components).
++        """
++        resolved, duration, friction_count, emotion_data = \
++            self._episode_facts(episode)
++        result, _ = self._score_components(
++            resolved, duration, friction_count, emotion_data
++        )
++        return result
++
++    def explain(self, episode: Episode) -> List[Dict[str, Any]]:
++        """Factor-level reasons in banking vocabulary. For unresolved
++        episodes, the security-focused signals (the old abandonment
++        diagnosis logic, kept as _security_signals) ride along. Kernel
++        verification findings are prepended by episode.explain_episode."""
++        resolved, duration, friction_count, emotion_data = \
++            self._episode_facts(episode)
++        _, factors = self._score_components(
++            resolved, duration, friction_count, emotion_data
++        )
++        if not resolved:
++            journey = list(episode.attributes.get("journey", []))
++            friction_events = list(episode.attributes.get("friction_events", []))
++            signals = self._security_signals(
++                journey, friction_events, emotion_data, resolved
++            )
++            factors.append({"factor": "security_diagnosis", **signals})
++        return factors
++
++    def _security_signals(self, journey: List[str], friction: List,
++                          emotion: Dict, resolved: bool) -> Dict:
++        """Banking's security-focused read on an unresolved episode
++        (formerly the diagnose_abandonment telephony surface; the
++        logic is unchanged, it is simply no longer a contract method
++        of a capability this domain doesn't enable)."""
++
+         if resolved:
+             return {"reason": "n/a", "confidence": 1.0}
+-        
++
+         primary = "unknown"
+         factors = []
+-        
++
+         # In banking, fraud alerts MUST stay on line
+         if any("fraud" in node.lower() for node in journey):
+             if emotion.get("frustration", 0) > 0.5:
+                 primary = "fraud_frustration"
+                 factors.append("Caller frustrated during fraud alert")
+-        
++
+         # Long hold = abandonment risk in banking
+         if any(f.get("type") == "long_wait" for f in friction if isinstance(f, dict)):
+             if primary == "unknown":
+                 primary = "security_hold_too_long"
+             factors.append("Security verification took too long")
+-        
++
+         # Repeats suggest account issues
+         if any(node == "account_inquiry_queue" for node in journey):
+             account_repeats = sum(1 for node in journey if "account" in node)
+             if account_repeats > 1:
+                 primary = "account_issue"
+                 factors.append("Caller could not resolve account issue")
+-        
++
+         return {
+             "reason": primary,
+             "factors": factors,
+             "confidence": 0.85 if primary != "unknown" else 0.3
+         }
+-    
+-    def get_friction_thresholds(self) -> Dict[str, float]:
+-        """Banking-specific friction (MORE SENSITIVE to security)"""
+-        return {
+-            "long_wait_threshold": self._GOVERNANCE_PARAMETERS["long_wait_threshold"]["value"],
+-            "repeat_penalty": 0.3,  # Repeats worse in banking
+-            "denial_penalty": 0.4,  # Denials worse (security failures)
+-            "min_friction_for_governance": self._GOVERNANCE_PARAMETERS["governance_trigger"]["value"],
+-        }
+-    
++
+     def get_healing_bounds(self) -> Dict[str, tuple]:
+         """Banking-specific healing bounds (STRICTER)"""
+         return {
+diff --git a/sentinel_os/cassettes/ivr_cassette.py b/sentinel_os/cassettes/ivr_cassette.py
+index 1a5b93f..27d4843 100644
+--- a/sentinel_os/cassettes/ivr_cassette.py
++++ b/sentinel_os/cassettes/ivr_cassette.py
+@@ -7,10 +7,35 @@ Domain-specific rules for traditional voice IVR
+ import copy
+ 
+ from cassette_interface import Cassette, CassetteConfig, QualityResult
+-from typing import Dict, List
++from cassette_capabilities import (
++    CAPABILITY_RL,
++    CAPABILITY_ROUTING_TOPOLOGY,
++    CAPABILITY_SELF_HEALING,
++    CAPABILITY_TELEPHONY_INGEST,
++    ReinforcementLearning,
++    RoutingTopology,
++    SelfHealing,
++    TelephonyIngest,
++)
++from episode import Episode
++from typing import Any, Dict, List
+ 
+-class IvrCassette(Cassette):
+-    """Call center IVR cassette - what we've been building"""
++class IvrCassette(Cassette, TelephonyIngest, RoutingTopology,
++                  ReinforcementLearning, SelfHealing):
++    """Call center IVR cassette -- the REFERENCE IMPLEMENTATION of
++    kernel + capabilities, not the template other domains contort into.
++    IVR is simply the domain that happens to enable everything:
++    telephony ingest, queue routing, RL, and self-healing."""
++
++    # The manifest: which opt-in capability contracts this domain
++    # enables. Load-time validation checks the kernel contract plus the
++    # union of these capabilities' contracts (cassette_schema).
++    CAPABILITIES = (
++        CAPABILITY_TELEPHONY_INGEST,
++        CAPABILITY_ROUTING_TOPOLOGY,
++        CAPABILITY_RL,
++        CAPABILITY_SELF_HEALING,
++    )
+     
+     # THE declaration site. Every governance number the engine reads
+     # about this domain lives in this one dict -- typed, bounded,
+@@ -104,7 +129,14 @@ class IvrCassette(Cassette):
+             # 1.0.0 -> 1.1.0: governance parameters became typed schema
+             # declarations (Item #3); governance_trigger declared at 2
+             # with inclusive (>=) semantics.
+-            version="1.1.0",
++            # 1.1.0 -> 2.0.0: kernel/capability split. Parameter VALUES,
++            # queues, intents, scoring arithmetic, and tier cutoffs are
++            # all UNCHANGED -- but the cassette code hash changes (new
++            # judge/explain surface, capability manifest, shared
++            # governance modules), and load-time binding enforcement
++            # correctly treats a changed hash under an old version
++            # string as a conflict. New code hash => new version.
++            version="2.0.0",
+             description="Traditional call center IVR",
+             domain="ivr"
+         )
+@@ -138,16 +170,19 @@ class IvrCassette(Cassette):
+         }
+         return mapping.get(queue_name, "UNKNOWN")
+     
+-    def score_outcome_quality(self, resolved: bool, duration: float,
+-                             friction_count: int, emotion_data: Dict) -> QualityResult:
+-        """Score call quality for IVR.
++    def _score_call(self, resolved: bool, duration: float,
++                    friction_count: int, emotion_data: Dict):
++        """THE scoring arithmetic for this domain, in one place.
+ 
+-        Returns QualityResult: this cassette owns both the score
+-        arithmetic and the tier cutoffs below.
++        Returns (QualityResult, factors). score_outcome_quality (the
++        telephony capability surface) and judge/explain (the kernel
++        surface) both run THIS code -- one judgment, two entrances --
++        so the two surfaces cannot quietly disagree.
+         """
+-        
++
+         score = 0.0
+-        
++        factors: List[Dict[str, Any]] = []
++
+         if resolved:
+             # 0.7, not 0.6: with the old baseline a flawless call
+             # (resolved, fast, zero friction, calm caller) maxed out at
+@@ -156,19 +191,42 @@ class IvrCassette(Cassette):
+             # At 0.7 a flawless call scores 0.9 and can actually reach
+             # the top tier.
+             score += 0.7
++            factors.append({"factor": "resolved", "value": True,
++                            "contribution": +0.7,
++                            "detail": "call resolved in the IVR"})
+         else:
+             score += 0.1
++            factors.append({"factor": "resolved", "value": False,
++                            "contribution": +0.1,
++                            "detail": "call not resolved"})
+         
+         if duration < 120:
+             score += 0.2
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": +0.2,
++                            "detail": "fast call (< 120s)"})
+         elif duration < 300:
+             score += 0.1
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": +0.1,
++                            "detail": "acceptable call length (< 300s)"})
++        else:
++            factors.append({"factor": "duration", "value": duration,
++                            "contribution": 0.0,
++                            "detail": "long call (>= 300s)"})
+         
+         friction_penalty = min(friction_count * 0.15, 0.3)
+         score -= friction_penalty
++        factors.append({"factor": "friction", "value": friction_count,
++                        "contribution": -friction_penalty,
++                        "detail": "0.15 per friction event, capped at 0.3"})
+         
+         frustration_penalty = emotion_data.get("frustration", 0) * 0.2
+         score -= frustration_penalty
++        factors.append({"factor": "frustration",
++                        "value": emotion_data.get("frustration", 0),
++                        "contribution": -frustration_penalty,
++                        "detail": "0.2 x measured frustration"})
+         
+         score = max(0.0, min(1.0, score))
+         
+@@ -181,7 +239,71 @@ class IvrCassette(Cassette):
+         else:
+             tier = "failed"
+         
+-        return QualityResult(score=score, tier=tier)
++        return QualityResult(score=score, tier=tier), factors
++
++    def score_outcome_quality(self, resolved: bool, duration: float,
++                             friction_count: int, emotion_data: Dict) -> QualityResult:
++        """Score call quality for IVR (telephony_ingest surface).
++
++        Returns QualityResult: this cassette owns both the score
++        arithmetic and the tier cutoffs (see _score_call).
++        """
++        result, _ = self._score_call(resolved, duration, friction_count, emotion_data)
++        return result
++
++    # ---- Kernel judgment surface (judge/explain over episodes) ----
++    #
++    # Field convention this cassette reads (fail-loud on absence --
++    # a value the episode never carried is a value no judgment may
++    # invent): episode.actual["resolved"] (an OUTCOME, so it lives in
++    # actual, never taken from actor_report); episode.attributes
++    # "duration", "friction_count", and optionally "emotion" (dict)
++    # and "journey"/"friction_events" for explanation.
++
++    def _episode_call_facts(self, episode: Episode):
++        try:
++            resolved = bool(episode.actual["resolved"])
++        except KeyError:
++            raise KeyError(
++                "IVR judgment requires episode.actual['resolved'] -- the "
++                "OBSERVED resolution outcome (actor_report is never read)"
++            )
++        try:
++            duration = float(episode.attributes["duration"])
++            friction_count = int(episode.attributes["friction_count"])
++        except KeyError as missing:
++            raise KeyError(
++                f"IVR judgment requires episode.attributes[{missing.args[0]!r}]; "
++                f"declared attributes: {sorted(episode.attributes)}"
++            )
++        emotion_data = dict(episode.attributes.get("emotion", {}))
++        return resolved, duration, friction_count, emotion_data
++
++    def judge(self, episode: Episode) -> QualityResult:
++        """Judge one validated episode -- same arithmetic, same
++        cutoffs as score_outcome_quality, via _score_call."""
++        resolved, duration, friction_count, emotion_data = \
++            self._episode_call_facts(episode)
++        result, _ = self._score_call(resolved, duration, friction_count, emotion_data)
++        return result
++
++    def explain(self, episode: Episode) -> List[Dict[str, Any]]:
++        """Factor-level reasons behind judge()'s verdict, in IVR
++        vocabulary. For unresolved episodes that carry a journey, the
++        abandonment diagnosis rides along as a factor. Kernel-level
++        verification findings (actor divergence, outcome mismatch) are
++        prepended by episode.explain_episode, not restated here."""
++        resolved, duration, friction_count, emotion_data = \
++            self._episode_call_facts(episode)
++        _, factors = self._score_call(resolved, duration, friction_count, emotion_data)
++        if not resolved:
++            journey = list(episode.attributes.get("journey", []))
++            friction_events = list(episode.attributes.get("friction_events", []))
++            diagnosis = self.diagnose_abandonment(
++                journey, friction_events, emotion_data, resolved
++            )
++            factors.append({"factor": "abandonment_diagnosis", **diagnosis})
++        return factors
+     
+     def diagnose_abandonment(self, journey: List[str], friction: List,
+                             emotion: Dict, resolved: bool) -> Dict:
+diff --git a/sentinel_os/episode.py b/sentinel_os/episode.py
+new file mode 100644
+index 0000000..3bef3bc
+--- /dev/null
++++ b/sentinel_os/episode.py
+@@ -0,0 +1,287 @@
++"""
++Episode -- the kernel's domain-blind ground-truth record.
++
++An Episode is what a cassette judges: a record of what was REQUESTED,
++what ACTUALLY happened per independent observation, what the acting
++system CLAIMS happened, and the timeline in between. It replaces the
++call-shaped fixed signature (resolved, duration, friction_count,
++emotion_data) as the kernel's unit of judgment; telephony keeps that
++signature inside its own capability, but the kernel speaks episodes.
++
++Two invariants live here, both fail-closed:
++
++1. REASON ON ANY MISMATCH (not just denials). If any requested field's
++   actual value differs from what was requested, the episode MUST carry
++   at least one outcome reason or it does not validate. Proven
++   necessary by a real insurance pattern: a claim can be PAID at a
++   reduced amount with no formal denial anywhere, which silently
++   bypasses reason-requirements built only around denials
++   ("downcoding"). Mismatch means mismatch -- reduced, substituted,
++   delayed, or denied alike.
++
++2. NEVER TRUST THE ACTOR'S SELF-REPORT. The acting system's own claim
++   of what happened (actor_report) is recorded but never treated as
++   truth: validation always cross-checks it against the observed
++   record (actual) and surfaces every divergence, in the same posture
++   as the twin replica cross-check (twin_custody / twin_detector):
++   the primary's story is compared against an independent record, and
++   disagreement is a first-class finding, not noise. Judgment
++   (Cassette.judge) reads `actual`, never `actor_report`.
++
++Like cassettes, episodes have exactly one validation entry point for
++every judgment path: judge_episode / explain_episode below validate
++first, so no judgment path admits an unvalidated episode -- the same
++rule cassette loading already enforces ("no load path admits an
++unvalidated cassette").
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Mapping, Sequence, Tuple
++
++# Sentinel used in discrepancies when the actor claims a field the
++# observed record never captured at all. String (not object()) so it
++# survives JSON round-trips into ledger rows.
++UNOBSERVED = "<<UNOBSERVED>>"
++
++
++@dataclass(frozen=True)
++class EpisodeEvent:
++    """One timeline entry, in the domain's own vocabulary.
++
++    `at` is seconds from episode start; `kind` is a domain word
++    ("node_entered", "wait", "decision", "payment_adjusted", ...);
++    `detail` carries whatever the domain records about the event.
++    """
++
++    at: float
++    kind: str
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class Mismatch:
++    """A requested field whose actual value differs from the request."""
++
++    name: str
++    requested: Any
++    actual: Any
++
++
++@dataclass(frozen=True)
++class Discrepancy:
++    """The actor's self-report disagrees with the observed record.
++
++    kind follows the twin verdict vocabulary: "DIVERGE" when both
++    sides carry the field with different values; "EXTRA" when the
++    actor claims a field the observed record never captured.
++    """
++
++    name: str
++    actor_claimed: Any
++    observed: Any
++    kind: str  # "DIVERGE" | "EXTRA"
++
++
++@dataclass(frozen=True)
++class Episode:
++    """The ground-truth record of one governed episode.
++
++    requested     -- what was asked for / expected (the promise).
++    actual        -- what happened per the OBSERVED record (the truth
++                     judgment runs on).
++    actor_report  -- what the acting system itself claims happened.
++                     Recorded, cross-checked, never trusted.
++    timeline      -- ordered EpisodeEvents in domain vocabulary.
++    outcome_reasons -- REQUIRED (non-empty) whenever any requested
++                     field mismatches its actual value.
++    attributes    -- domain measurements the cassette's judgment may
++                     read (duration, friction_count, emotion, ...).
++    """
++
++    episode_id: str
++    domain: str
++    requested: Dict[str, Any]
++    actual: Dict[str, Any]
++    actor_report: Dict[str, Any] = field(default_factory=dict)
++    timeline: Tuple[EpisodeEvent, ...] = ()
++    outcome_reasons: Tuple[str, ...] = ()
++    attributes: Dict[str, Any] = field(default_factory=dict)
++
++
++class EpisodeIntegrityError(Exception):
++    """An episode failed kernel validation. Carries every violation
++    found so one attempt reports the whole picture (same reporting
++    posture as CassetteValidationError)."""
++
++    def __init__(self, episode_id: str, violations: List[str]):
++        self.episode_id = episode_id
++        self.violations = list(violations)
++        lines = "\n".join(f"  - {v}" for v in self.violations)
++        super().__init__(
++            f"Episode '{episode_id}' failed integrity validation "
++            f"({len(self.violations)} violation(s)):\n{lines}"
++        )
++
++
++@dataclass(frozen=True)
++class EpisodeReport:
++    """What validation established about an episode: which requested
++    fields mismatched, and where the actor's story diverges from the
++    observed record. Both lists are always computed -- an episode with
++    reasons on file still reports its mismatches, and a divergent
++    actor report is surfaced even when judgment would proceed."""
++
++    mismatches: Tuple[Mismatch, ...]
++    discrepancies: Tuple[Discrepancy, ...]
++
++
++def make_episode(episode_id: str, domain: str, requested: Mapping[str, Any],
++                 actual: Mapping[str, Any],
++                 actor_report: Mapping[str, Any] | None = None,
++                 timeline: Sequence[EpisodeEvent] = (),
++                 outcome_reasons: Sequence[str] = (),
++                 attributes: Mapping[str, Any] | None = None) -> Episode:
++    """Normalizing constructor: copies mappings, freezes sequences."""
++    return Episode(
++        episode_id=str(episode_id),
++        domain=str(domain),
++        requested=dict(requested),
++        actual=dict(actual),
++        actor_report=dict(actor_report or {}),
++        timeline=tuple(timeline),
++        outcome_reasons=tuple(str(r) for r in outcome_reasons),
++        attributes=dict(attributes or {}),
++    )
++
++
++def outcome_mismatches(episode: Episode) -> List[Mismatch]:
++    """Every requested field whose actual value differs -- ANY
++    difference, not just denial-shaped ones. A request for
++    {"outcome": "paid", "amount": 1200.0} answered by
++    {"outcome": "paid", "amount": 900.0} mismatches on amount even
++    though nothing was denied; that is the case this rule exists for.
++    A requested field absent from `actual` is also a mismatch: an
++    outcome that never materialized is not a match."""
++    found: List[Mismatch] = []
++    for name in sorted(episode.requested):
++        want = episode.requested[name]
++        if name not in episode.actual:
++            found.append(Mismatch(name=name, requested=want, actual=None))
++        elif episode.actual[name] != want:
++            found.append(Mismatch(name=name, requested=want,
++                                  actual=episode.actual[name]))
++    return found
++
++
++def actor_discrepancies(episode: Episode) -> List[Discrepancy]:
++    """Cross-check the actor's self-report against the observed record.
++
++    Same posture as the twin: the actor's story is evidence about the
++    actor, not evidence about the world. Divergence on a shared field
++    is DIVERGE; a field the actor claims but observation never
++    captured is EXTRA (a claim with nothing behind it)."""
++    found: List[Discrepancy] = []
++    for name in sorted(episode.actor_report):
++        claimed = episode.actor_report[name]
++        if name not in episode.actual:
++            found.append(Discrepancy(name=name, actor_claimed=claimed,
++                                     observed=UNOBSERVED, kind="EXTRA"))
++        elif episode.actual[name] != claimed:
++            found.append(Discrepancy(name=name, actor_claimed=claimed,
++                                     observed=episode.actual[name],
++                                     kind="DIVERGE"))
++    return found
++
++
++def validate_episode(episode: Episode) -> EpisodeReport:
++    """The single fail-loud validation entry point for every judgment
++    path. Raises EpisodeIntegrityError with the complete violation
++    list, or returns the EpisodeReport (mismatches + actor
++    discrepancies) judgment can proceed with.
++
++    The hard invariant: a mismatch between requested and actual with
++    no outcome reason on file does not validate. There is deliberately
++    no way to waive this -- an outcome that differs from what was
++    asked, with no stated reason, is exactly the record an auditor
++    cannot accept."""
++    violations: List[str] = []
++
++    if not str(episode.episode_id).strip():
++        violations.append("episode_id must be a non-empty string")
++    if not str(episode.domain).strip():
++        violations.append("domain must be a non-empty string")
++    for label, value in (("requested", episode.requested),
++                         ("actual", episode.actual),
++                         ("actor_report", episode.actor_report),
++                         ("attributes", episode.attributes)):
++        if not isinstance(value, dict):
++            violations.append(f"{label} must be a dict, got {type(value).__name__}")
++    for i, reason in enumerate(episode.outcome_reasons):
++        if not str(reason).strip():
++            violations.append(f"outcome_reasons[{i}] is empty; a blank reason is no reason")
++    for i, event in enumerate(episode.timeline):
++        if not isinstance(event, EpisodeEvent):
++            violations.append(
++                f"timeline[{i}] must be an EpisodeEvent, got {type(event).__name__}"
++            )
++
++    if violations:
++        raise EpisodeIntegrityError(episode.episode_id, violations)
++
++    mismatches = outcome_mismatches(episode)
++    if mismatches and not episode.outcome_reasons:
++        for m in mismatches:
++            violations.append(
++                f"outcome mismatch on '{m.name}' (requested {m.requested!r}, "
++                f"actual {m.actual!r}) with NO outcome reason recorded -- a "
++                f"reason is owed any time the outcome differs from what was "
++                f"requested, not only on formal denials"
++            )
++        raise EpisodeIntegrityError(episode.episode_id, violations)
++
++    return EpisodeReport(
++        mismatches=tuple(mismatches),
++        discrepancies=tuple(actor_discrepancies(episode)),
++    )
++
++
++def judge_episode(cassette, episode: Episode):
++    """Kernel judgment entry point: validate, then let the cassette
++    judge. Returns the cassette's QualityResult. No judgment path
++    admits an unvalidated episode."""
++    validate_episode(episode)
++    return cassette.judge(episode)
++
++
++def explain_episode(cassette, episode: Episode) -> List[Dict[str, Any]]:
++    """Kernel explanation entry point: validate, then combine the
++    kernel's own findings with the cassette's factor-level reasons.
++
++    The kernel PREPENDS verification findings -- actor-report
++    divergences and requested/actual mismatches -- so no cassette can
++    forget to surface them. Verification posture is kernel policy, not
++    a per-domain courtesy."""
++    report = validate_episode(episode)
++    factors: List[Dict[str, Any]] = []
++    for d in report.discrepancies:
++        factors.append({
++            "factor": "actor_report_divergence",
++            "field": d.name,
++            "actor_claimed": d.actor_claimed,
++            "observed": d.observed,
++            "kind": d.kind,
++            "detail": "actor self-report disagrees with the observed record; "
++                      "judgment used the observed record",
++        })
++    for m in report.mismatches:
++        factors.append({
++            "factor": "outcome_mismatch",
++            "field": m.name,
++            "requested": m.requested,
++            "actual": m.actual,
++            "reasons_on_file": list(episode.outcome_reasons),
++        })
++    factors.extend(cassette.explain(episode))
++    return factors
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 4e31331..11cae5a 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -84,6 +84,23 @@ class IcebergProductionHarness:
+             config.get("cassette_domain", "ivr")
+         )
+         validate_cassette(self.cassette)
++        # This pipeline reads long_wait_threshold + Twilio ingest
++        # (telephony), routes intent through SentinelCore (routing),
++        # and clamps healing inside expected_wait_bounds
++        # (self_healing). Refuse a cassette missing any of those at
++        # construction -- and again at swap -- rather than mid-call.
++        from cassette_capabilities import (
++            CAPABILITY_ROUTING_TOPOLOGY,
++            CAPABILITY_SELF_HEALING,
++            CAPABILITY_TELEPHONY_INGEST,
++            require_capabilities,
++        )
++        require_capabilities(
++            self.cassette,
++            (CAPABILITY_TELEPHONY_INGEST, CAPABILITY_ROUTING_TOPOLOGY,
++             CAPABILITY_SELF_HEALING),
++            consumer="IcebergProductionHarness",
++        )
+ 
+         # Data sources
+         self.twilio_parser = TwilioLogParser(cassette=self.cassette)
+@@ -209,6 +226,18 @@ class IcebergProductionHarness:
+         next process_call reads the new policy; nothing is cached across
+         the swap."""
+         validate_cassette(cassette)
++        from cassette_capabilities import (
++            CAPABILITY_ROUTING_TOPOLOGY,
++            CAPABILITY_SELF_HEALING,
++            CAPABILITY_TELEPHONY_INGEST,
++            require_capabilities,
++        )
++        require_capabilities(
++            cassette,
++            (CAPABILITY_TELEPHONY_INGEST, CAPABILITY_ROUTING_TOPOLOGY,
++             CAPABILITY_SELF_HEALING),
++            consumer="IcebergProductionHarness.swap_cassette",
++        )
+         self.cassette = cassette
+         self.sentinel = SentinelCore(cassette)
+         self.twilio_parser.cassette = cassette
+diff --git a/sentinel_os/sentinel_core.py b/sentinel_os/sentinel_core.py
+index aa1c5b8..1da2597 100644
+--- a/sentinel_os/sentinel_core.py
++++ b/sentinel_os/sentinel_core.py
+@@ -87,6 +87,23 @@ class SentinelCore:
+         # module importable in isolation.)
+         from cassette_schema import validate_cassette
+         validate_cassette(cassette)
++        # This engine is a call-analytics pipeline: it reads the
++        # routing surface (_infer_intent_to_label) and the telephony
++        # judgment surface (score_outcome_quality, diagnose_abandonment).
++        # A cassette without those capabilities is refused HERE, with a
++        # legible error, instead of failing mid-call -- fail-closed at
++        # the door. Kernel-only domains are judged through
++        # episode.judge_episode / explain_episode, not this class.
++        from cassette_capabilities import (
++            CAPABILITY_ROUTING_TOPOLOGY,
++            CAPABILITY_TELEPHONY_INGEST,
++            require_capabilities,
++        )
++        require_capabilities(
++            cassette,
++            (CAPABILITY_TELEPHONY_INGEST, CAPABILITY_ROUTING_TOPOLOGY),
++            consumer="SentinelCore",
++        )
+         self.cassette = cassette
+ 
+     def infer_intent(self, journey: List[str], first_queue_chosen: str) -> IntentSignal:
+diff --git a/sentinel_os/twilio_log_ingestion.py b/sentinel_os/twilio_log_ingestion.py
+index 3d89446..3370234 100644
+--- a/sentinel_os/twilio_log_ingestion.py
++++ b/sentinel_os/twilio_log_ingestion.py
+@@ -170,6 +170,24 @@ class TwilioLogParser:
+             params = validate_cassette(cassette)
+         except Exception as e:
+             raise ValueError(f"Cassette validation failed: {e}")
++
++        # Twilio ingest is the telephony_ingest capability's surface:
++        # a cassette that doesn't enable it has no twilio_* thresholds
++        # BY DESIGN (they'd be rejected as unowned declarations), so
++        # refuse here with the capability error, not a KeyError deep
++        # in parameter access.
++        from cassette_capabilities import (
++            CAPABILITY_TELEPHONY_INGEST,
++            CapabilityError,
++            require_capabilities,
++        )
++        try:
++            require_capabilities(
++                cassette, (CAPABILITY_TELEPHONY_INGEST,),
++                consumer="TwilioLogParser._count_friction",
++            )
++        except CapabilityError as e:
++            raise ValueError(str(e))
+         
+         # Read Twilio thresholds with NO fallback (type-strict, fail-loud)
+         try:
+-- 
+2.43.0
+

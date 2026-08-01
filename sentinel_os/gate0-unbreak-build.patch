@@ -1,0 +1,261 @@
+diff --git a/sentinel_os/Tests/conftest.py b/sentinel_os/Tests/conftest.py
+index 545d61d..06acbe4 100644
+--- a/sentinel_os/Tests/conftest.py
++++ b/sentinel_os/Tests/conftest.py
+@@ -82,20 +82,56 @@ class DomainFinder:
+ sys.meta_path.insert(0, DomainFinder())
+ 
+ 
++PG_CONFIG = dict(host="localhost", port=5432, dbname="iceberg",
++                  user="iceberg", password="iceberg")
++
++
++def _pg_available() -> bool:
++    try:
++        import psycopg2
++        conn = psycopg2.connect(connect_timeout=2, **PG_CONFIG)
++        conn.close()
++        return True
++    except Exception:
++        return False
++
++
+ @pytest.fixture
+ def test_ledger():
+-    """Provides a test ledger for testing.
+-    
+-    Skips cleanly if PostgreSQL is not available, following the
+-    established pattern in test_cassette_governs_every_decision.py.
++    """Real PostgreSQLLedger against a live database, fresh table per test.
++
++    Skips only if PostgreSQL is genuinely unreachable at
++    iceberg/iceberg@localhost:5432 -- this used to skip unconditionally
++    regardless of whether a database was available, which meant these
++    tests could never actually run even in an environment with Postgres
++    configured. Now it probes first, same pattern as the
++    requires_pg / _pg_available check in
++    test_cassette_governs_every_decision.py.
+     """
+-    pytest.skip("Ledger tests require PostgreSQL (iceberg/iceberg@localhost:5432)")
++    if not _pg_available():
++        pytest.skip("Ledger tests require PostgreSQL (iceberg/iceberg@localhost:5432)")
++
++    import psycopg2
++    from governance.ledger_postgres import PostgreSQLLedger
++
++    conn = psycopg2.connect(connect_timeout=2, **PG_CONFIG)
++    conn.autocommit = True
++    conn.cursor().execute("DROP TABLE IF EXISTS ledger_entries CASCADE;")
++    conn.close()
++
++    ledger = PostgreSQLLedger(**PG_CONFIG)
++    yield ledger
++    ledger.close()
+ 
+ 
+ @pytest.fixture
+ def test_cassette():
+-    """Provides a test cassette for testing.
+-    
+-    Skips cleanly if fixtures are not available.
++    """Real governing cassette (the default IVR cassette).
++
++    Previously skipped unconditionally with no attempt to construct one;
++    the default IvrCassette is what the rest of the codebase treats as
++    "a cassette" (see cassette_loader.CassetteLoader / production_harness),
++    so it's a faithful stand-in here.
+     """
+-    pytest.skip("Cassette tests require proper cassette fixtures")
++    from cassettes.ivr_cassette import IvrCassette
++    return IvrCassette()
+diff --git a/sentinel_os/Tests/test_cassette_snapshot_forensics.py b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+index a8fbd40..ab2e60d 100644
+--- a/sentinel_os/Tests/test_cassette_snapshot_forensics.py
++++ b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+@@ -11,9 +11,9 @@ Proves that:
+ 
+ import pytest
+ import json
+-from sentinel_os.governance.ledger_postgres import PostgreSQLLedger, GovernanceDecisionRecord
+-from sentinel_os.cassette_schema import validate_cassette, cassette_version_of
+-from sentinel_os.cassette_forensics import (
++from governance.ledger_postgres import PostgreSQLLedger, GovernanceDecisionRecord
++from cassette_schema import validate_cassette, cassette_version_of
++from cassette_forensics import (
+     serialize_cassette_for_ledger,
+     compute_cassette_hash,
+     reconstruct_cassette_for_decision,
+diff --git a/sentinel_os/Tests/test_production_integration.py b/sentinel_os/Tests/test_production_integration.py
+index 8ef3f70..ba02c2a 100644
+--- a/sentinel_os/Tests/test_production_integration.py
++++ b/sentinel_os/Tests/test_production_integration.py
+@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from metrics_prometheus import PrometheusMetrics
+ from twilio_log_ingestion import TwilioLogParser, IcebergJourney
++from cassettes.ivr_cassette import IvrCassette
+ 
+ def test_prometheus_metrics():
+     print("\n[TEST 1] Prometheus metrics export")
+@@ -36,7 +37,7 @@ def test_prometheus_metrics():
+ 
+ def test_twilio_log_parsing():
+     print("\n[TEST 2] Twilio log parsing")
+-    parser = TwilioLogParser()
++    parser = TwilioLogParser(cassette=IvrCassette())
+     
+     # Mock Twilio record
+     twilio_record = {
+@@ -64,7 +65,7 @@ def test_twilio_log_parsing():
+ 
+ def test_twilio_abandonment_parsing():
+     print("\n[TEST 3] Twilio abandonment detection")
+-    parser = TwilioLogParser()
++    parser = TwilioLogParser(cassette=IvrCassette())
+     
+     # Abandoned call
+     twilio_record = {
+@@ -92,7 +93,7 @@ def test_full_production_integration():
+     print("\n[TEST 4] Full production integration: metrics + Twilio + governance")
+     
+     metrics = PrometheusMetrics()
+-    parser = TwilioLogParser()
++    parser = TwilioLogParser(cassette=IvrCassette())
+     
+     # Simulate batch of real Twilio calls
+     twilio_records = [
+diff --git a/sentinel_os/Tests/test_twilio_cassette_thresholds.py b/sentinel_os/Tests/test_twilio_cassette_thresholds.py
+index ac1d455..5919a9c 100644
+--- a/sentinel_os/Tests/test_twilio_cassette_thresholds.py
++++ b/sentinel_os/Tests/test_twilio_cassette_thresholds.py
+@@ -32,18 +32,23 @@ def test_count_friction_uses_cassette_thresholds():
+     assert friction == 1, f"Expected 1 friction for 250s call, got {friction}"
+ 
+ 
+-def test_count_friction_falls_back_to_defaults():
+-    """_count_friction uses hardcoded defaults if no cassette provided."""
++def test_count_friction_requires_cassette():
++    """_count_friction is fail-loud: cassette=None raises rather than
++    silently falling back to hardcoded defaults. A friction estimate with
++    no declared source of truth for its thresholds is a policy the system
++    invented, not one that governed anything -- so it's refused outright."""
+     parser = TwilioLogParser()
+-    
++
+     record_medium = {
+         "duration": 250,
+         "status": "completed"
+     }
+-    
+-    # With no cassette, should still use default 300/120/10
+-    friction = parser._count_friction(record_medium, [], cassette=None)
+-    assert friction == 1, f"Expected 1 friction (default 120 threshold), got {friction}"
++
++    try:
++        parser._count_friction(record_medium, [], cassette=None)
++        assert False, "expected ValueError for cassette=None, got a result instead"
++    except ValueError as e:
++        assert "cassette" in str(e).lower()
+ 
+ 
+ def test_count_friction_long_call():
+diff --git a/sentinel_os/cassettes/ivr_cassette_patch.py b/sentinel_os/cassettes/ivr_cassette_patch.py
+deleted file mode 100644
+index 17b29d9..0000000
+--- a/sentinel_os/cassettes/ivr_cassette_patch.py
++++ /dev/null
+@@ -1,40 +0,0 @@
+-# Insert these lines before line 59 (the closing } of _GOVERNANCE_PARAMETERS)
+-        "twilio_long_duration_threshold": {
+-            "value": 300,
+-            "type": "int",
+-            "min": 1,
+-            "max": 3600,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls longer than this duration contribute 2 friction points.",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "5 minutes (300s) is the standard call-center threshold for 'long call' in IVR contexts.",
+-                "last_reviewed": None,
+-            },
+-        },
+-        "twilio_medium_duration_threshold": {
+-            "value": 120,
+-            "type": "int",
+-            "min": 1,
+-            "max": 3600,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls longer than this duration contribute 1 friction point.",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "2 minutes (120s) is the threshold for 'medium length' in IVR contexts.",
+-                "last_reviewed": None,
+-            },
+-        },
+-        "twilio_short_duration_threshold": {
+-            "value": 10,
+-            "type": "int",
+-            "min": 1,
+-            "max": 60,
+-            "unit": "seconds",
+-            "description": "Twilio ingest: calls shorter than this duration with non-completed status indicate dropped calls (1 friction point).",
+-            "metadata": {
+-                "approval_date": None,
+-                "justification": "10 seconds is insufficient for an IVR to play a prompt and capture input; shorter non-completed calls suggest early hang-ups.",
+-                "last_reviewed": None,
+-            },
+-        },
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index 5d559f3..fec8e95 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -304,6 +304,8 @@ class PostgreSQLLedger:
+ 
+     @staticmethod
+     def _as_json(raw):
++        if raw is None:
++            return None
+         if isinstance(raw, (dict, list)):
+             return raw
+         if raw:
+diff --git a/sentinel_os/ledger_backup_1783941109.sql b/sentinel_os/ledger_backup_1783941109.sql
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 73f735a..208614c 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -47,7 +47,7 @@ class IcebergProductionHarness:
+         validate_cassette(self.cassette)
+ 
+         # Data sources
+-        self.twilio_parser = TwilioLogParser(cassette=cassette)
++        self.twilio_parser = TwilioLogParser(cassette=self.cassette)
+         self.twilio_adapter = None  # Will init if API key provided
+ 
+         # Observability
+@@ -123,6 +123,7 @@ class IcebergProductionHarness:
+         validate_cassette(cassette)
+         self.cassette = cassette
+         self.sentinel = SentinelCore(cassette)
++        self.twilio_parser.cassette = cassette
+ 
+     def process_call(self, twilio_record: Dict) -> Dict:
+         """Process one call through complete pipeline"""
+diff --git a/sentinel_os/twilio_log_ingestion.py b/sentinel_os/twilio_log_ingestion.py
+index 94c7390..ebb47fb 100644
+--- a/sentinel_os/twilio_log_ingestion.py
++++ b/sentinel_os/twilio_log_ingestion.py
+@@ -174,9 +174,9 @@ class TwilioLogParser:
+         
+         # Read Twilio thresholds with NO fallback (type-strict, fail-loud)
+         try:
+-            long_threshold = params.float_value("twilio_long_duration_threshold")
+-            medium_threshold = params.float_value("twilio_medium_duration_threshold")
+-            short_threshold = params.float_value("twilio_short_duration_threshold")
++            long_threshold = params.int_value("twilio_long_duration_threshold")
++            medium_threshold = params.int_value("twilio_medium_duration_threshold")
++            short_threshold = params.int_value("twilio_short_duration_threshold")
+         except KeyError as e:
+             raise ValueError(f"Cassette missing required Twilio threshold: {e}")
+         

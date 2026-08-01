@@ -1,0 +1,14 @@
+-- ARGV: 1 prefix, 2 job_id, 3 worker_id, 4 claim_id
+-- Fenced: a worker whose lease expired and whose job was reclaimed
+-- gets 'stale' back and cannot complete someone else's claim.
+local prefix, id = ARGV[1], ARGV[2]
+local ok = owner_check(prefix, id, ARGV[3], ARGV[4])
+if ok ~= 'ok' then
+  redis.call('HINCRBY', prefix .. ':counters', 'stale_acks', 1)
+  return ok
+end
+redis.call('ZREM', prefix .. ':processing', id)
+redis.call('DEL', prefix .. ':job:' .. id, prefix .. ':errors:' .. id)
+redis.call('HINCRBY', prefix .. ':counters', 'completed', 1)
+redis.call('HSET', prefix .. ':counters', 'last_completed_at_ms', now_ms())
+return 'ok'

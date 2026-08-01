@@ -1,0 +1,1000 @@
+diff --git a/sentinel_os/Tests/test_bisg_estimator.py b/sentinel_os/Tests/test_bisg_estimator.py
+index 67b8a1c..4c6800e 100644
+--- a/sentinel_os/Tests/test_bisg_estimator.py
++++ b/sentinel_os/Tests/test_bisg_estimator.py
+@@ -139,3 +139,50 @@ def test_indeterminate_estimate_never_carries_a_distribution():
+ def test_determinate_estimate_reports_true():
+     est = BISGEstimate(distribution={"white": 1.0}, precision="tract")
+     assert est.is_determinate is True
++
++
++# ==========================================================================
++# extract_zip / CensusGeocoder.geocode_county_fips -- the ZIP/county
++# regional-equity check's property-location primitives (see
++# regulatory_checks.check_geographic_outcome_equity). No network here:
++# geocode_to_tract itself is exercised live in test_bisg_estimator_live.py;
++# this only proves geocode_county_fips correctly reshapes whatever
++# geocode_to_tract returns, and extract_zip's own pure text parsing.
++# ==========================================================================
++
++def test_extract_zip_parses_trailing_five_digit_zip():
++    from bisg_estimator import extract_zip
++    assert extract_zip("123 Main St, Springfield, IL 62704") == "62704"
++
++
++def test_extract_zip_handles_zip_plus_four():
++    from bisg_estimator import extract_zip
++    assert extract_zip("123 Main St, Springfield, IL 62704-1234") == "62704"
++
++
++def test_extract_zip_returns_none_for_no_recognizable_zip():
++    from bisg_estimator import extract_zip
++    assert extract_zip("123 Main St, Springfield, IL") is None
++
++
++def test_extract_zip_returns_none_for_empty_address():
++    from bisg_estimator import extract_zip
++    assert extract_zip("") is None
++    assert extract_zip(None) is None
++
++
++def test_geocode_county_fips_combines_state_and_county_from_tract_lookup():
++    from bisg_estimator import CensusGeocoder
++
++    geocoder = CensusGeocoder()
++    geocoder.geocode_to_tract = lambda address: {
++        "state": "17", "county": "167", "tract": "800102"}
++    assert geocoder.geocode_county_fips("any address") == "17167"
++
++
++def test_geocode_county_fips_returns_none_when_address_does_not_resolve():
++    from bisg_estimator import CensusGeocoder
++
++    geocoder = CensusGeocoder()
++    geocoder.geocode_to_tract = lambda address: None
++    assert geocoder.geocode_county_fips("unresolvable address") is None
+diff --git a/sentinel_os/Tests/test_c2_geographic_outcome_equity.py b/sentinel_os/Tests/test_c2_geographic_outcome_equity.py
+new file mode 100644
+index 0000000..0359f35
+--- /dev/null
++++ b/sentinel_os/Tests/test_c2_geographic_outcome_equity.py
+@@ -0,0 +1,195 @@
++"""
++test_c2_geographic_outcome_equity -- proof suite for C2 dimension 6
++(regulatory_checks.check_geographic_outcome_equity): the ZIP/county
++redlining-style regional-equity screen.
++
++Pure logic only -- no ledger, no sealed channel, no geocoder (that's
++obligation_sweep's job to wire together; see Tests/test_obligation_sweep.py
++for the end-to-end geocoding path). This file tests the STATISTICAL
++check itself against already-assembled GeographicCohortDecision records,
++same posture as test_c2_statistical_outcome_equity.py for dimension 4.
++
++Not wired into CFPBRegBLens.c2_rollup() yet (deliberately left as a
++follow-up decision, same posture dimension 5/correlation had between
++being built and being wired in) -- so there is no rollup-wiring section
++here yet, unlike test_c2_statistical_outcome_equity.py's.
++"""
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from regulatory_checks import (
++    FOUR_FIFTHS_THRESHOLD,
++    GEOGRAPHY_TIER_COUNTY,
++    GEOGRAPHY_TIER_ZIP,
++    MIN_COHORT_SIZE_FOR_STATISTICAL_TEST,
++    MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP,
++    GeographicCohortDecision,
++    RegulationCheckProfile,
++    check_geographic_outcome_equity,
++)
++
++_PROFILE = RegulationCheckProfile(regulation="test-dimension-6")
++
++
++def _cohort_for_tier(n_per_group: int, rate_a: float, rate_b: float,
++                     tier: str = GEOGRAPHY_TIER_ZIP):
++    """n_per_group decisions each for two groups 'zip-a'/'zip-b' (or
++    'county-a'/'county-b'), hard-assigned -- one group per record, not
++    a distribution. Mirrors test_c2_statistical_outcome_equity._cohort
++    but for the hard-assigned shape."""
++    cohort = []
++    n_favorable_a = round(n_per_group * rate_a)
++    n_favorable_b = round(n_per_group * rate_b)
++    for i in range(n_per_group):
++        kwargs = dict(subject_id=f"a{i}", favorable_outcome=(i < n_favorable_a),
++                     zip_code=None, county_fips=None)
++        if tier == GEOGRAPHY_TIER_ZIP:
++            kwargs["zip_code"] = "62701"
++        else:
++            kwargs["county_fips"] = "17167"
++        cohort.append(GeographicCohortDecision(**kwargs))
++    for i in range(n_per_group):
++        kwargs = dict(subject_id=f"b{i}", favorable_outcome=(i < n_favorable_b),
++                     zip_code=None, county_fips=None)
++        if tier == GEOGRAPHY_TIER_ZIP:
++            kwargs["zip_code"] = "62704"
++        else:
++            kwargs["county_fips"] = "17201"
++        cohort.append(GeographicCohortDecision(**kwargs))
++    return cohort
++
++
++# ==========================================================================
++# ZIP tier
++# ==========================================================================
++
++def test_clear_adverse_impact_flags_at_zip_tier():
++    # 90% vs 50%: ratio 0.556, well under the 0.8 threshold.
++    cohort = _cohort_for_tier(20, rate_a=0.9, rate_b=0.5, tier=GEOGRAPHY_TIER_ZIP)
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    zip_findings = [f for f in findings if f.evidence.get("tier") == GEOGRAPHY_TIER_ZIP]
++    assert len(zip_findings) == 1
++    f = zip_findings[0]
++    assert f.classification == "four_fifths_adverse_impact"
++    assert f.evidence["group"] == "62704"
++    assert f.evidence["ratio"] == pytest.approx(0.5 / 0.9, abs=0.01)
++    assert f.evidence["ratio"] < FOUR_FIFTHS_THRESHOLD
++
++
++def test_equal_rates_across_zips_is_clean():
++    cohort = _cohort_for_tier(20, rate_a=0.75, rate_b=0.75, tier=GEOGRAPHY_TIER_ZIP)
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    assert not any(f.evidence.get("tier") == GEOGRAPHY_TIER_ZIP and
++                   f.classification == "four_fifths_adverse_impact" for f in findings)
++
++
++# ==========================================================================
++# County tier -- same math, different attribute, run independently
++# ==========================================================================
++
++def test_clear_adverse_impact_flags_at_county_tier():
++    cohort = _cohort_for_tier(20, rate_a=0.9, rate_b=0.5, tier=GEOGRAPHY_TIER_COUNTY)
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    county_findings = [f for f in findings
++                       if f.evidence.get("tier") == GEOGRAPHY_TIER_COUNTY]
++    assert len(county_findings) == 1
++    assert county_findings[0].evidence["group"] == "17201"
++
++
++def test_rates_within_four_fifths_band_is_clean_at_county_tier():
++    # 80% vs 65%: ratio = 0.8125, just above the 0.8 threshold.
++    cohort = _cohort_for_tier(20, rate_a=0.80, rate_b=0.65, tier=GEOGRAPHY_TIER_COUNTY)
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    assert not any(f.evidence.get("tier") == GEOGRAPHY_TIER_COUNTY and
++                   f.classification == "four_fifths_adverse_impact" for f in findings)
++
++
++# ==========================================================================
++# Both tiers run together, independently, off the SAME cohort
++# ==========================================================================
++
++def test_both_tiers_evaluated_from_one_cohort_independently():
++    """A record's zip and county can disagree about which side of a
++    disparity it's on -- e.g. two ZIPs in the same county with very
++    different rates should be able to flag at the ZIP tier while the
++    county tier (pooling both ZIPs together) stays clean."""
++    cohort = []
++    # ZIP 62701 (county 17167): 90% favorable, 20 loans.
++    for i in range(20):
++        cohort.append(GeographicCohortDecision(
++            f"a{i}", favorable_outcome=(i < 18), zip_code="62701", county_fips="17167"))
++    # ZIP 62702 (SAME county 17167): 50% favorable, 20 loans.
++    for i in range(20):
++        cohort.append(GeographicCohortDecision(
++            f"b{i}", favorable_outcome=(i < 10), zip_code="62702", county_fips="17167"))
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    zip_flags = [f for f in findings if f.evidence.get("tier") == GEOGRAPHY_TIER_ZIP
++                and f.classification == "four_fifths_adverse_impact"]
++    county_flags = [f for f in findings if f.evidence.get("tier") == GEOGRAPHY_TIER_COUNTY
++                   and f.classification == "four_fifths_adverse_impact"]
++    assert len(zip_flags) == 1  # the two ZIPs disagree -- flags
++    assert len(county_flags) == 0  # pooled into one county -- nothing to compare
++
++
++# ==========================================================================
++# Cohort-size / group-coverage gates
++# ==========================================================================
++
++def test_below_minimum_cohort_size_is_indeterminate_not_a_false_pass():
++    small = _cohort_for_tier(5, rate_a=1.0, rate_b=0.0)  # would obviously flag if evaluated
++    assert len(small) < MIN_COHORT_SIZE_FOR_STATISTICAL_TEST
++    findings = check_geographic_outcome_equity(small, _PROFILE)
++    assert len(findings) == 1  # one indeterminate for the WHOLE cohort, not per-tier
++    assert findings[0].classification == "indeterminate_insufficient_cohort"
++    assert findings[0].evidence["cohort_size"] == len(small)
++
++
++def test_single_group_per_tier_is_indeterminate_insufficient_coverage():
++    cohort = [
++        GeographicCohortDecision(f"a{i}", favorable_outcome=(i % 2 == 0),
++                                 zip_code="62701", county_fips="17167")
++        for i in range(MIN_COHORT_SIZE_FOR_STATISTICAL_TEST + 5)
++    ]
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    # every record shares the same zip AND county -- both tiers indeterminate
++    assert len(findings) == 2
++    assert {f.evidence["tier"] for f in findings} == {GEOGRAPHY_TIER_ZIP, GEOGRAPHY_TIER_COUNTY}
++    assert all(f.classification == "indeterminate_insufficient_group_coverage"
++              for f in findings)
++
++
++def test_group_below_minimum_observations_excluded_from_comparison():
++    """Unlike dimension 4's >= 1.0 EFFECTIVE weight floor (built for
++    probability-weighted BISG estimates), hard-assigned geography needs
++    a real sample per group -- MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP,
++    not 1."""
++    cohort = _cohort_for_tier(MIN_COHORT_SIZE_FOR_STATISTICAL_TEST, rate_a=0.9, rate_b=0.9,
++                              tier=GEOGRAPHY_TIER_ZIP)
++    # Add a THIRD zip with only 2 loans -- below the floor of 5.
++    assert MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP > 2
++    cohort.append(GeographicCohortDecision("c0", favorable_outcome=True,
++                                           zip_code="62799", county_fips=None))
++    cohort.append(GeographicCohortDecision("c1", favorable_outcome=False,
++                                           zip_code="62799", county_fips=None))
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    assert not any(f.evidence.get("group") == "62799" for f in findings)
++
++
++# ==========================================================================
++# Partial geography: a record can carry only one tier's value
++# ==========================================================================
++
++def test_record_with_only_zip_contributes_to_zip_tier_only():
++    cohort = _cohort_for_tier(20, rate_a=0.9, rate_b=0.5, tier=GEOGRAPHY_TIER_ZIP)
++    # None of these records have a county_fips at all.
++    assert all(d.county_fips is None for d in cohort)
++    findings = check_geographic_outcome_equity(cohort, _PROFILE)
++    # county tier: no groups have ANY observations -- indeterminate, not a flag
++    county_findings = [f for f in findings if f.evidence.get("tier") == GEOGRAPHY_TIER_COUNTY]
++    assert len(county_findings) == 1
++    assert county_findings[0].classification == "indeterminate_insufficient_group_coverage"
+diff --git a/sentinel_os/Tests/test_obligation_sweep.py b/sentinel_os/Tests/test_obligation_sweep.py
+index 6002b8f..a971ae7 100644
+--- a/sentinel_os/Tests/test_obligation_sweep.py
++++ b/sentinel_os/Tests/test_obligation_sweep.py
+@@ -117,7 +117,7 @@ def test_subject_of_falls_back_to_decision_hash():
+ # handed in directly.
+ # ---------------------------------------------------------------------------
+ 
+-def test_assemble_cohort_builds_both_dimension_cohorts_when_everything_is_on_file():
++def test_assemble_cohort_builds_all_three_dimension_cohorts_when_everything_is_on_file():
+     from regulatory_cassette_interface import DecisionMaterial
+ 
+     obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
+@@ -125,10 +125,14 @@ def test_assemble_cohort_builds_both_dimension_cohorts_when_everything_is_on_fil
+     materials = {"h1": DecisionMaterial(
+         subject_id="h1", domain="lending", reasons=(), input_fields={"income": 50000},
+         mismatched_fields=(), outcome={"approved": True}, source="ledger")}
++    geography = {"h1": {"zip": "62704", "county_fips": "17167"}}
+     assembled = assemble_cohort("lending", "loan_performance", obligations,
+-                                distributions, materials)
++                                distributions, materials, geography)
+     assert len(assembled.dimension_4_cohort) == 1
+     assert len(assembled.dimension_5_cohort) == 1
++    assert len(assembled.dimension_6_cohort) == 1
++    assert assembled.dimension_6_cohort[0].zip_code == "62704"
++    assert assembled.dimension_6_cohort[0].county_fips == "17167"
+     assert assembled.skipped == []
+     assert assembled.total_resolved == 1
+ 
+@@ -165,15 +169,20 @@ def test_assemble_cohort_skips_a_genuinely_ambiguous_resolution_for_dimension_4_
+ def test_assemble_cohort_admits_dimension_4_without_dimension_5():
+     """The reverse of the above: a real favorable call with a
+     distribution, but no decision material -- dimension 4 gets it,
+-    dimension 5 reports why it doesn't."""
++    dimension 5 reports why it doesn't. Dimension 6 also can't run:
++    with no decision material there's no address to geocode either,
++    so it reports its own skip for the same underlying reason."""
+     obligations = [_resolved("o1", "lending", "loan_performance", "h1")]
+     distributions = {"h1": {"white": 0.6, "black": 0.4}}
+     assembled = assemble_cohort("lending", "loan_performance", obligations,
+                                 distributions, {})
+     assert len(assembled.dimension_4_cohort) == 1
+     assert assembled.dimension_5_cohort == []
+-    assert len(assembled.skipped) == 1
+-    assert "dimension 5" in assembled.skipped[0].reason
++    assert assembled.dimension_6_cohort == []
++    assert len(assembled.skipped) == 2
++    reasons = [s.reason for s in assembled.skipped]
++    assert any("dimension 5" in r for r in reasons)
++    assert any("dimension 6" in r for r in reasons)
+ 
+ 
+ def test_assemble_cohort_uses_subject_id_to_look_up_distribution_when_present():
+@@ -349,4 +358,45 @@ def test_sweep_end_to_end_produces_one_review_per_cohort(twin, channel, test_led
+         assert review.total_resolved == 1
+         assert review.dimension_4_cohort_size == 1
+         assert review.dimension_5_cohort_size == 1
+-        assert review.skipped == []
++        # dimension 6 (ZIP/county) needs a property address in
++        # input_fields; these fixtures don't declare one (income/claims
++        # only), so it's expected to skip, not an error -- see
++        # test_sweep_geocodes_property_address_into_dimension_6 below
++        # for the address-present path.
++        assert review.dimension_6_cohort_size == 0
++        assert len(review.skipped) == 1
++        assert "dimension 6" in review.skipped[0].reason
++
++
++def test_sweep_geocodes_property_address_into_dimension_6(twin, channel, test_ledger):
++    """Same wiring as above, but the decision DOES declare a property
++    address -- proving sweep() actually calls the geocoder (a stub
++    here, real bisg_estimator.CensusGeocoder in production) and feeds
++    the result into dimension 6, rather than only proving the skip
++    path."""
++    class _StubGeocoder:
++        def geocode_county_fips(self, address: str):
++            return "17167" if "Springfield" in address else None
++
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="lending:test_cassette:1.0.0",
++        input_data={"income": 60000, "loan_property_address":
++                   "123 Main St, Springfield, IL 62704"},
++        policy_parameters={"min_income": 40000}, reasoning="qualifies",
++        output={"approved": True}, outcome_obligation="loan_performance@24mo",
++    ))
++    lending_hash = test_ledger.get_entries(limit=1)[0]["current_hash"]
++    _ship_and_resolve(twin, 1, "lending", lending_hash, favorable=True)
++    channel.record_estimate(lending_hash, SOURCE_BISG_ESTIMATED, {"white": 0.7, "black": 0.3})
++
++    conn = test_ledger.pool.getconn()
++    try:
++        reviews = sweep(twin, twin.replica_id, conn, channel, CFPB_REG_B_PROFILE,
++                        geocoder=_StubGeocoder())
++    finally:
++        test_ledger.pool.putconn(conn)
++
++    assert len(reviews) == 1
++    review = reviews[0]
++    assert review.dimension_6_cohort_size == 1
++    assert review.skipped == []
+diff --git a/sentinel_os/Tests/test_twin_cohort_reviews.py b/sentinel_os/Tests/test_twin_cohort_reviews.py
+index fbb735f..8a66917 100644
+--- a/sentinel_os/Tests/test_twin_cohort_reviews.py
++++ b/sentinel_os/Tests/test_twin_cohort_reviews.py
+@@ -47,12 +47,14 @@ def _review(domain="lending", obligation_kind="loan_performance",
+         "domain": domain, "obligation_kind": obligation_kind,
+         "total_resolved": 1, "dimension_4_cohort_size": 1,
+         "dimension_5_cohort_size": 0,
++        "dimension_6_cohort_size": 0,
+         "dimension_4_findings": dimension_4_findings or [
+             {"check": "statistical_outcome_equity", "subject_id": "cohort:1",
+              "regulation": "reg_b", "action": "flag",
+              "classification": "indeterminate_insufficient_cohort",
+              "score": 0.0, "evidence": {}}],
+         "dimension_5_findings": [],
++        "dimension_6_findings": [],
+         "skipped": [], "swept_at": swept_at,
+     }
+ 
+@@ -153,10 +155,13 @@ def test_record_reviews_wires_obligation_sweep_output_into_the_twin(twin):
+     review = CohortEquityReview(
+         domain="lending", obligation_kind="loan_performance", total_resolved=5,
+         dimension_4_cohort_size=5, dimension_5_cohort_size=3,
+-        dimension_4_findings=[], dimension_5_findings=[], skipped=[])
++        dimension_6_cohort_size=2,
++        dimension_4_findings=[], dimension_5_findings=[], dimension_6_findings=[],
++        skipped=[])
+     results = record_reviews(twin, twin.replica_id, [review], swept_at=1_700_000_000.0)
+     assert len(results) == 1
+     assert results[0]["seq"] == 1
+     listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews").json()["reviews"]
+     assert listed[0]["total_resolved"] == 5
+     assert listed[0]["dimension_5_cohort_size"] == 3
++    assert listed[0]["dimension_6_cohort_size"] == 2
+diff --git a/sentinel_os/bisg_estimator.py b/sentinel_os/bisg_estimator.py
+index bba75aa..53a27c5 100644
+--- a/sentinel_os/bisg_estimator.py
++++ b/sentinel_os/bisg_estimator.py
+@@ -68,6 +68,7 @@ from __future__ import annotations
+ import csv
+ import io
+ import os
++import re
+ import tempfile
+ import zipfile
+ from dataclasses import dataclass
+@@ -220,9 +221,41 @@ class SurnameTable:
+         return self._national
+ 
+ 
++# The literal postal ZIP, parsed straight from the formatted address
++# string -- no geocoding call needed. This is a HARD FACT already
++# present in the text (see the ZIP/county regional-equity check's
++# module docstring in regulatory_checks.py: "race is subjective,
++# address is not"), unlike a Census ZCTA (Zip Code Tabulation Area),
++# which is a Census-drawn *approximation* of ZIP delivery areas and
++# would not be the literal ZIP on the loan file. Deliberately not
++# pulled from the geocoder's response for that reason.
++_ZIP_PATTERN = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
++
++
++def extract_zip(address: str) -> Optional[str]:
++    """Parse the trailing 5-digit ZIP from a formatted address string
++    ("123 Main St, Springfield, IL 62704" -> "62704"). None if the
++    address is empty or does not end in a recognizable ZIP -- never a
++    guessed value."""
++    if not address:
++        return None
++    match = _ZIP_PATTERN.search(address.strip())
++    return match.group(1) if match else None
++
++
+ class CensusGeocoder:
+     """Real, live, key-free geocoding (address -> Census tract FIPS)."""
+ 
++    def geocode_county_fips(self, address: str) -> Optional[str]:
++        """5-digit state+county FIPS (e.g. "24033"), from the SAME
++        geocode_to_tract call the BISG race estimate already makes for
++        this address -- reuses the pipeline, not a new data source.
++        None if the address doesn't resolve (never a guessed county)."""
++        tract = self.geocode_to_tract(address)
++        if tract is None:
++            return None
++        return f"{tract['state']}{tract['county']}"
++
+     def geocode_to_tract(self, address: str) -> Optional[Dict[str, str]]:
+         """Returns {"state": "24", "county": "033", "tract": "800102"}
+         or None if the address didn't resolve or the service was
+diff --git a/sentinel_os/obligation_sweep.py b/sentinel_os/obligation_sweep.py
+index 2836916..8ad1e92 100644
+--- a/sentinel_os/obligation_sweep.py
++++ b/sentinel_os/obligation_sweep.py
+@@ -51,7 +51,7 @@ and belongs in the review, not a bucket that silently never appears.
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+-from typing import Any, Dict, List, Mapping, Set, Tuple
++from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+ 
+ import psycopg2.extras
+ 
+@@ -65,8 +65,10 @@ from regulatory_cassette_interface import DecisionMaterial, material_from_ledger
+ from regulatory_checks import (
+     CohortDecision,
+     CohortInputDecision,
++    GeographicCohortDecision,
+     RegulationCheckProfile,
+     check_correlation_based_proxy_detection,
++    check_geographic_outcome_equity,
+     check_statistical_outcome_equity,
+ )
+ 
+@@ -151,12 +153,14 @@ class SkippedObligation:
+ 
+ @dataclass
+ class AssembledCohort:
+-    """One (domain, obligation_kind) bucket, converted into the two
+-    typed shapes the C2 dimension-4 and dimension-5 checks each need."""
++    """One (domain, obligation_kind) bucket, converted into the three
++    typed shapes the C2 dimension-4, dimension-5, and dimension-6
++    checks each need."""
+     domain: str
+     obligation_kind: str
+     dimension_4_cohort: List[CohortDecision]
+     dimension_5_cohort: List[CohortInputDecision]
++    dimension_6_cohort: List[GeographicCohortDecision]
+     skipped: List[SkippedObligation]
+     total_resolved: int
+ 
+@@ -166,43 +170,55 @@ def assemble_cohort(
+         obligations: List[Mapping[str, Any]],
+         group_distributions: Mapping[str, Mapping[str, float]],
+         decision_materials: Mapping[str, DecisionMaterial],
++        property_geography: Optional[Mapping[str, Mapping[str, Optional[str]]]] = None,
+         ) -> AssembledCohort:
+-    """Turn one bucket of resolved obligations into the two cohort
+-    shapes check_statistical_outcome_equity (dimension 4) and
+-    check_correlation_based_proxy_detection (dimension 5) each need.
+-
+-    group_distributions and decision_materials are both pre-fetched by
+-    the caller, keyed by subject_of(obligation) and decision_hash
+-    respectively -- this function does no I/O, so it needs no live
+-    sealed channel or ledger connection to test.
+-
+-    The two dimensions have DIFFERENT data requirements and are
++    """Turn one bucket of resolved obligations into the three cohort
++    shapes check_statistical_outcome_equity (dimension 4),
++    check_correlation_based_proxy_detection (dimension 5), and
++    check_geographic_outcome_equity (dimension 6) each need.
++
++    group_distributions, decision_materials, and property_geography are
++    all pre-fetched by the caller, keyed by subject_of(obligation),
++    decision_hash, and decision_hash respectively -- this function does
++    no I/O, so it needs no live sealed channel, ledger connection, or
++    geocoder to test. property_geography defaults to None (treated as
++    empty): a caller not yet fetching geography still gets dimension
++    4/5 exactly as before -- dimension 6 just comes back empty, not an
++    error.
++
++    The three dimensions have DIFFERENT data requirements and are
+     evaluated INDEPENDENTLY: an obligation can enter dimension 4's
+-    cohort without entering dimension 5's (missing decision material),
+-    but never the reverse (dimension 5 also needs a group_distribution,
+-    same as dimension 4) -- so a per-obligation skip reason is specific
+-    to which dimension it affects, not a single pass/fail gate.
++    cohort without entering dimension 5's or 6's (missing decision
++    material or geography respectively), but 5 and 6 both also need a
++    resolved dimension-4 entry first (favorable outcome known) -- so a
++    per-obligation skip reason is specific to which dimension it
++    affects, not a single pass/fail gate.
+     """
++    property_geography = property_geography or {}
+     dim4: List[CohortDecision] = []
+     dim5: List[CohortInputDecision] = []
++    dim6: List[GeographicCohortDecision] = []
+     skipped: List[SkippedObligation] = []
+     for obligation in obligations:
+         subject = subject_of(obligation)
+         obligation_id = str(obligation.get("obligation_id", subject))
++        decision_hash = str(obligation["decision_hash"])
+         distribution = group_distributions.get(subject)
+         if distribution is None:
+             skipped.append(SkippedObligation(
+                 obligation_id,
+                 "no protected-characteristic estimate on file for this subject"))
+             continue
++        dim4_entry = None
+         try:
+-            dim4.append(to_cohort_decision(
+-                _to_outcome_obligation(obligation), distribution))
++            dim4_entry = to_cohort_decision(
++                _to_outcome_obligation(obligation), distribution)
++            dim4.append(dim4_entry)
+         except OutcomeIntegrityError as exc:
+             skipped.append(SkippedObligation(
+                 obligation_id,
+                 f"not usable for dimension 4: {'; '.join(exc.violations)}"))
+-        material = decision_materials.get(str(obligation["decision_hash"]))
++        material = decision_materials.get(decision_hash)
+         if material is not None:
+             dim5.append(CohortInputDecision(
+                 subject_id=subject,
+@@ -214,9 +230,26 @@ def assemble_cohort(
+                 obligation_id,
+                 "not usable for dimension 5: no decision material found on "
+                 "the primary ledger for this obligation's decision_hash"))
++        if dim4_entry is not None:
++            geography = property_geography.get(decision_hash)
++            zip_code = (geography or {}).get("zip")
++            county_fips = (geography or {}).get("county_fips")
++            if zip_code or county_fips:
++                dim6.append(GeographicCohortDecision(
++                    subject_id=subject,
++                    favorable_outcome=dim4_entry.favorable_outcome,
++                    zip_code=zip_code,
++                    county_fips=county_fips,
++                ))
++            else:
++                skipped.append(SkippedObligation(
++                    obligation_id,
++                    "not usable for dimension 6: no property ZIP or county "
++                    "resolved for this obligation's decision_hash"))
+     return AssembledCohort(
+         domain=domain, obligation_kind=obligation_kind,
+         dimension_4_cohort=dim4, dimension_5_cohort=dim5,
++        dimension_6_cohort=dim6,
+         skipped=skipped, total_resolved=len(obligations),
+     )
+ 
+@@ -231,8 +264,10 @@ class CohortEquityReview:
+     total_resolved: int
+     dimension_4_cohort_size: int
+     dimension_5_cohort_size: int
++    dimension_6_cohort_size: int
+     dimension_4_findings: List[Dict[str, Any]]
+     dimension_5_findings: List[Dict[str, Any]]
++    dimension_6_findings: List[Dict[str, Any]]
+     skipped: List[SkippedObligation] = field(default_factory=list)
+ 
+     def as_dict(self) -> Dict[str, Any]:
+@@ -244,8 +279,10 @@ class CohortEquityReview:
+             "total_resolved": self.total_resolved,
+             "dimension_4_cohort_size": self.dimension_4_cohort_size,
+             "dimension_5_cohort_size": self.dimension_5_cohort_size,
++            "dimension_6_cohort_size": self.dimension_6_cohort_size,
+             "dimension_4_findings": self.dimension_4_findings,
+             "dimension_5_findings": self.dimension_5_findings,
++            "dimension_6_findings": self.dimension_6_findings,
+             "skipped": [{"obligation_id": s.obligation_id, "reason": s.reason}
+                        for s in self.skipped],
+         }
+@@ -253,27 +290,31 @@ class CohortEquityReview:
+ 
+ def review_cohort(assembled: AssembledCohort,
+                   profile: RegulationCheckProfile) -> CohortEquityReview:
+-    """Run both cohort-level C2 checks against one assembled cohort.
+-
+-    Both checks are called regardless of cohort size -- each reports
+-    its own INDETERMINATE finding when its cohort is below
+-    MIN_COHORT_SIZE_FOR_STATISTICAL_TEST rather than this function
+-    pre-filtering small cohorts out. A domain/obligation_kind pair with
+-    too few resolved obligations to say anything yet is itself
+-    reportable state, not silence.
++    """Run all three cohort-level C2 checks against one assembled cohort.
++
++    All three checks are called regardless of cohort size -- each
++    reports its own INDETERMINATE finding when its cohort is below the
++    relevant minimum rather than this function pre-filtering small
++    cohorts out. A domain/obligation_kind pair with too few resolved
++    obligations to say anything yet is itself reportable state, not
++    silence.
+     """
+     dim4_findings = check_statistical_outcome_equity(
+         assembled.dimension_4_cohort, profile)
+     dim5_findings = check_correlation_based_proxy_detection(
+         assembled.dimension_5_cohort, profile)
++    dim6_findings = check_geographic_outcome_equity(
++        assembled.dimension_6_cohort, profile)
+     return CohortEquityReview(
+         domain=assembled.domain,
+         obligation_kind=assembled.obligation_kind,
+         total_resolved=assembled.total_resolved,
+         dimension_4_cohort_size=len(assembled.dimension_4_cohort),
+         dimension_5_cohort_size=len(assembled.dimension_5_cohort),
++        dimension_6_cohort_size=len(assembled.dimension_6_cohort),
+         dimension_4_findings=[f.as_dict() for f in dim4_findings],
+         dimension_5_findings=[f.as_dict() for f in dim5_findings],
++        dimension_6_findings=[f.as_dict() for f in dim6_findings],
+         skipped=assembled.skipped,
+     )
+ 
+@@ -334,12 +375,61 @@ def fetch_decision_materials(ledger_conn, decision_hashes: Set[str],
+     return result
+ 
+ 
++def fetch_property_geography(
++        geocoder, decision_materials: Mapping[str, DecisionMaterial],
++        address_field: str = "loan_property_address",
++        ) -> Dict[str, Dict[str, Optional[str]]]:
++    """Resolve each decision's property address to ZIP + county FIPS,
++    keyed by decision_hash. Reuses the SAME CensusGeocoder call the
++    BISG race estimate already makes for this address
++    (bisg_estimator.CensusGeocoder.geocode_county_fips) plus a plain
++    text parse for ZIP (bisg_estimator.extract_zip) -- no new data
++    source, one geocode per address.
++
++    address_field is a parameter, not a hardcoded import of
++    cassettes.mortgage_cassette.PROPERTY_ADDRESS_FIELD: this module
++    stays domain-agnostic, same posture as every other cohort-assembly
++    function here, so a future loan-type cassette that declares its
++    property address under a different input_fields key can reuse this
++    without a code change here.
++
++    A decision_hash with no value under address_field at all is simply
++    absent from the result (nothing to geocode). A decision_hash WITH
++    an address is always present in the result, even if neither zip nor
++    county_fips resolves -- assemble_cohort's skip handling is what
++    turns "present but both None" into a reported skip, not this
++    function silently omitting it.
++    """
++    from bisg_estimator import extract_zip
++
++    result: Dict[str, Dict[str, Optional[str]]] = {}
++    for decision_hash, material in decision_materials.items():
++        address = material.input_fields.get(address_field)
++        if not address:
++            continue
++        result[decision_hash] = {
++            "zip": extract_zip(str(address)),
++            "county_fips": geocoder.geocode_county_fips(str(address)),
++        }
++    return result
++
++
+ def sweep(twin_client, replica_id: str, ledger_conn, sealed_channel,
+-          profile: RegulationCheckProfile) -> List[CohortEquityReview]:
++          profile: RegulationCheckProfile, geocoder=None,
++          ) -> List[CohortEquityReview]:
+     """The whole sweep, wired to real I/O: fetch resolved obligations
+     from the twin, bucket them, fetch what each bucket needs, and
+     return one CohortEquityReview per bucket -- including buckets too
+-    small to test (see review_cohort)."""
++    small to test (see review_cohort).
++
++    geocoder defaults to a real bisg_estimator.CensusGeocoder() when not
++    supplied -- the same live, key-free geocoding service dimension 4's
++    BISG estimate already depends on. Pass a stub/mock in tests to avoid
++    a real network call, same posture as sealed_channel and twin_client.
++    """
++    if geocoder is None:
++        from bisg_estimator import CensusGeocoder
++        geocoder = CensusGeocoder()
+     obligations = fetch_resolved_obligations(twin_client, replica_id)
+     buckets = bucket_resolved_obligations(obligations)
+     reviews: List[CohortEquityReview] = []
+@@ -348,8 +438,10 @@ def sweep(twin_client, replica_id: str, ledger_conn, sealed_channel,
+         decision_hashes = {str(o["decision_hash"]) for o in bucket_obligations}
+         group_distributions = fetch_group_distributions(sealed_channel, subjects)
+         decision_materials = fetch_decision_materials(ledger_conn, decision_hashes)
++        property_geography = fetch_property_geography(geocoder, decision_materials)
+         assembled = assemble_cohort(domain, obligation_kind, bucket_obligations,
+-                                    group_distributions, decision_materials)
++                                    group_distributions, decision_materials,
++                                    property_geography)
+         reviews.append(review_cohort(assembled, profile))
+     return reviews
+ 
+diff --git a/sentinel_os/regulatory_checks.py b/sentinel_os/regulatory_checks.py
+index 9413f99..7f8fd85 100644
+--- a/sentinel_os/regulatory_checks.py
++++ b/sentinel_os/regulatory_checks.py
+@@ -148,7 +148,7 @@ from __future__ import annotations
+ import re
+ import statistics
+ from dataclasses import dataclass, field
+-from typing import Any, Dict, List, Mapping, Tuple
++from typing import Any, Dict, List, Mapping, Optional, Tuple
+ 
+ from regulatory_cassette_interface import (
+     ACTION_FLAG,
+@@ -1285,6 +1285,182 @@ def check_correlation_based_proxy_detection(
+     return findings
+ 
+ 
++# ---------------------------------------------------------------------------
++# Check 8: geographic (ZIP/county) outcome-equity screen (dimension 6)
++#
++# Redlining-style regional-equity check, COHORT-level like check 5 --
++# same reason: a rate is a property of many decisions, not one.
++# Reuses check 5's four-fifths threshold and overall shape, but the
++# comparison itself is HARD-ASSIGNED rather than probability-weighted.
++# check 5's BISG estimate is a genuine posterior across race categories
++# (Elliott et al.) because race/ethnicity is never directly observed
++# from a surname+tract alone -- weighting by probability is the honest
++# way to use an estimate. A property's ZIP code and county are not
++# estimates: a mortgage secures exactly one physical address, known
++# with certainty from the loan file itself (locked 2026-07-29, Wm:
++# "race is subjective, address is not"). Weighting a known fact by a
++# fabricated probability would be less honest than the plain count it
++# already is, not more.
++#
++# Reuses the EXISTING BISG geocoder pipeline (bisg_estimator.
++# CensusGeocoder), not a new data source: the same geocode_to_tract
++# call already made for the race estimate also yields county FIPS
++# (CensusGeocoder.geocode_county_fips); ZIP is parsed directly from
++# the address text (bisg_estimator.extract_zip) since it needs no
++# geocoding call at all. See obligation_sweep.fetch_property_geography
++# for where these are actually called.
++# ---------------------------------------------------------------------------
++
++# Hard-assigned data needs a real per-group sample, unlike check 5's
++# probability-weighted >= 1.0 effective-weight floor (where even ONE
++# decision spreads partial weight across every race category, so 1.0
++# genuinely means "about one decision's worth of signal, pooled from
++# many"). A single ZIP code with exactly one loan in it produces a
++# hard rate of 0% or 100% off that one data point -- not a thin
++# signal, just noise dressed as a number. Set higher for that reason;
++# adjust if 5 proves too strict or too loose in practice.
++MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP = 5
++
++GEOGRAPHY_TIER_ZIP = "zip"
++GEOGRAPHY_TIER_COUNTY = "county"
++GEOGRAPHY_TIERS = (GEOGRAPHY_TIER_ZIP, GEOGRAPHY_TIER_COUNTY)
++
++
++@dataclass(frozen=True)
++class GeographicCohortDecision:
++    """One RESOLVED decision's outcome plus its property location --
++    HARD-ASSIGNED, not a probability distribution (see module docstring
++    above for why this differs from CohortDecision's BISG posterior).
++
++    zip_code / county_fips -- either may be None INDEPENDENTLY of the
++    other: a ZIP is parsed from the address text and a county comes
++    from a separate geocoding call, so one can resolve while the other
++    doesn't. A decision missing BOTH never reaches this cohort at all
++    (see obligation_sweep.assemble_cohort's skip handling) -- partial
++    geography here just excludes this record from ONE tier's rate, not
++    the whole check.
++    """
++
++    subject_id: str
++    favorable_outcome: bool
++    zip_code: Optional[str]
++    county_fips: Optional[str]
++
++
++def check_geographic_outcome_equity(
++        cohort: "List[GeographicCohortDecision]", profile: RegulationCheckProfile,
++        check_name: str = "geographic_outcome_equity_four_fifths",
++        ) -> List[RegulatoryFinding]:
++    """Four-fifths disparate-impact screen by property location, run at
++    BOTH geography tiers (ZIP -- fine-grained -- and county -- coarse)
++    against the same cohort; findings from both tiers come back in one
++    list, each tagged with which tier fired in its evidence. Same
++    overall shape and threshold as check_statistical_outcome_equity
++    (dimension 4); see this module's docstring above for why the
++    comparison itself is hard-assigned counts, not weighted rates.
++
++    A record with no value for a given tier (zip_code or county_fips is
++    None) simply does not count toward THAT tier's rate -- it still
++    counts toward the other tier if it has a value there. This mirrors
++    dimension 4/5's per-obligation independence in obligation_sweep.py:
++    a partial record is used everywhere it can be, not discarded
++    wholesale.
++    """
++    if len(cohort) < MIN_COHORT_SIZE_FOR_STATISTICAL_TEST:
++        return [RegulatoryFinding(
++            check=check_name,
++            subject_id=f"cohort:{len(cohort)}",
++            regulation=profile.regulation,
++            action=ACTION_FLAG,
++            classification="indeterminate_insufficient_cohort",
++            score=0.0,
++            evidence={
++                "cohort_size": len(cohort),
++                "minimum_required": MIN_COHORT_SIZE_FOR_STATISTICAL_TEST,
++                "detail": "cohort is too small for a statistical disparate-impact "
++                          "comparison to mean anything -- reporting indeterminate "
++                          "rather than a spurious pass or flag",
++            },
++        )]
++
++    findings: List[RegulatoryFinding] = []
++    for tier, attr in ((GEOGRAPHY_TIER_ZIP, "zip_code"),
++                       (GEOGRAPHY_TIER_COUNTY, "county_fips")):
++        favorable_count: Dict[str, int] = {}
++        total_count: Dict[str, int] = {}
++        for decision in cohort:
++            group = getattr(decision, attr)
++            if not group:
++                continue
++            total_count[group] = total_count.get(group, 0) + 1
++            if decision.favorable_outcome:
++                favorable_count[group] = favorable_count.get(group, 0) + 1
++
++        rates = {
++            group: favorable_count.get(group, 0) / total
++            for group, total in total_count.items()
++            if total >= MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP
++        }
++        if len(rates) < 2:
++            findings.append(RegulatoryFinding(
++                check=check_name,
++                subject_id=f"cohort:{len(cohort)}",
++                regulation=profile.regulation,
++                action=ACTION_FLAG,
++                classification="indeterminate_insufficient_group_coverage",
++                score=0.0,
++                evidence={
++                    "tier": tier,
++                    "cohort_size": len(cohort),
++                    "groups_with_sufficient_observations": sorted(rates),
++                    "minimum_observations_per_group": MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP,
++                    "detail": f"fewer than two {tier} groups have at least "
++                              f"{MIN_OBSERVATIONS_PER_GEOGRAPHY_GROUP} resolved "
++                              f"loans in this cohort to compare -- cannot compute "
++                              f"a four-fifths ratio between groups that don't "
++                              f"both have signal here",
++                },
++            ))
++            continue
++
++        highest_rate = max(rates.values())
++        if highest_rate > 0:
++            for group, rate in sorted(rates.items()):
++                ratio = rate / highest_rate
++                if ratio < FOUR_FIFTHS_THRESHOLD:
++                    findings.append(RegulatoryFinding(
++                        check=check_name,
++                        subject_id=f"cohort:{len(cohort)}",
++                        regulation=profile.regulation,
++                        action=ACTION_FLAG,
++                        classification="four_fifths_adverse_impact",
++                        score=round(1.0 - ratio, 4),
++                        evidence={
++                            "tier": tier,
++                            "group": group,
++                            "group_favorable_rate": round(rate, 4),
++                            "highest_group_favorable_rate": round(highest_rate, 4),
++                            "ratio": round(ratio, 4),
++                            "threshold": FOUR_FIFTHS_THRESHOLD,
++                            "cohort_size": len(cohort),
++                            "group_observations": total_count[group],
++                            "all_group_rates": {g: round(v, 4) for g, v in sorted(rates.items())},
++                            "detail": f"favorable-outcome rate for {tier} "
++                                      f"'{group}' is {ratio:.1%} of the "
++                                      f"highest-rate {tier} group's, below the "
++                                      f"{FOUR_FIFTHS_THRESHOLD:.0%} four-fifths "
++                                      f"threshold -- a screening signal for "
++                                      f"human review, not a legal determination "
++                                      f"of redlining or disparate impact",
++                            "score_meaning": "0.0-1.0, how far below the "
++                                            "four-fifths threshold this group's "
++                                            "rate falls (1.0 - ratio); never a "
++                                            "compliance probability",
++                        },
++                    ))
++    return findings
++
++
+ # ---------------------------------------------------------------------------
+ # Build item 3: C2 rollup
+ # ---------------------------------------------------------------------------
+@@ -1294,6 +1470,7 @@ DIMENSION_INPUT_AUTHORIZATION_TIER = "input_authorization_tier"
+ DIMENSION_NARRATIVE_LEGITIMACY = "narrative_legitimacy"
+ DIMENSION_STATISTICAL_OUTCOME_EQUITY = "statistical_outcome_equity"
+ DIMENSION_CORRELATION_PROXY_SIGNAL = "correlation_proxy_signal"
++DIMENSION_GEOGRAPHIC_OUTCOME_EQUITY = "geographic_outcome_equity"
+ 
+ C2_DIMENSIONS = (
+     DIMENSION_KNOWN_BAD_VARIABLE_NAMES,
+diff --git a/sentinel_os/twin_receiver.py b/sentinel_os/twin_receiver.py
+index 461fcad..c00a4a2 100644
+--- a/sentinel_os/twin_receiver.py
++++ b/sentinel_os/twin_receiver.py
+@@ -145,6 +145,16 @@ CREATE TABLE IF NOT EXISTS cohort_review_ledger (
+     at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+     UNIQUE (replica_id, seq)
+ );
++-- dimension_6 (ZIP/county regional-equity, see obligation_sweep.py and
++-- regulatory_checks.check_geographic_outcome_equity): added after the
++-- table's initial release, same backward-compatible ADD COLUMN IF NOT
++-- EXISTS posture as obligation_ledger's domain column above. Existing
++-- rows keep their original (unhashed-for-dim-6) curr_hash; only NEW
++-- appends include dimension_6 in the hashed payload -- an append-only
++-- chain's hash is a property of the row it was computed for, not
++-- retroactively recomputed when the schema gains a field.
++ALTER TABLE cohort_review_ledger ADD COLUMN IF NOT EXISTS dimension_6_cohort_size INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE cohort_review_ledger ADD COLUMN IF NOT EXISTS dimension_6_findings JSONB NOT NULL DEFAULT '[]'::jsonb;
+ CREATE INDEX IF NOT EXISTS idx_cohort_review_ledger_key
+     ON cohort_review_ledger (replica_id, domain, obligation_kind, seq DESC);
+ CREATE TABLE IF NOT EXISTS custody_log (
+@@ -498,8 +508,10 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 "total_resolved": review["total_resolved"],
+                 "dimension_4_cohort_size": review["dimension_4_cohort_size"],
+                 "dimension_5_cohort_size": review["dimension_5_cohort_size"],
++                "dimension_6_cohort_size": review["dimension_6_cohort_size"],
+                 "dimension_4_findings": review["dimension_4_findings"],
+                 "dimension_5_findings": review["dimension_5_findings"],
++                "dimension_6_findings": review["dimension_6_findings"],
+                 "skipped": review["skipped"],
+                 "swept_at": review["swept_at"],
+                 "prev_hash": prev_hash,
+@@ -509,14 +521,17 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 """INSERT INTO cohort_review_ledger
+                      (replica_id, seq, domain, obligation_kind, total_resolved,
+                       dimension_4_cohort_size, dimension_5_cohort_size,
+-                      dimension_4_findings, dimension_5_findings, skipped,
++                      dimension_6_cohort_size,
++                      dimension_4_findings, dimension_5_findings,
++                      dimension_6_findings, skipped,
+                       swept_at, prev_hash, curr_hash)
+-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
++                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 (replica_id, seq, review["domain"], review["obligation_kind"],
+                  review["total_resolved"], review["dimension_4_cohort_size"],
+-                 review["dimension_5_cohort_size"],
++                 review["dimension_5_cohort_size"], review["dimension_6_cohort_size"],
+                  json.dumps(review["dimension_4_findings"]),
+                  json.dumps(review["dimension_5_findings"]),
++                 json.dumps(review["dimension_6_findings"]),
+                  json.dumps(review["skipped"]), review["swept_at"],
+                  prev_hash, curr_hash))
+         return seq, curr_hash
+@@ -697,7 +712,9 @@ def build_app(dsn: str, site: str) -> FastAPI:
+         not independent judge)."""
+         required = ("domain", "obligation_kind", "total_resolved",
+                    "dimension_4_cohort_size", "dimension_5_cohort_size",
++                   "dimension_6_cohort_size",
+                    "dimension_4_findings", "dimension_5_findings",
++                   "dimension_6_findings",
+                    "skipped", "swept_at")
+         missing = [k for k in required if k not in body]
+         if missing:
+@@ -720,7 +737,9 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                 query = """SELECT seq, domain, obligation_kind, total_resolved,
+                                   dimension_4_cohort_size, dimension_5_cohort_size,
++                                  dimension_6_cohort_size,
+                                   dimension_4_findings, dimension_5_findings,
++                                  dimension_6_findings,
+                                   skipped, swept_at, prev_hash, curr_hash
+                            FROM cohort_review_ledger WHERE replica_id=%s"""
+                 params = [replica_id]

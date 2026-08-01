@@ -1,0 +1,65 @@
+From ef8114fbf8760b7ab04d7383092035cb3704f5a4 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 31 Jul 2026 12:37:06 +0000
+Subject: [PATCH 1/7] Fix AC-13 test fallout: two pre-existing tests never sent
+ the ship token
+
+test_obligation_supersession.py's twin fixture set client.ship but never
+applied it as a default header, so the AC-13 auth check (merged same day)
+broke _ship_open's obligations/derive and obligations GET calls -- 6 tests
+failing with KeyError: 'obligations'. Fix matches the precedent
+test_twin_cohort_reviews.py already established for the same change:
+client.headers.update(client.ship) on the fixture.
+
+test_twin_receiver_auth.py's _cohort_review_body() predates the
+dimension_6 (ZIP/county) fields becoming required -- the endpoint checks
+for missing fields (422) before it checks the ship token (401), so the
+test's own assertion that a tokenless POST returns 401 could never be
+reached; it always 422'd first on a body neither test author intended to
+be invalid. Added the two missing fields to match the real, current
+schema.
+
+Neither fix touches production code -- both are test-data/fixture bugs
+uncovered by running the full suite after the AC-13 merge, not caused by
+this session's own change.
+---
+ sentinel_os/Tests/test_obligation_supersession.py | 6 ++++++
+ sentinel_os/Tests/test_twin_receiver_auth.py      | 5 +++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/sentinel_os/Tests/test_obligation_supersession.py b/sentinel_os/Tests/test_obligation_supersession.py
+index b6d46a2..9ee4ade 100644
+--- a/sentinel_os/Tests/test_obligation_supersession.py
++++ b/sentinel_os/Tests/test_obligation_supersession.py
+@@ -156,6 +156,12 @@ def twin():
+     assert resp.status_code == 200, resp.text
+     client.replica_id = rid
+     client.ship = {"Authorization": "Bearer tok"}
++    # obligations (GET/derive) and cohort-reviews now check the ship
++    # token (AC-13 fix); set it as a client default so this file's
++    # existing calls, written before that fix, keep working without
++    # touching every call site (same fix test_twin_cohort_reviews.py
++    # already applied for the same reason).
++    client.headers.update(client.ship)
+     return client
+ 
+ 
+diff --git a/sentinel_os/Tests/test_twin_receiver_auth.py b/sentinel_os/Tests/test_twin_receiver_auth.py
+index dbb2f64..30bba5f 100644
+--- a/sentinel_os/Tests/test_twin_receiver_auth.py
++++ b/sentinel_os/Tests/test_twin_receiver_auth.py
+@@ -72,8 +72,9 @@ def _custody_event_body():
+ def _cohort_review_body():
+     return {"domain": "lending", "obligation_kind": "loan_performance",
+             "total_resolved": 1, "dimension_4_cohort_size": 1,
+-            "dimension_5_cohort_size": 0, "dimension_4_findings": [],
+-            "dimension_5_findings": [], "skipped": [], "swept_at": NOW}
++            "dimension_5_cohort_size": 0, "dimension_6_cohort_size": 0,
++            "dimension_4_findings": [], "dimension_5_findings": [],
++            "dimension_6_findings": [], "skipped": [], "swept_at": NOW}
+ 
+ 
+ def _ship_and_derive(twin):
+-- 
+2.43.0
+

@@ -1,0 +1,10 @@
+-- KEYS[1]=scheduled zset, KEYS[2]=pending list  ARGV[1]=limit ARGV[2]=job key prefix
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, tonumber(ARGV[1]))
+for _, id in ipairs(due) do
+  redis.call('ZREM', KEYS[1], id)
+  redis.call('RPUSH', KEYS[2], id)
+  redis.call('HSET', ARGV[2] .. id, 'status', 'pending', 'updated_at', now)
+end
+return #due

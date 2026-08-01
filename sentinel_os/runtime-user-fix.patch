@@ -1,0 +1,211 @@
+diff --git a/sentinel_os/conftest.py b/sentinel_os/conftest.py
+new file mode 100644
+index 0000000..149c1f2
+--- /dev/null
++++ b/sentinel_os/conftest.py
+@@ -0,0 +1,85 @@
++"""Repo-root pytest configuration.
++
++governance/ledger_postgres.py's PostgreSQLLedger now refuses to boot
++unless ICEBERG_LEDGER_RUNTIME_USER is set to a non-owner, non-superuser
++role (see the ICEBERG_LEDGER_RUNTIME_USER fail-closed fix). Most tests
++in this repo aren't testing THAT behavior specifically -- they just
++want a working ledger -- so this gives every test a real, working,
++already-restricted default identity (the `ledger_reader` role the
++ledger itself creates via ledger_immutability.sql) instead of making
++every test file hand-roll credentials.
++
++Tests that want a different runtime identity on purpose (e.g.
++test_production_harness_breakers.py's `harness_no_claude` fixture,
++which needs a role it can surgically revoke INSERT from) set their own
++env vars for the duration of that test and are unaffected -- this
++fixture only fills in a default when the var is unset or empty, never
++overrides an explicit value.
++"""
++import os
++import pytest
++
++_PG_OWNER = dict(host="localhost", port=5432, dbname="iceberg",
++                  user="iceberg", password="iceberg")
++_LEDGER_READER_TEST_PASSWORD = "ledger_reader_test_pw"
++
++
++def _pg_available() -> bool:
++    try:
++        import psycopg2
++        conn = psycopg2.connect(connect_timeout=2, **_PG_OWNER)
++        conn.close()
++        return True
++    except Exception:
++        return False
++
++
++@pytest.fixture(scope="session", autouse=True)
++def _ensure_default_ledger_runtime_role():
++    """Once per session: make sure `ledger_reader` has a known password.
++
++    The role itself is created idempotently by ledger_immutability.sql
++    (which every PostgreSQLLedger construction applies), but CREATE ROLE
++    there deliberately doesn't set a password inline (no credential
++    baked into a file that gets committed). Tests need one set up front
++    so the very first ledger construction of the session -- which now
++    must resolve a working non-owner runtime user before it can even
++    open its pool -- doesn't fail on auth before it gets anywhere near
++    the code being tested.
++    """
++    if not _pg_available():
++        yield
++        return
++    import psycopg2
++    conn = psycopg2.connect(connect_timeout=2, **_PG_OWNER)
++    conn.autocommit = True
++    cur = conn.cursor()
++    cur.execute(
++        "DO $$ BEGIN "
++        "IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='ledger_reader') THEN "
++        "CREATE ROLE ledger_reader WITH LOGIN PASSWORD %(pw)s; "
++        "ELSE ALTER ROLE ledger_reader WITH PASSWORD %(pw)s; "
++        "END IF; END $$;",
++        {"pw": _LEDGER_READER_TEST_PASSWORD},
++    )
++    conn.close()
++    yield
++
++
++@pytest.fixture(autouse=True)
++def _default_ledger_runtime_user(_ensure_default_ledger_runtime_role):
++    """Before every test: fill in a working runtime identity if the test
++    (or a stale module-level default) left the var unset or empty.
++
++    Checked with .get() + falsy test rather than setdefault(), because
++    a couple of test files do
++    `os.environ.setdefault("ICEBERG_LEDGER_RUNTIME_USER", "")` at import
++    time -- a leftover from when an empty string meant "fall back to
++    the owner credentials". That value is present-but-empty, so a plain
++    setdefault() here would never override it. Falsy-check does.
++    """
++    if not os.environ.get("ICEBERG_LEDGER_RUNTIME_USER"):
++        os.environ["ICEBERG_LEDGER_RUNTIME_USER"] = "ledger_reader"
++    if not os.environ.get("ICEBERG_LEDGER_RUNTIME_PASSWORD"):
++        os.environ["ICEBERG_LEDGER_RUNTIME_PASSWORD"] = _LEDGER_READER_TEST_PASSWORD
++    yield
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index b2aa7f0..d93f877 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -117,21 +117,63 @@ class PostgreSQLLedger:
+         runtime_user = runtime_user or os.getenv("ICEBERG_LEDGER_RUNTIME_USER")
+         runtime_password = runtime_password or os.getenv("ICEBERG_LEDGER_RUNTIME_PASSWORD")
+         if not runtime_user:
+-            print(
+-                "[WARN] ICEBERG_LEDGER_RUNTIME_USER not set -- ledger is running "
+-                "with full schema-init privileges for all operations (no "
+-                "connection-level defense-in-depth). Set ICEBERG_LEDGER_RUNTIME_USER "
+-                "/ ICEBERG_LEDGER_RUNTIME_PASSWORD (e.g. the ledger_reader role from "
+-                "ledger_immutability.sql) in production so the app connection itself "
+-                "cannot UPDATE/DELETE/DROP TRIGGER even if compromised."
++            raise RuntimeError(
++                "ICEBERG_LEDGER_RUNTIME_USER is not set. The ledger refuses to "
++                "start without an explicitly declared runtime identity -- there "
++                "is no privileged fallback. Set ICEBERG_LEDGER_RUNTIME_USER / "
++                "ICEBERG_LEDGER_RUNTIME_PASSWORD to a restricted role (e.g. the "
++                "ledger_reader role created by ledger_immutability.sql: SELECT + "
++                "INSERT only, no UPDATE/DELETE/DDL) so the app connection itself "
++                "cannot UPDATE/DELETE/DROP TRIGGER even if compromised or misused."
+             )
+-            runtime_user, runtime_password = user, password
+ 
+         self.pool = SimpleConnectionPool(
+             min_connections, max_connections,
+             host=host, port=port, database=dbname,
+             user=runtime_user, password=runtime_password
+         )
++        self._verify_runtime_user_is_not_privileged(runtime_user, dbname)
++
++    def _verify_runtime_user_is_not_privileged(self, runtime_user: str, dbname: str):
++        """Hard floor: refuse to run if the *resolved* runtime identity turns
++        out to be a superuser or the owner of ledger_entries, even when
++        ICEBERG_LEDGER_RUNTIME_USER was set explicitly. A privileged runtime
++        connection can UPDATE/DELETE ledger rows or DROP the immutability
++        triggers outright, defeating connection-level defense-in-depth no
++        matter how carefully the env var was configured. This check runs on
++        every startup, not just when the var is unset, because a
++        misconfigured-but-present value is exactly the silent-privilege case
++        this fix exists to close.
++        """
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user;")
++            row = cursor.fetchone()
++            is_superuser = bool(row and row[0])
++
++            cursor.execute("""
++                SELECT pg_catalog.pg_get_userbyid(c.relowner)
++                FROM pg_catalog.pg_class c
++                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
++                WHERE c.relname = 'ledger_entries' AND n.nspname = 'public';
++            """)
++            owner_row = cursor.fetchone()
++            table_owner = owner_row[0] if owner_row else None
++            is_owner = (table_owner is not None and table_owner == runtime_user)
++
++            if is_superuser or is_owner:
++                reason = "a superuser" if is_superuser else f"the table owner ({table_owner})"
++                raise RuntimeError(
++                    f"ICEBERG_LEDGER_RUNTIME_USER='{runtime_user}' resolves to {reason} "
++                    f"on database '{dbname}'. Refusing to start: the runtime ledger "
++                    "connection must be a restricted, non-owner role (e.g. "
++                    "ledger_reader: SELECT + INSERT only) so the app cannot rewrite "
++                    "or wipe the ledger, or drop its immutability triggers, even if "
++                    "the app itself is compromised or misused."
++                )
++        finally:
++            self.pool.putconn(conn)
+     
+     def _initialize_schema(self):
+         """Create ledger table if not exists"""
+diff --git a/sentinel_os/test_production_harness_breakers.py b/sentinel_os/test_production_harness_breakers.py
+index 7d49d87..ff68bbb 100644
+--- a/sentinel_os/test_production_harness_breakers.py
++++ b/sentinel_os/test_production_harness_breakers.py
+@@ -144,6 +144,31 @@ LEDGER_WRITE_TEST_USER = "ledger_write_test"
+ LEDGER_WRITE_TEST_PASSWORD = "ledger_write_test"
+ 
+ 
++def _ensure_ledger_write_test_role():
++    """Idempotently provision the `ledger_write_test` role itself.
++
++    Pre-existing gap, unrelated to the ICEBERG_LEDGER_RUNTIME_USER
++    fail-closed fix: this role was documented (see
++    roadster_breakers_verification_report_v1.md) as "a real, restricted
++    Postgres role, SELECT-only on ledger_entries" but nothing in the
++    repo actually created it -- it was assumed pre-provisioned outside
++    the suite. Made idempotent here so the suite is self-contained
++    rather than failing on a fresh database with `role does not exist`.
++    """
++    conn = psycopg2.connect(**PG_DSN)
++    conn.autocommit = True
++    cur = conn.cursor()
++    cur.execute(
++        f"DO $$ BEGIN IF NOT EXISTS "
++        f"(SELECT FROM pg_roles WHERE rolname='{LEDGER_WRITE_TEST_USER}') THEN "
++        f"CREATE ROLE {LEDGER_WRITE_TEST_USER} WITH LOGIN "
++        f"PASSWORD '{LEDGER_WRITE_TEST_PASSWORD}'; END IF; END $$;"
++    )
++    cur.execute(f"GRANT USAGE ON SCHEMA public TO {LEDGER_WRITE_TEST_USER};")
++    cur.execute(f"GRANT SELECT ON ledger_entries TO {LEDGER_WRITE_TEST_USER};")
++    conn.close()
++
++
+ def _revoke_insert():
+     """Revoke real INSERT (and the sequence USAGE INSERT depends on for the
+     SERIAL id column -- GRANT/REVOKE INSERT on the table alone does not cover
+@@ -180,6 +205,7 @@ def harness_no_claude():
+     surgically, realistically failed without breaking sid_exists()."""
+     os.environ["ICEBERG_LEDGER_RUNTIME_USER"] = LEDGER_WRITE_TEST_USER
+     os.environ["ICEBERG_LEDGER_RUNTIME_PASSWORD"] = LEDGER_WRITE_TEST_PASSWORD
++    _ensure_ledger_write_test_role()
+     _grant_insert()
+     h = IcebergProductionHarness({
+         "postgres_host": PG_DSN["host"], "postgres_port": PG_DSN["port"],

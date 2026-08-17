@@ -1,0 +1,2945 @@
+From b660e216a3fcfc5bcf517413ab15b9c934254dd0 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Thu, 23 Jul 2026 12:50:45 +0000
+Subject: [PATCH] Regulatory-cassette framework: auditor-insertable lenses with
+ chain-native insertion and disclosure events
+
+A regulatory cassette is a LENS, not policy: it reviews decisions
+against one regulation's expectations and flags for human review.
+Own contract, registry, identity namespace (regulatory:name:version),
+and directory -- structurally impossible to load as domain policy.
+
+- regulatory_cassette_interface: lens ABC (observer/live mode
+  manifest), findings, decision-material adapters (episode + ledger
+  row; actor_report never enters), fail-loud validation, separate
+  registry, screening-not-certification disclaimer on every report.
+- regulatory_checks: regulation-parameterized checkers -- adverse-
+  action reason specificity (deterministic scoring, evidence shows
+  phrase hits + case references) and prohibited-basis/proxy input
+  screen (declared-name only; statistical disparate-impact
+  deliberately deferred).
+- regulatory_deck: insertion binds lens content hash through the
+  existing bind_cassette_version tripwire, writes first-class
+  regulatory_cassette_inserted/removed events; live path disclosure-
+  first -- every flag/block written to the chain naming regulation
+  and check BEFORE it takes effect, failed disclosure aborts the
+  action (no silent path). explain() reports without writing.
+- ledger: three new hash-chained record kinds with matching
+  reconstruction branches in verify_chain AND twin_custody (shared
+  canonical_fields contract; no new columns, no parallel log).
+  get_regulatory_cassette_history = the examiner query.
+- regulatory_cassettes/cfpb_reg_b: CFPB / ECOA / Reg B reference
+  lens; everything regulation-specific is profile DATA. CMS-style
+  reuse proven in tests through the unmodified checker.
+- forensics: the three new modules join _GOVERNANCE_CODE_MODULES;
+  consequently ivr + banking bump 2.0.0 -> 2.0.1 (moved code hash
+  requires a new version under binding enforcement; behavior
+  unchanged) with test pins updated.
+- READMEs: regulatory_cassettes/ (framework) + cassettes/ (domain
+  module; closes one of the six missing module READMEs).
+- Tests/test_regulatory_cassettes.py: 34 tests against live
+  Postgres -- interface fail-closed, chain+twin verification of all
+  three event kinds, binding tripwire on altered lens config,
+  observer review writes nothing, disclosure-before-effect,
+  disclosure-failure aborts, checker parameterization, proxy screen,
+  forensics surface coverage.
+
+Suite: 341 passed (307 baseline + 34 new), real PostgreSQL.
+---
+ .../Tests/test_cassette_source_of_truth.py    |   4 +-
+ sentinel_os/Tests/test_phase2_limitations.py  |   2 +-
+ .../Tests/test_regulatory_cassettes.py        | 709 ++++++++++++++++++
+ sentinel_os/cassette_forensics.py             |  10 +
+ sentinel_os/cassettes/README.md               |  73 ++
+ sentinel_os/cassettes/banking_cassette.py     |   6 +-
+ sentinel_os/cassettes/ivr_cassette.py         |  10 +-
+ sentinel_os/governance/ledger_postgres.py     | 310 ++++++++
+ sentinel_os/regulatory_cassette_interface.py  | 519 +++++++++++++
+ sentinel_os/regulatory_cassettes/README.md    | 117 +++
+ sentinel_os/regulatory_cassettes/__init__.py  |  11 +
+ .../regulatory_cassettes/cfpb_reg_b.py        | 207 +++++
+ sentinel_os/regulatory_checks.py              | 353 +++++++++
+ sentinel_os/regulatory_deck.py                | 366 +++++++++
+ sentinel_os/twin_custody.py                   |  33 +
+ 15 files changed, 2725 insertions(+), 5 deletions(-)
+ create mode 100644 sentinel_os/Tests/test_regulatory_cassettes.py
+ create mode 100644 sentinel_os/cassettes/README.md
+ create mode 100644 sentinel_os/regulatory_cassette_interface.py
+ create mode 100644 sentinel_os/regulatory_cassettes/README.md
+ create mode 100644 sentinel_os/regulatory_cassettes/__init__.py
+ create mode 100644 sentinel_os/regulatory_cassettes/cfpb_reg_b.py
+ create mode 100644 sentinel_os/regulatory_checks.py
+ create mode 100644 sentinel_os/regulatory_deck.py
+
+diff --git a/sentinel_os/Tests/test_cassette_source_of_truth.py b/sentinel_os/Tests/test_cassette_source_of_truth.py
+index 997d73e..ffa16a1 100644
+--- a/sentinel_os/Tests/test_cassette_source_of_truth.py
++++ b/sentinel_os/Tests/test_cassette_source_of_truth.py
+@@ -71,7 +71,7 @@ def test_ivr_cassette_passes_validation():
+     """The reference IVR cassette validates and reads back its declared
+     values (30.0 / 2 / (4, 120))."""
+     params = validate_cassette(IvrCassette())
+-    assert params.cassette_version == "ivr:standard-ivr:2.0.0"
++    assert params.cassette_version == "ivr:standard-ivr:2.0.1"
+     assert params.float_value("long_wait_threshold") == 30.0
+     assert params.int_value("governance_trigger") == 2
+     assert params.range_value("expected_wait_bounds") == (4.0, 120.0)
+@@ -85,7 +85,7 @@ def test_banking_cassette_passes_validation():
+     are GONE, because telephony_ingest is no longer enabled -- the
+     whole point of capability-scoped requirements."""
+     params = validate_cassette(BankingCassette())
+-    assert params.cassette_version == "banking:banking-v1:2.0.0"
++    assert params.cassette_version == "banking:banking-v1:2.0.1"
+     assert params.range_value("expected_wait_bounds") == (15.0, 300.0)
+     assert params.int_value("governance_trigger") == 2
+     assert sorted(params.capabilities) == [
+diff --git a/sentinel_os/Tests/test_phase2_limitations.py b/sentinel_os/Tests/test_phase2_limitations.py
+index edeaf39..8a6d0b7 100644
+--- a/sentinel_os/Tests/test_phase2_limitations.py
++++ b/sentinel_os/Tests/test_phase2_limitations.py
+@@ -353,7 +353,7 @@ def test_harness_binds_cassette_on_load_by_default():
+ 
+     L = _ledger()
+     row = [r for r in _rows(conn) if r["record_kind"] == "cassette_binding"
+-           and r["cassette_version"] == "ivr:standard-ivr:2.0.0"]
++           and r["cassette_version"] == "ivr:standard-ivr:2.0.1"]
+     assert row, "expected a cassette_binding row for the loaded cassette's version"
+     assert recompute_current_hash(row[-1]) == row[-1]["current_hash"]
+ 
+diff --git a/sentinel_os/Tests/test_regulatory_cassettes.py b/sentinel_os/Tests/test_regulatory_cassettes.py
+new file mode 100644
+index 0000000..4cde724
+--- /dev/null
++++ b/sentinel_os/Tests/test_regulatory_cassettes.py
+@@ -0,0 +1,709 @@
++"""
++test_regulatory_cassettes -- regulatory-cassette framework proof suite.
++
++Proves the framework's contract end to end, against the real ledger:
++
++1. BASE INTERFACE: a lens that cannot state its modes, checks, or a
++   strictly-JSON-safe profile does not validate; lens and domain
++   registries refuse each other's citizens.
++2. LEDGER EVENTS: lens insertion/removal and live disclosures are
++   first-class hash-chained record kinds -- written, chain-verified,
++   and recomputed identically by the twin. "When was this lens active"
++   is a direct query.
++3. SPECIFICITY CHECKER: a generic adverse-action reason flags, a
++   case-specific one does not, a bare code classifies placeholder --
++   and a CMS-style profile reuses the SAME checker unmodified
++   (configuration, not code, is the extension point).
++4. DISCLOSURE SAFEGUARD (non-negotiable): every live flag/block is on
++   the chain, naming regulation and check, BEFORE it takes effect;
++   a failed disclosure write aborts the action instead of proceeding
++   silently; explain() never writes.
++5. PROXY SCREEN: declared proxy variables (zip code) and direct
++   protected characteristics flag; clean inputs do not. Name
++   screening only -- no statistics, on purpose.
++6. FORENSICS: the new modules sit inside the shared code-hash tamper
++   surface, and removing one from the surface moves the hash.
++
++Run: pytest Tests/test_regulatory_cassettes.py -q
++Requires the same live Postgres the rest of the suite uses.
++"""
++
++import json
++import os
++import sys
++import uuid
++
++import psycopg2
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++import cassette_forensics
++from cassette_forensics import (
++    _GOVERNANCE_CODE_MODULES,
++    compute_cassette_code_hash,
++    compute_cassette_hash,
++)
++from cassette_interface import CassetteRegistry
++from cassette_schema import CassetteValidationError
++from cassettes.banking_cassette import BankingCassette
++from episode import judge_episode, make_episode
++from governance.ledger_postgres import GovernanceDecisionRecord, PostgreSQLLedger
++from regulatory_cassette_interface import (
++    ACTION_BLOCK,
++    ACTION_FLAG,
++    MODE_LIVE,
++    MODE_OBSERVER,
++    DecisionMaterial,
++    RegulatoryBlock,
++    RegulatoryCassette,
++    RegulatoryCassetteConfig,
++    RegulatoryCassetteRegistry,
++    RegulatoryValidationError,
++    SCREENING_DISCLAIMER,
++    material_from_episode,
++    material_from_ledger_row,
++    regulatory_cassette_version_of,
++    validate_regulatory_cassette,
++)
++from regulatory_checks import (
++    RegulationCheckProfile,
++    assess_reason_specificity,
++    check_proxy_variables,
++    check_reason_specificity,
++)
++from regulatory_deck import GovernedJudgment, RegulatoryDeck
++from regulatory_cassettes.cfpb_reg_b import (
++    CFPB_REG_B_PROFILE,
++    CHECK_PROHIBITED_BASIS,
++    CHECK_REASON_SPECIFICITY,
++    CFPBRegBLens,
++)
++from twin_custody import SHIPPED_COLUMNS, recompute_current_hash
++
++DSN = dict(
++    host=os.environ.get("PGHOST", "127.0.0.1"),
++    port=int(os.environ.get("PGPORT", "5432")),
++    dbname=os.environ.get("PGDATABASE", "iceberg"),
++    user=os.environ.get("PGUSER", "iceberg"),
++    password=os.environ.get("PGPASSWORD", "iceberg"),
++)
++
++
++def _conn():
++    """Autocommit read connection. Plain SELECT connections left in an
++    open transaction hold ACCESS SHARE on ledger_entries, and the
++    ledger constructor's idempotent ALTER TABLE migrations need ACCESS
++    EXCLUSIVE -- an idle-in-transaction reader therefore stalls the
++    next PostgreSQLLedger() forever (found the hard way; see the
++    session buildlog). Autocommit means a SELECT never leaves a
++    transaction open, so read helpers here can never block a
++    constructor."""
++    c = psycopg2.connect(**DSN)
++    c.autocommit = True
++    return c
++
++
++def _ledger():
++    return PostgreSQLLedger(**DSN)
++
++
++def _rows(conn):
++    cur = conn.cursor()
++    cur.execute(f"SELECT {', '.join(SHIPPED_COLUMNS)} FROM ledger_entries ORDER BY id ASC")
++    out = []
++    for r in cur.fetchall():
++        d = dict(zip(SHIPPED_COLUMNS, r))
++        for k in ("data", "input_data", "policy_parameters", "decision_output",
++                  "cassette_snapshot"):
++            v = d.get(k)
++            if isinstance(v, str):
++                try:
++                    d[k] = json.loads(v)
++                except Exception:
++                    pass
++        out.append(d)
++    return out
++
++
++def _row_count(conn):
++    cur = conn.cursor()
++    cur.execute("SELECT count(*) FROM ledger_entries")
++    return cur.fetchone()[0]
++
++
++def _fresh_lens(**kwargs):
++    """A CFPB lens with a uuid version so binding never collides across
++    runs of this suite on a persistent database (a version string is a
++    content commitment; a reused one with today's code hash would trip
++    yesterday's binding, which is correct behavior and exactly why we
++    don't reuse strings in tests)."""
++    kwargs.setdefault("version", f"1.0.0-t{uuid.uuid4().hex[:8]}")
++    return CFPBRegBLens(**kwargs)
++
++
++def _lending_episode(reason, episode_id=None, inputs=None):
++    """A lending-shaped episode banking can judge: requested approval,
++    actual decline -- reason on file (the kernel refuses it otherwise),
++    the lens screens whether the reason says anything."""
++    attributes = {"duration": 200.0, "friction_count": 0}
++    attributes.update(inputs or {})
++    return make_episode(
++        episode_id or f"EP-{uuid.uuid4().hex[:8]}", "banking",
++        requested={"approved": True, "amount": 25000.0},
++        actual={"approved": False, "amount": 0.0, "resolved": False},
++        outcome_reasons=(reason,),
++        attributes=attributes,
++    )
++
++
++GENERIC_REASON = "Applicant does not meet our minimum credit standards."
++SPECIFIC_REASON = ("Credit score 574 is below the 620 required for the "
++                   "requested amount of $25,000; debt-to-income 52% exceeds "
++                   "the 43% ceiling.")
++
++
++# ==========================================================================
++# 1. Base interface
++# ==========================================================================
++
++class _NoModesLens(RegulatoryCassette):
++    MODES = None  # type: ignore[assignment]
++
++    def get_config(self):
++        return RegulatoryCassetteConfig("x", "1", "d", "reg", "auth")
++
++    def get_checks(self):
++        return ("c",)
++
++    def get_profile(self):
++        return {}
++
++    def review(self, material):
++        return []
++
++    def validate(self):
++        return True
++
++
++def test_lens_without_modes_refused():
++    lens = _NoModesLens()
++    with pytest.raises(RegulatoryValidationError, match="MODES"):
++        validate_regulatory_cassette(lens)
++
++
++def test_lens_with_unknown_mode_refused():
++    lens = _NoModesLens()
++    lens.MODES = ("observer", "supervisor")
++    with pytest.raises(RegulatoryValidationError, match="unknown mode 'supervisor'"):
++        validate_regulatory_cassette(lens)
++
++
++def test_lens_with_empty_checks_refused():
++    lens = _NoModesLens()
++    lens.MODES = (MODE_OBSERVER,)
++    lens.get_checks = lambda: ()
++    with pytest.raises(RegulatoryValidationError, match="non-empty tuple of check"):
++        validate_regulatory_cassette(lens)
++
++
++def test_lens_with_non_json_profile_refused():
++    """The profile is content-hashed as the lens's configuration; an
++    object that only serializes via repr would let 'identical config'
++    hash differently -- refused at validation, not discovered at bind."""
++    lens = _NoModesLens()
++    lens.MODES = (MODE_OBSERVER,)
++    lens.get_profile = lambda: {"threshold": object()}
++    with pytest.raises(RegulatoryValidationError, match="JSON-serializable"):
++        validate_regulatory_cassette(lens)
++
++
++def test_valid_lens_snapshot_and_identity():
++    lens = _fresh_lens()
++    snapshot = validate_regulatory_cassette(lens)
++    identity = regulatory_cassette_version_of(lens)
++    assert identity.startswith("regulatory:cfpb-ecoa-reg-b:")
++    assert snapshot["cassette_version"] == identity
++    assert snapshot["kind"] == "regulatory_lens"
++    assert snapshot["modes"] == ["live", "observer"]
++    assert set(snapshot["checks"]) == {CHECK_REASON_SPECIFICITY,
++                                       CHECK_PROHIBITED_BASIS}
++    # Deterministic content hash over the full configuration.
++    assert compute_cassette_hash(snapshot) == compute_cassette_hash(lens.snapshot())
++
++
++def test_registries_refuse_each_others_citizens():
++    """Lens is not policy and policy is not a lens: the domain registry
++    refuses a regulatory lens (it has no kernel contract), and the
++    regulatory registry refuses a domain cassette (it has no lens
++    contract). Two questions, two registries -- enforced, not styled."""
++    reg_registry = RegulatoryCassetteRegistry()
++    identity = reg_registry.register(_fresh_lens())
++    assert identity in reg_registry.list_all()
++
++    # A lens config deliberately has no .domain (its identity namespace
++    # is the reserved "regulatory" prefix instead) -- so the domain
++    # registry's key construction fails before schema validation would.
++    # Either exception is the refusal working; there is no path where a
++    # lens lands in the domain registry.
++    with pytest.raises((CassetteValidationError, AttributeError)):
++        CassetteRegistry().register(_fresh_lens())
++    with pytest.raises(RegulatoryValidationError):
++        reg_registry.register(BankingCassette())
++
++
++def test_material_from_episode_excludes_actor_report():
++    ep = make_episode(
++        "EP-MAT", "banking",
++        requested={"approved": True},
++        actual={"approved": False, "resolved": False},
++        actor_report={"self_praise": "flawless"},
++        outcome_reasons=("declined for stated reasons",),
++        attributes={"duration": 100.0, "friction_count": 0, "zip_code": "60601"},
++    )
++    material = material_from_episode(ep)
++    assert material.source == "episode"
++    assert material.mismatched_fields == ("approved",)
++    assert "zip_code" in material.input_fields
++    assert "approved" in material.input_fields  # the request is decision input
++    assert "self_praise" not in material.input_fields  # actor story never enters
++
++
++def test_material_from_ledger_row_shapes():
++    row = {"id": 42, "reasoning": "  recorded reason  ",
++           "output": {"approved": False, "reasons": ["second reason", " "]},
++           "input_data": {"income": 50000}, "cassette_version": "banking:x:1"}
++    material = material_from_ledger_row(row)
++    assert material.subject_id == "42"
++    assert material.reasons == ("recorded reason", "second reason")
++    assert material.input_fields == {"income": 50000}
++    assert material.mismatched_fields == ()
++    assert material.source == "ledger"
++
++
++# ==========================================================================
++# 3. Specificity checker (the case that SHOULD flag, and the one that
++#    shouldn't) + configuration-not-code reuse
++# ==========================================================================
++
++def test_generic_reason_flags():
++    material = material_from_episode(_lending_episode(GENERIC_REASON))
++    findings = check_reason_specificity(material, CFPB_REG_B_PROFILE)
++    assert len(findings) == 1
++    f = findings[0]
++    assert f.classification == "generic"
++    assert f.action == ACTION_FLAG
++    assert f.score < CFPB_REG_B_PROFILE.specific_score_threshold
++    # The evidence shows the mechanism: which phrases fired.
++    assert "does not meet" in f.evidence["generic_phrase_hits"]
++    assert f.evidence["cites_concrete_value"] is False
++
++
++def test_specific_reason_passes():
++    material = material_from_episode(_lending_episode(SPECIFIC_REASON))
++    findings = check_reason_specificity(material, CFPB_REG_B_PROFILE)
++    assert findings == []
++    # And the assessment shows WHY it passed: concrete values plus a
++    # named case field outweigh the "credit score" boilerplate hit.
++    assessment = assess_reason_specificity(SPECIFIC_REASON, material,
++                                           CFPB_REG_B_PROFILE)
++    assert assessment["flagged"] is False
++    assert assessment["evidence"]["cites_concrete_value"] is True
++    assert "amount" in assessment["evidence"]["case_fields_referenced"]
++
++
++def test_placeholder_code_flags_at_zero():
++    material = material_from_episode(_lending_episode("DECLINE_001"))
++    findings = check_reason_specificity(material, CFPB_REG_B_PROFILE)
++    assert len(findings) == 1
++    assert findings[0].classification == "placeholder"
++    assert findings[0].score == 0.0
++
++
++def test_missing_reason_on_ledger_material_flags():
++    """Reachable only for ledger rows: the kernel refuses to validate a
++    mismatched episode with no reason, so live material can never
++    arrive here reasonless -- but a recorded row might, and an
++    observer review must say so."""
++    material = DecisionMaterial(
++        subject_id="7", domain="banking:x:1", reasons=(),
++        input_fields={"income": 1}, mismatched_fields=("approved",),
++        outcome={}, source="ledger",
++    )
++    findings = check_reason_specificity(material, CFPB_REG_B_PROFILE)
++    assert [f.classification for f in findings] == ["missing"]
++
++
++def test_cms_style_profile_reuses_same_checker():
++    """THE reusability proof: a CMS-shaped lens ('denial notices must
++    cite specific current criteria, not generic algorithmic output') is
++    a RegulationCheckProfile -- pure configuration -- run through the
++    unmodified checker. No new code, and the same reason text flips
++    verdicts appropriately under the different profile."""
++    cms = RegulationCheckProfile(
++        regulation="CMS coverage-denial notice specificity (illustrative)",
++        generic_phrases=("not medically necessary", "medical necessity",
++                         "plan guidelines", "algorithmic output",
++                         "clinical criteria", "internal review"),
++    )
++    material = DecisionMaterial(
++        subject_id="CLM-1", domain="health-plan", reasons=(),
++        input_fields={"procedure_code": "99214"}, mismatched_fields=("coverage",),
++        outcome={}, source="ledger",
++    )
++    generic = material_from_ledger_row({
++        "id": 1, "reasoning": "Denied: not medically necessary per plan guidelines.",
++        "input_data": {"procedure_code": "99214"}, "output": {},
++    })
++    specific = material_from_ledger_row({
++        "id": 2, "reasoning": ("Denied under LCD L34567 criterion 3: submitted "
++                               "HbA1c 9.2 exceeds the 8.0 ceiling current as of "
++                               "2026-01."),
++        "input_data": {"procedure_code": "99214"}, "output": {},
++    })
++    assert len(check_reason_specificity(generic, cms)) == 1
++    assert check_reason_specificity(specific, cms) == []
++    # Same texts under the CFPB profile behave differently -- the
++    # CMS phrases aren't CFPB phrases -- which is the point: the
++    # regulation lives in the profile, not the checker.
++    assert check_reason_specificity(generic, CFPB_REG_B_PROFILE) == []
++    del material  # (constructed above only to document the shape)
++
++
++# ==========================================================================
++# 5. Proxy-variable / direct-protected screen (C2, scoped down)
++# ==========================================================================
++
++def test_proxy_zip_code_flags():
++    material = material_from_episode(_lending_episode(
++        SPECIFIC_REASON, inputs={"zip_code": "60601"}))
++    findings = check_proxy_variables(material, CFPB_REG_B_PROFILE)
++    flagged = {f.evidence["variable"]: f for f in findings}
++    assert "zip_code" in flagged
++    assert flagged["zip_code"].classification == "proxy_variable"
++    assert "race" in flagged["zip_code"].evidence["proxies_for"]
++
++
++def test_clean_inputs_produce_no_proxy_findings():
++    material = material_from_episode(_lending_episode(
++        SPECIFIC_REASON, inputs={"income": 88000, "debt_to_income": 0.52,
++                                 "requested_term_months": 60}))
++    # amount/approved from the request are also inputs; none match.
++    assert check_proxy_variables(material, CFPB_REG_B_PROFILE) == []
++
++
++def test_direct_protected_characteristic_flags():
++    material = material_from_episode(_lending_episode(
++        SPECIFIC_REASON, inputs={"applicant_race": "declined-to-state"}))
++    findings = check_proxy_variables(material, CFPB_REG_B_PROFILE)
++    assert len(findings) == 1
++    assert findings[0].classification == "direct_protected_characteristic"
++    assert findings[0].evidence["variable"] == "applicant_race"
++
++
++def test_cfpb_lens_review_combines_both_checks():
++    lens = _fresh_lens()
++    material = material_from_episode(_lending_episode(
++        GENERIC_REASON, inputs={"zip_code": "60601"}))
++    findings = lens.review(material)
++    checks = sorted({f.check for f in findings})
++    assert checks == sorted({CHECK_REASON_SPECIFICITY, CHECK_PROHIBITED_BASIS})
++    assert all(f.action == ACTION_FLAG for f in findings)
++    for f in findings:
++        json.dumps(f.as_dict())  # every finding is ledger-safe
++
++
++# ==========================================================================
++# 2. Ledger event types -- chain + twin, against real Postgres
++# ==========================================================================
++
++def test_insertion_and_removal_events_verify_in_chain_and_twin():
++    conn = _conn()
++    L = _ledger()
++    ver = f"regulatory:test-lens:{uuid.uuid4().hex[:8]}"
++    L.record_regulatory_cassette_event(
++        event="regulatory_cassette_inserted", cassette_version=ver,
++        cassette_hash="h-ins", cassette_code_hash="c-ins", mode="observer",
++        regulation="Test Regulation 1", authorized_by="auditor:test")
++    L.record_regulatory_cassette_event(
++        event="regulatory_cassette_removed", cassette_version=ver,
++        cassette_hash="h-ins", cassette_code_hash="c-ins", mode="observer",
++        regulation="Test Regulation 1", authorized_by="auditor:test")
++    rows = [r for r in _rows(conn) if r["cassette_version"] == ver]
++    assert [r["record_kind"] for r in rows] == ["regulatory_cassette_inserted",
++                                               "regulatory_cassette_removed"]
++    for row in rows:
++        assert recompute_current_hash(row) == row["current_hash"]
++        assert row["data"]["mode"] == "observer"
++        assert row["data"]["regulation"] == "Test Regulation 1"
++    assert L.verify_chain(mode="lenient")["ok"] is True
++
++
++def test_disclosure_event_verifies_in_chain_and_twin():
++    conn = _conn()
++    L = _ledger()
++    ver = f"regulatory:test-lens:{uuid.uuid4().hex[:8]}"
++    finding = {"check": "reason_specificity", "score": 0.25,
++               "evidence": {"generic_phrase_hits": ["does not meet"]}}
++    L.record_regulatory_disclosure(
++        cassette_version=ver, regulation="Test Regulation 2",
++        check="reason_specificity", action="flag", subject_id="EP-9",
++        finding=finding, cassette_hash="h-d", authorized_by="auditor:test")
++    row = [r for r in _rows(conn) if r["cassette_version"] == ver][-1]
++    assert row["record_kind"] == "regulatory_disclosure"
++    assert recompute_current_hash(row) == row["current_hash"]
++    # The disclosure names the regulation AND the specific check.
++    assert row["data"]["regulation"] == "Test Regulation 2"
++    assert row["data"]["check"] == "reason_specificity"
++    assert row["data"]["action"] == "flag"
++    assert row["decision_output"]["score"] == 0.25
++    assert L.verify_chain(mode="lenient")["ok"] is True
++
++
++def test_disclosure_requires_the_specific_check_and_action():
++    L = _ledger()
++    with pytest.raises(ValueError, match="specific"):
++        L.record_regulatory_disclosure(
++            cassette_version="regulatory:x:1", regulation="R", check="  ",
++            action="flag", subject_id="s", finding={})
++    with pytest.raises(ValueError, match="action"):
++        L.record_regulatory_disclosure(
++            cassette_version="regulatory:x:1", regulation="R", check="c",
++            action="veto", subject_id="s", finding={})
++
++
++def test_insertion_event_requires_identity_and_known_event():
++    L = _ledger()
++    with pytest.raises(ValueError, match="authorized_by"):
++        L.record_regulatory_cassette_event(
++            event="regulatory_cassette_inserted", cassette_version="regulatory:x:1",
++            cassette_hash="h", cassette_code_hash=None, mode="observer",
++            regulation="R", authorized_by="  ")
++    with pytest.raises(ValueError, match="Unknown regulatory cassette event"):
++        L.record_regulatory_cassette_event(
++            event="regulatory_cassette_paused", cassette_version="regulatory:x:1",
++            cassette_hash="h", cassette_code_hash=None, mode="observer",
++            regulation="R", authorized_by="a")
++
++
++# ==========================================================================
++# Deck: insertion binding, observer review, live path -- real Postgres
++# ==========================================================================
++
++def test_deck_requires_a_ledger():
++    with pytest.raises(ValueError, match="requires a ledger"):
++        RegulatoryDeck(None)
++
++
++def test_insert_binds_records_and_reports_history():
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    lens = _fresh_lens()
++    receipt = deck.insert(lens, MODE_OBSERVER, inserted_by="auditor:cfpb-1")
++    identity = receipt["identity"]
++    assert receipt["mode"] == MODE_OBSERVER
++    assert receipt["cassette_hash"] == compute_cassette_hash(lens.snapshot())
++    assert deck.active()[0]["identity"] == identity
++
++    deck.remove(identity, removed_by="auditor:cfpb-1")
++    assert deck.active() == []
++
++    # The examiner query: the active window read straight off the chain.
++    history = L.get_regulatory_cassette_history(cassette_version=identity)
++    assert [h["event"] for h in history] == ["regulatory_cassette_inserted",
++                                            "regulatory_cassette_removed"]
++    assert all(h["mode"] == MODE_OBSERVER for h in history)
++    assert all(h["authorized_by"] == "auditor:cfpb-1" for h in history)
++    assert history[0]["cassette_hash"] == receipt["cassette_hash"]
++
++
++def test_changed_lens_config_same_version_refused_at_insertion():
++    """The tamper tripwire, reused from domain cassettes (decision 5):
++    a lens whose configuration changed -- here, the blocking switch --
++    under an UNCHANGED version string is refused at bind. Changed
++    content requires a new version, not a silent re-bind."""
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    shared_version = f"1.0.0-t{uuid.uuid4().hex[:8]}"
++    deck.insert(CFPBRegBLens(version=shared_version), MODE_OBSERVER,
++                inserted_by="auditor:a")
++    altered = CFPBRegBLens(block_on_placeholder=True, version=shared_version)
++    with pytest.raises(ValueError, match="binding conflict"):
++        RegulatoryDeck(L).insert(altered, MODE_OBSERVER, inserted_by="auditor:b")
++
++
++def test_insert_refuses_mode_the_lens_does_not_declare():
++    class ObserverOnly(CFPBRegBLens):
++        MODES = (MODE_OBSERVER,)
++
++    L = _ledger()
++    with pytest.raises(ValueError, match="does not support mode 'live'"):
++        RegulatoryDeck(L).insert(ObserverOnly(version=f"1.0.0-t{uuid.uuid4().hex[:8]}"),
++                                 MODE_LIVE, inserted_by="auditor:a")
++
++
++def test_insert_requires_inserted_by():
++    L = _ledger()
++    with pytest.raises(ValueError, match="inserted_by"):
++        RegulatoryDeck(L).insert(_fresh_lens(), MODE_OBSERVER)
++
++
++def test_observer_review_flags_recorded_generic_decision_and_writes_nothing():
++    conn = _conn()
++    L = _ledger()
++    domain_ver = f"banking:banking-v1:t{uuid.uuid4().hex[:8]}"
++    L.append_decision(GovernanceDecisionRecord(
++        action_type="governance_decision", node="loan_queue",
++        cassette_version=domain_ver,
++        input_data={"call_sid": f"CA-{uuid.uuid4().hex[:10]}",
++                    "zip_code": "60601", "income": 41000},
++        policy_parameters={"program_max_dti": 0.43}, reasoning=GENERIC_REASON,
++        output={"approved": False}))
++    L.append_decision(GovernanceDecisionRecord(
++        action_type="governance_decision", node="loan_queue",
++        cassette_version=domain_ver,
++        input_data={"call_sid": f"CA-{uuid.uuid4().hex[:10]}",
++                    "income": 92000},
++        policy_parameters={"program_max_dti": 0.43}, reasoning=SPECIFIC_REASON,
++        output={"approved": False}))
++
++    deck = RegulatoryDeck(L)
++    deck.insert(_fresh_lens(), MODE_OBSERVER, inserted_by="auditor:cfpb-1")
++
++    before = _row_count(conn)
++    report = deck.observer_review(decision_cassette_version=domain_ver)
++    assert _row_count(conn) == before  # observer review writes NOTHING
++
++    assert report["disclaimer"] == SCREENING_DISCLAIMER
++    lens_report = report["lenses"][0]
++    assert lens_report["decisions_reviewed"] == 2
++    assert lens_report["decisions_flagged"] == 1  # only the generic+zip row
++    classifications = sorted(f["classification"] for f in lens_report["findings"])
++    assert classifications == ["generic", "proxy_variable"]
++
++
++def test_live_flag_is_disclosed_before_judgment_returns():
++    conn = _conn()
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    lens = _fresh_lens()
++    receipt = deck.insert(lens, MODE_LIVE, inserted_by="auditor:cfpb-live")
++    cassette = BankingCassette()
++    episode = _lending_episode(GENERIC_REASON, inputs={"zip_code": "60601"})
++
++    governed = deck.judge(cassette, episode)
++    assert isinstance(governed, GovernedJudgment)
++    # The domain judgment is untouched by the lens: byte-identical to
++    # the plain kernel path. A lens reviews; it never moves the score.
++    plain = judge_episode(cassette, episode)
++    assert governed.quality == plain
++    assert len(governed.findings) == 2
++
++    disclosures = [r for r in _rows(conn)
++                   if r["record_kind"] == "regulatory_disclosure"
++                   and r["cassette_version"] == receipt["identity"]]
++    assert len(disclosures) == 2
++    for row in disclosures:
++        assert row["data"]["regulation"].startswith("ECOA / Regulation B")
++        assert row["data"]["check"] in (CHECK_REASON_SPECIFICITY,
++                                        CHECK_PROHIBITED_BASIS)
++        assert row["data"]["subject"] == episode.episode_id
++        assert recompute_current_hash(row) == row["current_hash"]
++    assert L.verify_chain(mode="lenient")["ok"] is True
++
++
++def test_live_clean_episode_no_findings_no_disclosures():
++    conn = _conn()
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    deck.insert(_fresh_lens(), MODE_LIVE, inserted_by="auditor:cfpb-live")
++    before = _row_count(conn)
++    governed = deck.judge(BankingCassette(),
++                          _lending_episode(SPECIFIC_REASON,
++                                           inputs={"income": 92000}))
++    assert governed.findings == ()
++    assert _row_count(conn) == before  # nothing fired, nothing written
++
++
++def test_live_block_is_disclosed_then_raised():
++    conn = _conn()
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    blocking = CFPBRegBLens(block_on_placeholder=True,
++                            version=f"1.0.0-t{uuid.uuid4().hex[:8]}")
++    receipt = deck.insert(blocking, MODE_LIVE, inserted_by="auditor:cfpb-block")
++    episode = _lending_episode("DECLINE_001")
++
++    with pytest.raises(RegulatoryBlock) as exc:
++        deck.judge(BankingCassette(), episode)
++    assert exc.value.lens_identity == receipt["identity"]
++    assert any(f.action == ACTION_BLOCK for f in exc.value.findings)
++
++    row = [r for r in _rows(conn)
++           if r["record_kind"] == "regulatory_disclosure"
++           and r["cassette_version"] == receipt["identity"]][-1]
++    assert row["data"]["action"] == "block"  # on the chain BEFORE the raise
++    assert row["data"]["check"] == CHECK_REASON_SPECIFICITY
++
++
++def test_failed_disclosure_aborts_the_action_never_silent():
++    """THE safeguard's fail-closed half: if the disclosure write fails,
++    the flag does not quietly proceed -- judgment does not return.
++    A live lens that cannot disclose does not act."""
++
++    class _DisclosureDownLedger:
++        def __init__(self):
++            self.bound = []
++
++        def bind_cassette_version(self, *a, **k):
++            return {"status": "created"}
++
++        def record_regulatory_cassette_event(self, **k):
++            return {"status": "created", "current_hash": "x"}
++
++        def record_regulatory_disclosure(self, **k):
++            raise RuntimeError("ledger unavailable for disclosure")
++
++    deck = RegulatoryDeck(_DisclosureDownLedger())
++    deck.insert(_fresh_lens(), MODE_LIVE, inserted_by="auditor:t")
++    with pytest.raises(RuntimeError, match="ledger unavailable"):
++        deck.judge(BankingCassette(), _lending_episode(GENERIC_REASON))
++
++
++def test_explain_includes_findings_but_writes_nothing():
++    conn = _conn()
++    L = _ledger()
++    deck = RegulatoryDeck(L)
++    deck.insert(_fresh_lens(), MODE_LIVE, inserted_by="auditor:cfpb-live")
++    before = _row_count(conn)
++    factors = deck.explain(BankingCassette(),
++                           _lending_episode(GENERIC_REASON,
++                                            inputs={"zip_code": "60601"}))
++    assert _row_count(conn) == before  # explanation is a reporting surface
++    regulatory = [f for f in factors if f.get("factor") == "regulatory_finding"]
++    assert len(regulatory) == 2
++    # Kernel verification factors still ride first (outcome mismatch).
++    assert any(f.get("factor") == "outcome_mismatch" for f in factors)
++
++
++# ==========================================================================
++# 6. Forensics: the new modules are inside the tamper surface
++# ==========================================================================
++
++def test_regulatory_modules_in_code_hash_surface():
++    for module in ("regulatory_cassette_interface", "regulatory_checks",
++                   "regulatory_deck"):
++        assert module in _GOVERNANCE_CODE_MODULES
++
++
++def test_code_hash_covers_regulatory_checks_source(monkeypatch):
++    """Removing regulatory_checks from the declared surface moves the
++    lens's code hash -- proving its source genuinely participates in
++    the hash rather than merely being listed."""
++    lens = _fresh_lens()
++    full = compute_cassette_code_hash(lens)
++    assert full == compute_cassette_code_hash(lens)  # deterministic
++    reduced = tuple(m for m in _GOVERNANCE_CODE_MODULES
++                    if m != "regulatory_checks")
++    monkeypatch.setattr(cassette_forensics, "_GOVERNANCE_CODE_MODULES", reduced)
++    assert compute_cassette_code_hash(lens) != full
+diff --git a/sentinel_os/cassette_forensics.py b/sentinel_os/cassette_forensics.py
+index 7a97fd4..b98958f 100644
+--- a/sentinel_os/cassette_forensics.py
++++ b/sentinel_os/cassette_forensics.py
+@@ -38,6 +38,16 @@ _GOVERNANCE_CODE_MODULES = (
+     "cassette_schema",         # parameter bounds/validation that constrain decisions
+     "cassette_capabilities",   # capability contracts: which surfaces exist and what they require
+     "episode",                 # the ground-truth record + its integrity invariants
++    # Regulatory-cassette framework: the lens contract, the shared
++    # regulation-parameterized checkers, and the deck that enforces
++    # insertion binding + disclosure-first live action. Governance code
++    # by any definition -- an edit to the specificity checker or the
++    # disclosure path MUST move every cassette's code hash, exactly
++    # like an edit to episode.py does. (This boundary was missed once
++    # before; declared here the same session the modules were born.)
++    "regulatory_cassette_interface",
++    "regulatory_checks",
++    "regulatory_deck",
+ )
+ 
+ 
+diff --git a/sentinel_os/cassettes/README.md b/sentinel_os/cassettes/README.md
+new file mode 100644
+index 0000000..9a65778
+--- /dev/null
++++ b/sentinel_os/cassettes/README.md
+@@ -0,0 +1,73 @@
++# Domain Cassettes
++
++Same boom box, different tapes. The engine (harnesses, ledger,
++governor) is domain-blind; everything an industry actually believes —
++scoring rules, tier cutoffs, queue topology, reward signals, governance
++thresholds — lives in that industry's cassette. Swap the cassette,
++same machine governs a different world.
++
++## The contract (as of the 2.0.0 kernel/capability split)
++
++Every cassette implements the **kernel**
++(`cassette_interface.Cassette`): identity (`get_config`), a typed
++governance-parameter declaration (`get_governance_parameters`,
++validated by `cassette_schema` — fail-loud, no defaults, nothing
++repaired), judgment (`judge(episode)` → score **and** tier; the
++cassette owns its own cutoffs), explanation (`explain(episode)` →
++factor-level reasons), a self-check (`validate`), and a **CAPABILITIES
++manifest** declaring which opt-in surfaces the domain genuinely has:
++
++- `telephony_ingest` — ingests phone calls; owns the Twilio thresholds
++  and the call-shaped scoring surface.
++- `routing_topology` — routes work through named queues.
++- `rl` — trains against a reward signal.
++- `self_healing` — allows governed self-adjustment inside declared
++  bounds.
++
++The manifest decides the parameter contract in both directions:
++required = kernel ∪ enabled capabilities, and declaring a parameter
++owned by a capability the cassette did *not* enable is refused (the
++anti-placeholder rule — born from a real incident where banking carried
++three flagged fake Twilio thresholds just to load). An empty manifest
++is a legitimate, explicit declaration: a kernel-only domain loads,
++validates, and judges episodes with zero call-center surface.
++
++Judgment reads `episode.actual` (the observed record) and
++`episode.attributes` — never `episode.actor_report`, which is the
++acting system's unverified story about itself. All judgment paths go
++through `episode.judge_episode`, so no path admits an unvalidated
++episode, and the kernel refuses any episode whose outcome differs from
++what was requested without a reason on file (any mismatch — including
++approved-but-reduced — not just formal denials).
++
++## The cassettes in this directory
++
++- `ivr_cassette.py` — the **reference implementation**: the domain
++  that happens to enable all four capabilities. A reference, not a
++  template other domains contort into.
++- `banking_cassette.py` — first cassette to use the split honestly:
++  routing + rl + self_healing, **no** telephony (no real banking call
++  data exists yet, so the capability is off rather than faked).
++  Judges the same episodes as IVR by different rules — that
++  difference is the point of the system, not a bug. One documented
++  open decision: a correct fraud escalation still scores unresolved in
++  judgment even though the reward signal treats it as a win; needs an
++  explicit call before an escalation carve-out is added.
++
++## Loading and tamper evidence
++
++Every load path — loader, registry, harness construction, direct
++injection — runs `cassette_schema.validate_cassette`; there is no
++partial load. At harness load the cassette's parameter snapshot and its
++**code hash** (its own module plus the shared governance modules in
++`cassette_forensics._GOVERNANCE_CODE_MODULES`) are bound into the
++ledger chain (`bind_cassette_version`). A version string is a content
++commitment: changed parameters *or* changed governance code require a
++new version string, or the load is refused. That is why cassette
++versions bump when shared governance code changes even though the
++cassette's own behavior didn't (see the 2.0.1 note in each cassette).
++
++`CassetteLoader` auto-discovers `*_cassette.py` in this directory,
++fail-loud by default. **Regulatory lenses do not live here** — they are
++review lenses, not operational policy, and have their own directory,
++registry, and contract: see `../regulatory_cassettes/README.md`.
+diff --git a/sentinel_os/cassettes/banking_cassette.py b/sentinel_os/cassettes/banking_cassette.py
+index 77f43b5..3823969 100644
+--- a/sentinel_os/cassettes/banking_cassette.py
++++ b/sentinel_os/cassettes/banking_cassette.py
+@@ -95,7 +95,11 @@ class BankingCassette(Cassette, RoutingTopology, ReinforcementLearning,
+             # episodes) with the SAME scoring arithmetic and tier
+             # cutoffs the old score_outcome_quality used. New code
+             # hash => new version (binding enforcement).
+-            version="2.0.0",
++            # 2.0.0 -> 2.0.1: regulatory-cassette framework modules
++            # joined the shared governance code-hash surface (see
++            # ivr_cassette for the identical note). Behavior unchanged;
++            # moved code hash => new version under binding enforcement.
++            version="2.0.1",
+             description="Financial services & banking",
+             domain="banking"
+         )
+diff --git a/sentinel_os/cassettes/ivr_cassette.py b/sentinel_os/cassettes/ivr_cassette.py
+index 27d4843..86a8f1d 100644
+--- a/sentinel_os/cassettes/ivr_cassette.py
++++ b/sentinel_os/cassettes/ivr_cassette.py
+@@ -136,7 +136,15 @@ class IvrCassette(Cassette, TelephonyIngest, RoutingTopology,
+             # governance modules), and load-time binding enforcement
+             # correctly treats a changed hash under an old version
+             # string as a conflict. New code hash => new version.
+-            version="2.0.0",
++            # 2.0.0 -> 2.0.1: regulatory-cassette framework modules
++            # (regulatory_cassette_interface, regulatory_checks,
++            # regulatory_deck) joined the shared governance code-hash
++            # surface (cassette_forensics._GOVERNANCE_CODE_MODULES).
++            # This cassette's own behavior is UNCHANGED; the code hash
++            # moved, and under binding enforcement a moved hash
++            # requires a new version string rather than a silent
++            # re-bind.
++            version="2.0.1",
+             description="Traditional call center IVR",
+             domain="ivr"
+         )
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index 640d18b..a91eb50 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -670,6 +670,280 @@ class PostgreSQLLedger:
+         finally:
+             self.pool.putconn(conn)
+ 
++    # ------------------------------------------------------------------
++    # Regulatory-cassette events (lens insertion / removal / disclosure)
++    # ------------------------------------------------------------------
++
++    _REGULATORY_CASSETTE_EVENTS = (
++        "regulatory_cassette_inserted",
++        "regulatory_cassette_removed",
++    )
++
++    def record_regulatory_cassette_event(self, event: str, cassette_version: str,
++                                         cassette_hash: str,
++                                         cassette_code_hash: Optional[str],
++                                         mode: str, regulation: str,
++                                         authorized_by: str) -> Dict[str, Any]:
++        """Record a regulatory lens's insertion or removal as a
++        FIRST-CLASS hash-chained event.
++
++        A regulatory cassette is an auditor-inserted lens (see
++        regulatory_cassette_interface); "when was the CFPB lens
++        active, in which mode, inserted by whom, with what content
++        hash" must be a direct ledger query -- not an inference from
++        the generic authorized_by field on some other row. So
++        insertion/removal get their own record_kind on the SAME chain
++        as every other event (no parallel logging path), hashed
++        through the same shared optional-field contract
++        (canonical_fields) the writer, verify_chain, and the twin all
++        use. The authorized_by COLUMN still stores who acted -- that
++        is what the column is for -- but the event stands as its own
++        queryable row, which is what "first-class" means here.
++
++        mode and regulation live inside the canonical form (and the
++        data JSONB, from which verification reconstructs them):
++        whether a lens sat read-only or live in the decision path is
++        exactly the kind of fact tampering would want to change.
++        """
++        if event not in self._REGULATORY_CASSETTE_EVENTS:
++            raise ValueError(
++                f"Unknown regulatory cassette event '{event}'; known: "
++                f"{list(self._REGULATORY_CASSETTE_EVENTS)}"
++            )
++        if not cassette_version or not isinstance(cassette_version, str):
++            raise ValueError("record_regulatory_cassette_event requires a "
++                             "non-empty cassette_version")
++        if not cassette_hash or not isinstance(cassette_hash, str):
++            raise ValueError("record_regulatory_cassette_event requires a "
++                             "cassette_hash (lens insertion without a content "
++                             "hash is an unevidenced insertion)")
++        if mode not in ("observer", "live"):
++            raise ValueError(f"mode must be 'observer' or 'live', got {mode!r}")
++        if not regulation or not str(regulation).strip():
++            raise ValueError("record_regulatory_cassette_event requires the "
++                             "regulation the lens claims to check")
++        if not authorized_by or not str(authorized_by).strip():
++            raise ValueError("record_regulatory_cassette_event requires "
++                             "authorized_by: an anonymous lens insertion is "
++                             "exactly the record an examiner cannot accept")
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
++            """)
++            row = cursor.fetchone()
++            previous_hash = row[0] if row else "genesis"
++
++            canonical_entry = {
++                "record_kind": event,
++                "cassette_version": cassette_version,
++                "mode": mode,
++                "regulation": str(regulation),
++                "previous_hash": previous_hash,
++            }
++            apply_optional_hashed_fields(canonical_entry, {
++                "cassette_hash": cassette_hash,
++                "cassette_code_hash": cassette_code_hash,
++                "authorized_by": authorized_by,
++            })
++            current_hash = hashlib.sha256(
++                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
++            ).hexdigest()
++
++            # mode + regulation are stored in data so verify_chain and
++            # the twin can rebuild the exact canonical form from the row.
++            data = {"record_kind": event, "mode": mode,
++                    "regulation": str(regulation), "parameter_changed": False}
++            verb = "inserted" if event.endswith("inserted") else "removed"
++            cursor.execute("""
++                INSERT INTO ledger_entries
++                (action_type, node, previous_value, applied_value, reason,
++                 previous_hash, current_hash, data,
++                 record_kind, cassette_version, cassette_hash, cassette_code_hash,
++                 authorized_by)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++            """, (event, str(regulation)[:100], 0.0, 0.0,
++                  f"regulatory lens {verb} ({mode} mode)",
++                  previous_hash, current_hash, json.dumps(data),
++                  event, cassette_version, cassette_hash,
++                  cassette_code_hash, authorized_by))
++            conn.commit()
++            return {
++                "status": "created",
++                "event": event,
++                "cassette_version": cassette_version,
++                "mode": mode,
++                "regulation": str(regulation),
++                "cassette_hash": cassette_hash,
++                "current_hash": current_hash,
++            }
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
++    def record_regulatory_disclosure(self, cassette_version: str, regulation: str,
++                                     check: str, action: str, subject_id: str,
++                                     finding: Dict[str, Any],
++                                     cassette_hash: Optional[str] = None,
++                                     authorized_by: Optional[str] = None
++                                     ) -> Dict[str, Any]:
++        """Record that a LIVE regulatory lens flagged/blocked a decision
++        -- the disclosure event itself.
++
++        THE safeguard of the regulatory framework: any time a live lens
++        causes a flag, block, or (if ever built) adjustment, THAT
++        ACTION is written to the chain naming which regulation and
++        which specific check triggered it, before the action takes
++        effect (regulatory_deck calls this first and does not catch
++        failures). Undisclosed compliance-driven steering of outputs
++        is the failure mode this event type exists to make structurally
++        impossible -- the same conduct the FTC's July 2026 Section 5
++        proposal treats as potentially deceptive. There is no silent
++        path and no parallel log: this is a chain row like every other.
++
++        The full finding body (JSON-safe, from RegulatoryFinding.as_dict)
++        is stored in decision_output and included in the canonical hash
++        -- the evidence an examiner reads is the evidence the chain
++        protects. It is normalized through a JSON round-trip before
++        hashing so the bytes hashed at write time are exactly the bytes
++        recomputed from the JSONB column at verify time.
++        """
++        if not cassette_version or not isinstance(cassette_version, str):
++            raise ValueError("record_regulatory_disclosure requires cassette_version")
++        if not regulation or not str(regulation).strip():
++            raise ValueError("record_regulatory_disclosure requires the regulation")
++        if not check or not str(check).strip():
++            raise ValueError("record_regulatory_disclosure requires the specific "
++                             "check that triggered -- 'something fired' is not a "
++                             "disclosure")
++        if action not in ("flag", "block", "adjust"):
++            raise ValueError(f"action must be 'flag', 'block', or 'adjust', "
++                             f"got {action!r}")
++        if not subject_id or not str(subject_id).strip():
++            raise ValueError("record_regulatory_disclosure requires the subject "
++                             "(episode/decision id) the action applies to")
++        if not isinstance(finding, dict):
++            raise ValueError("record_regulatory_disclosure requires the finding "
++                             "body as a dict")
++        # Normalize NOW so write-time hash bytes == verify-time hash
++        # bytes after the JSONB round-trip (tuples->lists, etc).
++        finding = json.loads(json.dumps(finding, sort_keys=True, default=str))
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
++            """)
++            row = cursor.fetchone()
++            previous_hash = row[0] if row else "genesis"
++
++            canonical_entry = {
++                "record_kind": "regulatory_disclosure",
++                "cassette_version": cassette_version,
++                "regulation": str(regulation),
++                "check": str(check),
++                "action": action,
++                "subject": str(subject_id),
++                "finding": finding,
++                "previous_hash": previous_hash,
++            }
++            apply_optional_hashed_fields(canonical_entry, {
++                "cassette_hash": cassette_hash,
++                "authorized_by": authorized_by,
++            })
++            current_hash = hashlib.sha256(
++                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
++            ).hexdigest()
++
++            data = {"record_kind": "regulatory_disclosure",
++                    "regulation": str(regulation), "check": str(check),
++                    "action": action, "subject": str(subject_id),
++                    "parameter_changed": False}
++            cursor.execute("""
++                INSERT INTO ledger_entries
++                (action_type, node, previous_value, applied_value, reason,
++                 previous_hash, current_hash, data,
++                 record_kind, cassette_version, decision_output, cassette_hash,
++                 authorized_by)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++            """, ("regulatory_disclosure", str(check)[:100], 0.0, 0.0,
++                  f"regulatory lens {action}: {check} ({str(regulation)[:120]})",
++                  previous_hash, current_hash, json.dumps(data),
++                  "regulatory_disclosure", cassette_version,
++                  json.dumps(finding), cassette_hash, authorized_by))
++            conn.commit()
++            return {
++                "status": "created",
++                "cassette_version": cassette_version,
++                "regulation": str(regulation),
++                "check": str(check),
++                "action": action,
++                "subject": str(subject_id),
++                "current_hash": current_hash,
++            }
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
++    def get_regulatory_cassette_history(self,
++                                        cassette_version: Optional[str] = None,
++                                        limit: int = 200) -> List[Dict[str, Any]]:
++        """The examiner query: every lens insertion/removal event, in
++        chain order -- 'when was the CFPB lens active' read straight
++        off record_kind, no inference required."""
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            if cassette_version:
++                cursor.execute("""
++                    SELECT id, timestamp, record_kind, cassette_version, data,
++                           cassette_hash, cassette_code_hash, authorized_by,
++                           current_hash
++                    FROM ledger_entries
++                    WHERE record_kind IN ('regulatory_cassette_inserted',
++                                          'regulatory_cassette_removed')
++                      AND cassette_version = %s
++                    ORDER BY id ASC LIMIT %s
++                """, (cassette_version, limit))
++            else:
++                cursor.execute("""
++                    SELECT id, timestamp, record_kind, cassette_version, data,
++                           cassette_hash, cassette_code_hash, authorized_by,
++                           current_hash
++                    FROM ledger_entries
++                    WHERE record_kind IN ('regulatory_cassette_inserted',
++                                          'regulatory_cassette_removed')
++                    ORDER BY id ASC LIMIT %s
++                """, (limit,))
++            events = []
++            for (row_id, ts, kind, version, data, chash, code_hash,
++                 who, cur_hash) in cursor.fetchall():
++                d = self._as_json(data)
++                events.append({
++                    "id": row_id,
++                    "timestamp": ts.isoformat() if ts else None,
++                    "event": kind,
++                    "cassette_version": version,
++                    "mode": d.get("mode"),
++                    "regulation": d.get("regulation"),
++                    "cassette_hash": chash,
++                    "cassette_code_hash": code_hash,
++                    "authorized_by": who,
++                    "current_hash": cur_hash,
++                })
++            return events
++        finally:
++            self.pool.putconn(conn)
++
+     def supersede_decision(self, supersedes_id: int, authority: str, reason: str,
+                            corrected_output: Dict[str, Any],
+                            cassette_version: Optional[str] = None) -> Dict[str, Any]:
+@@ -1114,6 +1388,42 @@ class PostgreSQLLedger:
+                             "cassette_code_hash": cassette_code_hash,
+                             "authorized_by": authorized_by,
+                         })
++                    elif record_kind in ("regulatory_cassette_inserted",
++                                         "regulatory_cassette_removed"):
++                        # Mirrors record_regulatory_cassette_event().
++                        # mode + regulation were stored in data.
++                        d = self._as_json(data)
++                        canonical_entry = {
++                            "record_kind": record_kind,
++                            "cassette_version": cassette_version,
++                            "mode": d.get("mode"),
++                            "regulation": d.get("regulation"),
++                            "previous_hash": stored_prev,
++                        }
++                        apply_optional_hashed_fields(canonical_entry, {
++                            "cassette_hash": cassette_hash,
++                            "cassette_code_hash": cassette_code_hash,
++                            "authorized_by": authorized_by,
++                        })
++                    elif record_kind == "regulatory_disclosure":
++                        # Mirrors record_regulatory_disclosure(). The
++                        # finding body was stored in decision_output;
++                        # regulation/check/action/subject in data.
++                        d = self._as_json(data)
++                        canonical_entry = {
++                            "record_kind": "regulatory_disclosure",
++                            "cassette_version": cassette_version,
++                            "regulation": d.get("regulation"),
++                            "check": d.get("check"),
++                            "action": d.get("action"),
++                            "subject": d.get("subject"),
++                            "finding": self._as_json(decision_output),
++                            "previous_hash": stored_prev,
++                        }
++                        apply_optional_hashed_fields(canonical_entry, {
++                            "cassette_hash": cassette_hash,
++                            "authorized_by": authorized_by,
++                        })
+                     elif record_kind == "decision_supersession":
+                         # Item 6 -- mirrors supersede_decision(). authority was
+                         # stored in authorized_by; corrected_output in decision_output.
+diff --git a/sentinel_os/regulatory_cassette_interface.py b/sentinel_os/regulatory_cassette_interface.py
+new file mode 100644
+index 0000000..0f2515a
+--- /dev/null
++++ b/sentinel_os/regulatory_cassette_interface.py
+@@ -0,0 +1,519 @@
++"""
++Regulatory Cassette Interface -- the auditor-insertable LENS contract.
++
++A regulatory cassette is NOT a domain cassette. A domain cassette
++(cassette_interface.Cassette -- IVR, banking, ...) is operational
++policy: it drives judgment of episodes in its industry's own terms. A
++regulatory cassette is a LENS an auditor inserts to check decisions
++against ONE regulation's requirements. It never judges quality, never
++owns governance parameters the engine reads, and never drives a
++decision -- it reviews decisions (recorded or in flight) and produces
++findings for human review. Keeping the two contracts, and their
++registries, separate is deliberate: a ledger row citing
++"regulatory:cfpb-ecoa-reg-b:1.0.0" must never look like the policy
++that produced the decision.
++
++Two modes, declared per lens in its MODES manifest (explicitly -- no
++default, same posture as the kernel's CAPABILITIES manifest):
++
++  observer (the expected default use) -- read-only against the
++      existing immutable ledger. Produces a review report scoped to
++      the lens's regulation. Touches nothing in any live decision
++      path; zero production risk.
++  live -- opt-in. The lens attaches to the kernel judgment path
++      (regulatory_deck.RegulatoryDeck) and reviews episodes as they
++      are judged. It can flag, or block, in real time -- and every
++      such action is itself logged to the ledger as a first-class
++      regulatory_disclosure event BEFORE the action takes effect.
++      There is no silent path: a live lens that cannot disclose does
++      not act (see regulatory_deck).
++
++WHAT A FINDING IS -- AND IS NOT. Every check in this framework is a
++screening signal for human review: "this recorded reason reads as
++generic," "this input variable is a known proxy for a protected
++characteristic." A finding is NOT a determination that a decision
++violated (or an absence of findings that it satisfied) ECOA, Reg B,
++or any other law. Legal compliance is a legal determination made by
++people; this code scores and flags. SCREENING_DISCLAIMER below rides
++in every report so that boundary cannot quietly disappear from the
++output.
++
++Tamper evidence reuses the machinery domain cassettes already proved:
++a lens's full configuration (its snapshot(), including the check
++profile that parameterizes its behavior) is content-hashed and bound
++into the ledger chain via bind_cassette_version at insertion. Same
++guarantee, same tripwire: an altered "CFPB regs" lens presenting the
++same version string is refused loud. Insertion itself is a
++first-class ledger event (regulatory_cassette_inserted: who, when,
++which lens, which mode, which content hash) so an examiner can query
++"when was the CFPB lens active" directly -- see
++governance/ledger_postgres.record_regulatory_cassette_event.
++"""
++
++from __future__ import annotations
++
++import json
++from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Mapping, Tuple
++
++from episode import Episode, outcome_mismatches
++
++# ---------------------------------------------------------------------------
++# Stable vocabulary -- these strings ride in ledger rows.
++# ---------------------------------------------------------------------------
++
++MODE_OBSERVER = "observer"
++MODE_LIVE = "live"
++REGULATORY_MODES = (MODE_OBSERVER, MODE_LIVE)
++
++# The domain slot every regulatory lens identity uses
++# ("regulatory:<name>:<version>"). One reserved word, so a ledger query
++# can always tell a lens from operational policy by its identity alone.
++REGULATORY_DOMAIN = "regulatory"
++
++# Versioning of the lens snapshot shape itself (self-describing records,
++# same idea as cassette_schema.SCHEMA_VERSION for domain cassettes).
++REGULATORY_SCHEMA_VERSION = "1.0.0"
++
++# Disclosure action vocabulary. "adjust" is reserved so the disclosure
++# event type can name it if a future lens ever adjusts an output -- but
++# no lens in this repo emits it, and the deck's rule stands regardless:
++# an undisclosed adjustment is not a smaller adjustment, it is a
++# forbidden one.
++ACTION_FLAG = "flag"
++ACTION_BLOCK = "block"
++ACTION_ADJUST = "adjust"
++REGULATORY_ACTIONS = (ACTION_FLAG, ACTION_BLOCK, ACTION_ADJUST)
++
++# Rides in every report and every observer review. Deliberately blunt.
++SCREENING_DISCLAIMER = (
++    "Screening output for human review. Findings score how a recorded "
++    "decision reads against this lens's configured checks; they are not "
++    "a legal determination of compliance or non-compliance with any "
++    "regulation, and the absence of findings is not a certification."
++)
++
++
++# ---------------------------------------------------------------------------
++# Records
++# ---------------------------------------------------------------------------
++
++@dataclass
++class RegulatoryCassetteConfig:
++    """Identity of one regulatory lens.
++
++    regulation names the specific rule the lens checks against (e.g.
++    "ECOA / Regulation B, 12 CFR Part 1002 ..."); authority names the
++    agency that owns that rule. Both ride in insertion/disclosure
++    ledger events so an examiner reading the chain sees WHICH
++    regulation a lens claimed to check, not just a lens name.
++    """
++
++    name: str
++    version: str
++    description: str
++    regulation: str
++    authority: str
++
++
++@dataclass(frozen=True)
++class RegulatoryFinding:
++    """One screening finding from one check on one decision.
++
++    action  -- what the lens asks for: "flag" (surface for human
++               review; judgment proceeds) or "block" (in live mode,
++               the deck refuses to return judgment for this episode
++               until a human reviews). See regulatory_deck for how
++               each is disclosed and enforced.
++    classification -- the check's own vocabulary for what it saw
++               ("generic", "placeholder", "missing", "proxy_variable",
++               "direct_protected_characteristic", ...).
++    score   -- 0.0-1.0, meaning defined per check and stated in the
++               evidence (e.g. the specificity checker's score is
++               "how case-specific this reason reads"; the proxy screen
++               reports 1.0 for a name-pattern match). Never a
++               compliance probability.
++    evidence -- JSON-safe dict showing exactly WHY the finding fired
++               (phrase hits, matched variables, referenced fields), so
++               the human reviewing it sees the mechanism, not a verdict.
++    """
++
++    check: str
++    subject_id: str
++    regulation: str
++    action: str
++    classification: str
++    score: float
++    evidence: Dict[str, Any] = field(default_factory=dict)
++
++    def as_dict(self) -> Dict[str, Any]:
++        """JSON-safe form -- what a regulatory_disclosure ledger event
++        stores and hashes as the finding body."""
++        return {
++            "check": self.check,
++            "subject_id": self.subject_id,
++            "regulation": self.regulation,
++            "action": self.action,
++            "classification": self.classification,
++            "score": float(self.score),
++            "evidence": dict(self.evidence),
++        }
++
++
++@dataclass(frozen=True)
++class DecisionMaterial:
++    """The normalized view of one decision that checks run on.
++
++    Regulatory checks must work on BOTH shapes a decision exists in:
++    a kernel Episode (live mode / episode review) and a recorded
++    governance_decision ledger row (observer mode). This is the one
++    shape both are adapted into, so a check is written once and runs
++    on either -- that adaptation, not any single lens, is what makes
++    the checker reusable across regulations and data sources.
++
++    reasons           -- the recorded outcome reason(s) for review.
++    input_fields      -- the decision's input variables (name -> value):
++                         what the deciding system saw.
++    mismatched_fields -- requested-vs-actual mismatch field names, when
++                         known (episodes). Ledger decision rows do not
++                         record a requested/actual split, so this is
++                         empty there -- checks treat it as one signal
++                         among several, never a required one.
++    outcome           -- the recorded outcome/output mapping.
++    source            -- "episode" | "ledger" (evidence context only).
++    """
++
++    subject_id: str
++    domain: str
++    reasons: Tuple[str, ...]
++    input_fields: Dict[str, Any]
++    mismatched_fields: Tuple[str, ...]
++    outcome: Dict[str, Any]
++    source: str
++
++
++def material_from_episode(episode: Episode) -> DecisionMaterial:
++    """Adapt a kernel Episode into check material.
++
++    input_fields is what the deciding system had in front of it: the
++    request plus the recorded attributes. actor_report is deliberately
++    NOT included -- same kernel rule as judgment: the actor's story
++    about itself is never treated as decision material.
++    """
++    inputs: Dict[str, Any] = dict(episode.requested)
++    inputs.update(episode.attributes)
++    return DecisionMaterial(
++        subject_id=episode.episode_id,
++        domain=episode.domain,
++        reasons=tuple(episode.outcome_reasons),
++        input_fields=inputs,
++        mismatched_fields=tuple(m.name for m in outcome_mismatches(episode)),
++        outcome=dict(episode.actual),
++        source="episode",
++    )
++
++
++def material_from_ledger_row(row: Mapping[str, Any]) -> DecisionMaterial:
++    """Adapt a governance_decision ledger row into check material.
++
++    Reasons come from the row's recorded reasoning plus any "reasons"
++    list the decision output carried. A row that recorded neither has
++    an empty tuple -- which is itself reviewable material (see the
++    specificity check's "missing" classification).
++    """
++    reasons: List[str] = []
++    reasoning = row.get("reasoning", row.get("reason"))
++    if isinstance(reasoning, str) and reasoning.strip():
++        reasons.append(reasoning.strip())
++    output = row.get("output", row.get("decision_output")) or {}
++    if isinstance(output, dict):
++        extra = output.get("reasons")
++        if isinstance(extra, (list, tuple)):
++            reasons.extend(str(r).strip() for r in extra if str(r).strip())
++    input_data = row.get("input_data") or {}
++    return DecisionMaterial(
++        subject_id=str(row.get("id", row.get("decision_id", "unknown"))),
++        domain=str(row.get("cassette_version", "unknown")),
++        reasons=tuple(reasons),
++        input_fields=dict(input_data) if isinstance(input_data, dict) else {},
++        mismatched_fields=(),
++        outcome=dict(output) if isinstance(output, dict) else {},
++        source="ledger",
++    )
++
++
++# ---------------------------------------------------------------------------
++# The lens contract
++# ---------------------------------------------------------------------------
++
++class RegulatoryValidationError(Exception):
++    """A regulatory lens failed validation. Carries the full violation
++    list so one insertion attempt reports every problem at once (same
++    reporting posture as CassetteValidationError)."""
++
++    def __init__(self, lens_label: str, violations: List[str]):
++        self.lens_label = lens_label
++        self.violations = list(violations)
++        lines = "\n".join(f"  - {v}" for v in self.violations)
++        super().__init__(
++            f"Regulatory cassette '{lens_label}' failed validation "
++            f"({len(self.violations)} violation(s)):\n{lines}"
++        )
++
++
++class RegulatoryBlock(Exception):
++    """A LIVE regulatory lens blocked an episode's judgment.
++
++    Raised by regulatory_deck.RegulatoryDeck.judge AFTER every finding
++    (blocking and otherwise) has been disclosed to the ledger -- the
++    block is always on the record before it takes effect. In judge
++    mode "block" means: the deck refuses to return a judgment for this
++    episode until a human reviews the findings. Sentinel remains the
++    judge, not the actor -- it does not reach into the deciding
++    system; it declines to certify.
++    """
++
++    def __init__(self, lens_identity: str, regulation: str,
++                 findings: Tuple[RegulatoryFinding, ...]):
++        self.lens_identity = lens_identity
++        self.regulation = regulation
++        self.findings = tuple(findings)
++        blocking = [f for f in self.findings if f.action == ACTION_BLOCK]
++        super().__init__(
++            f"Regulatory lens '{lens_identity}' ({regulation}) blocked this "
++            f"episode: {len(blocking)} blocking finding(s) of "
++            f"{len(self.findings)} total. All findings were disclosed to the "
++            f"ledger before this block took effect. Human review required."
++        )
++
++
++class RegulatoryCassette(ABC):
++    """Abstract base: the contract every regulatory lens implements.
++
++    Deliberately kernel-ADJACENT, not kernel: this class does not
++    subclass cassette_interface.Cassette, has no judge()/explain(),
++    owns no governance parameters, and never appears in the domain
++    CassetteRegistry. It matches the domain-cassette AUTHORING pattern
++    (a Python class with identity, a declaration, a self-check,
++    fail-loud validation on every load path) without ever being
++    loadable as operational policy.
++    """
++
++    # The mode manifest. REQUIRED on every concrete lens: a tuple of
++    # names from REGULATORY_MODES. There is no default -- a lens that
++    # never said whether it may attach live would attach by accident.
++    MODES: Tuple[str, ...]
++
++    @abstractmethod
++    def get_config(self) -> RegulatoryCassetteConfig:
++        """Return lens identity metadata."""
++
++    @abstractmethod
++    def get_checks(self) -> Tuple[str, ...]:
++        """The names of the checks this lens runs. These names ride in
++        regulatory_disclosure ledger events, so they are part of the
++        lens's public, tamper-evident surface."""
++
++    @abstractmethod
++    def get_profile(self) -> Dict[str, Any]:
++        """The JSON-safe configuration that parameterizes this lens's
++        checks (generic-phrase lists, thresholds, proxy-variable maps,
++        block behavior, ...). This is the regulation-specific CONFIG
++        the reusable checkers run under -- a CMS or NAIC lens differs
++        from a CFPB lens here, not in checker code. It is included in
++        snapshot() and therefore in the content hash: changing the
++        profile changes the hash, and the binding tripwire then
++        requires a new version string. Configuration is policy."""
++
++    @abstractmethod
++    def review(self, material: DecisionMaterial) -> List[RegulatoryFinding]:
++        """Run this lens's checks against one decision's material and
++        return findings (empty list when nothing warrants review).
++        Read-only by contract: review() must not write anywhere --
++        disclosure logging is the deck's job, precisely so no lens can
++        forget it."""
++
++    @abstractmethod
++    def validate(self) -> bool:
++        """Lens self-check."""
++
++    def modes(self) -> Tuple[str, ...]:
++        """The declared mode manifest, normalized (full validation with
++        the complete violation list happens in
++        validate_regulatory_cassette)."""
++        declared = getattr(self, "MODES", None)
++        if declared is None or isinstance(declared, str) \
++                or not isinstance(declared, (tuple, list)):
++            raise RegulatoryValidationError(
++                type(self).__name__,
++                ["MODES must be a tuple/list of mode names; every regulatory "
++                 "cassette must declare which modes it supports"],
++            )
++        return tuple(str(m) for m in declared)
++
++    def snapshot(self) -> Dict[str, Any]:
++        """The full, JSON-safe record of what this lens IS: identity,
++        regulation, modes, checks, and the complete check profile.
++        This is what gets content-hashed
++        (cassette_forensics.compute_cassette_hash) and bound into the
++        ledger at insertion -- the auditor's guarantee that the lens
++        reviewed today is byte-identical in configuration to the one
++        the insertion event recorded."""
++        config = self.get_config()
++        return {
++            "regulatory_schema_version": REGULATORY_SCHEMA_VERSION,
++            "cassette_version": regulatory_cassette_version_of(self),
++            "kind": "regulatory_lens",
++            "name": config.name,
++            "version": config.version,
++            "description": config.description,
++            "regulation": config.regulation,
++            "authority": config.authority,
++            "modes": sorted(self.modes()),
++            "checks": sorted(self.get_checks()),
++            "profile": self.get_profile(),
++        }
++
++
++def regulatory_cassette_version_of(lens) -> str:
++    """Canonical identity string a ledger row uses to name a lens:
++    regulatory:<name>:<version>. The reserved "regulatory" domain slot
++    keeps lens identities visibly distinct from operational cassette
++    identities in every ledger query."""
++    config = lens.get_config()
++    return f"{REGULATORY_DOMAIN}:{config.name}:{config.version}"
++
++
++def validate_regulatory_cassette(lens) -> Dict[str, Any]:
++    """The single fail-loud validation entry point for every lens load
++    path (registry registration AND deck insertion alike). Raises
++    RegulatoryValidationError with the complete violation list, or
++    returns the validated snapshot() so callers validate and hash in
++    one step. Nothing is defaulted, nothing repaired."""
++    violations: List[str] = []
++
++    config = None
++    try:
++        config = lens.get_config()
++    except Exception as exc:  # a config that crashes is a missing config
++        violations.append(f"get_config() raised: {exc}")
++    if config is not None:
++        for attr in ("name", "version", "description", "regulation", "authority"):
++            value = getattr(config, attr, None)
++            if not isinstance(value, str) or not value.strip():
++                violations.append(f"config.{attr} must be a non-empty string")
++    elif not violations:
++        violations.append("get_config() returned None")
++    label = (f"{REGULATORY_DOMAIN}:{getattr(config, 'name', '?')}:"
++             f"{getattr(config, 'version', '?')}")
++
++    # Mode manifest: explicit, known names only, at least one.
++    declared = getattr(lens, "MODES", None)
++    if declared is None:
++        violations.append(
++            "lens declares no MODES manifest; every regulatory cassette must "
++            "state which modes it supports (observer and/or live)"
++        )
++    elif isinstance(declared, str) or not isinstance(declared, (tuple, list)):
++        violations.append(
++            f"MODES must be a tuple/list of mode names, got {type(declared).__name__}"
++        )
++    else:
++        modes = tuple(str(m) for m in declared)
++        if not modes:
++            violations.append(
++                "MODES is empty; a lens that supports no mode cannot be inserted"
++            )
++        for mode in modes:
++            if mode not in REGULATORY_MODES:
++                violations.append(
++                    f"unknown mode '{mode}' in MODES; known: {list(REGULATORY_MODES)}"
++                )
++
++    # Checks: the lens's public surface must be named and non-empty.
++    try:
++        checks = lens.get_checks()
++        if isinstance(checks, str) or not isinstance(checks, (tuple, list)) or not checks:
++            violations.append("get_checks() must return a non-empty tuple of check names")
++        else:
++            for i, name in enumerate(checks):
++                if not str(name).strip():
++                    violations.append(f"get_checks()[{i}] is empty; a nameless check "
++                                      f"cannot be disclosed")
++    except Exception as exc:
++        violations.append(f"get_checks() raised: {exc}")
++
++    # Profile: must exist and be strictly JSON-safe -- the content hash
++    # is only a commitment if the same configuration always serializes
++    # to the same bytes. default=str fallbacks are deliberately NOT
++    # allowed here: a profile carrying a non-JSON object would hash by
++    # its repr, which can change without the configuration changing.
++    try:
++        profile = lens.get_profile()
++        if not isinstance(profile, dict):
++            violations.append(
++                f"get_profile() must return a dict, got {type(profile).__name__}"
++            )
++        else:
++            try:
++                json.dumps(profile, sort_keys=True)
++            except (TypeError, ValueError) as exc:
++                violations.append(
++                    f"get_profile() must be strictly JSON-serializable "
++                    f"(it is content-hashed as the lens's configuration): {exc}"
++                )
++    except Exception as exc:
++        violations.append(f"get_profile() raised: {exc}")
++
++    if not callable(getattr(lens, "review", None)):
++        violations.append("review(material) is missing or not callable")
++
++    try:
++        if lens.validate() is not True:
++            violations.append("lens.validate() self-check did not return True")
++    except Exception as exc:  # a self-check that crashes is a failed self-check
++        violations.append(f"lens.validate() raised: {exc}")
++
++    if violations:
++        raise RegulatoryValidationError(label, violations)
++
++    return lens.snapshot()
++
++
++# ---------------------------------------------------------------------------
++# Registry -- separate from the domain CassetteRegistry, on purpose.
++# ---------------------------------------------------------------------------
++
++class RegulatoryCassetteRegistry:
++    """Registry of regulatory lenses. DELIBERATELY separate from
++    cassette_interface.CassetteRegistry: a lens is not operational
++    policy, must never be returned by a domain lookup, and must never
++    look -- in code or in a ledger row -- like it drove a decision.
++    The domain registry answers "what policy governs banking?"; this
++    one answers "what lenses exist for review?". Two questions, two
++    registries."""
++
++    def __init__(self):
++        self.lenses: Dict[str, RegulatoryCassette] = {}
++
++    def register(self, lens: RegulatoryCassette) -> str:
++        """Register a lens (fail-loud). Full validation runs here --
++        registration is a load path, and no load path admits an
++        unvalidated lens. Returns the lens identity."""
++        validate_regulatory_cassette(lens)
++        identity = regulatory_cassette_version_of(lens)
++        self.lenses[identity] = lens
++        return identity
++
++    def get(self, identity: str) -> RegulatoryCassette:
++        if identity in self.lenses:
++            return self.lenses[identity]
++        raise KeyError(
++            f"No regulatory cassette registered under '{identity}'; "
++            f"registered: {sorted(self.lenses)}"
++        )
++
++    def list_all(self) -> Dict[str, RegulatoryCassetteConfig]:
++        return {identity: lens.get_config()
++                for identity, lens in self.lenses.items()}
+diff --git a/sentinel_os/regulatory_cassettes/README.md b/sentinel_os/regulatory_cassettes/README.md
+new file mode 100644
+index 0000000..9554c14
+--- /dev/null
++++ b/sentinel_os/regulatory_cassettes/README.md
+@@ -0,0 +1,117 @@
++# Regulatory Cassettes
++
++An auditor walks into a company running Sentinel and plugs in their
++agency's lens — "the CFPB regs" — and Sentinel checks decisions against
++that regulation's specific requirements. That is what this module is.
++
++A **regulatory cassette is a lens, not policy.** Domain cassettes
++(`cassettes/` — IVR, banking) drive judgment: they own the scoring
++rules and governance parameters for their industry. A regulatory
++cassette never does. It reviews decisions — recorded ones, or ones in
++flight — against one regulation's expectations, and produces findings
++for a human to review. It has its own registry
++(`RegulatoryCassetteRegistry`), its own identity namespace
++(`regulatory:<name>:<version>`), and its own directory, precisely so it
++can never be mistaken, in code or in a ledger row, for the policy that
++produced a decision.
++
++## The pieces
++
++| File | What it is |
++| --- | --- |
++| `../regulatory_cassette_interface.py` | The lens contract: config, mode manifest, findings, decision-material adapters, validation, registry. Kernel-adjacent — beside `cassette_interface.py`, never inside it. |
++| `../regulatory_checks.py` | The reusable checkers, parameterized per regulation by a `RegulationCheckProfile`. |
++| `../regulatory_deck.py` | Where lenses are inserted and run: binding, insertion events, observer review, the live judgment path with disclosure-first enforcement. |
++| `cfpb_reg_b.py` | The reference lens: CFPB / ECOA / Regulation B. |
++
++## Two modes
++
++**Observer (default use).** Read-only review of decisions already in
++the immutable ledger. `deck.observer_review()` returns a report scoped
++to each inserted lens's regulation. It touches nothing in any live
++path — zero production risk. The only ledger writes an observer lens
++ever causes are its own insertion and removal events.
++
++**Live (opt-in).** The lens attaches to the kernel judgment path
++(`deck.judge(domain_cassette, episode)`) and reviews episodes as they
++are judged. It can flag (judgment proceeds, finding attached) or block
++(the deck raises `RegulatoryBlock` and refuses to return judgment until
++a human reviews). Sentinel stays the judge, not the actor: a block
++declines to certify; it never reaches into the deciding system.
++
++## The three guarantees
++
++1. **Insertion is on the record.** Inserting or removing a lens writes
++   a first-class hash-chained event (`regulatory_cassette_inserted` /
++   `regulatory_cassette_removed`: who, when, which lens, which mode,
++   which content hash). "When was the CFPB lens active" is a direct
++   query — `ledger.get_regulatory_cassette_history()` — not an
++   inference.
++2. **The lens is what it says it is.** Insertion content-hashes the
++   lens's full configuration (including its check profile) and binds it
++   through the same `bind_cassette_version` tripwire domain cassettes
++   use. A changed lens presenting an unchanged version string is
++   refused loud. Configuration is policy: editing a phrase list without
++   bumping the lens version trips the refusal, by design.
++3. **No silent live action, ever.** Every flag or block a live lens
++   causes is itself written to the chain as a `regulatory_disclosure`
++   event — naming the regulation and the specific check — *before* the
++   action takes effect. If the disclosure write fails, the action does
++   not quietly happen; the failure propagates. This is the framework's
++   non-negotiable safeguard: undisclosed compliance-driven steering of
++   outputs is the conduct the FTC's July 2026 Section 5 proposal treats
++   as potentially deceptive, and this framework makes it structurally
++   impossible rather than merely discouraged.
++
++## What a finding is — and is not
++
++Every check **scores and flags for human review.** A finding is not a
++determination that a decision violated ECOA, Reg B, or anything else —
++and an absence of findings is not a certification of compliance. Legal
++compliance is a legal determination made by people.
++`SCREENING_DISCLAIMER` rides in every report so this boundary cannot
++quietly disappear from the output. Do not describe this module, in any
++sales or compliance context, as "proof of ECOA compliance."
++
++## Writing a new lens (CMS, NAIC, ...)
++
++Everything regulation-specific in the reference lens is **data**: a
++`RegulationCheckProfile` (generic-phrase list, placeholder patterns,
++proxy-variable map, direct-protected-term map, threshold) plus identity
++strings. The checkers in `regulatory_checks.py` are shared. A CMS lens
++("denial notices must cite specific current criteria, not generic
++algorithmic output") or a NAIC insurance-adverse-outcome lens is a new
++profile over the same functions — a configuration, not a rewrite. The
++test suite proves this by running a CMS-style profile through the
++unmodified checker.
++
++Authoring is Python-class-shaped this session, matching how domain
++cassettes are authored. A higher-level authoring interface for
++non-engineer auditors is a real, acknowledged future need — deferred
++deliberately, not forgotten.
++
++## What the checks do this session
++
++- **Reason specificity** — the kernel already guarantees a reason
++  *exists* on any outcome mismatch (`episode.validate_episode`; any
++  mismatch, not just formal denials — approved-but-reduced counts).
++  This check screens whether the reason that exists is case-specific
++  ("credit score 574 is below the 620 required for the amount
++  requested") or boilerplate ("does not meet our minimum credit
++  standards"). Deterministic, explainable scoring; every finding shows
++  the exact phrase hits and case references behind it.
++- **Prohibited-basis / proxy input screen** — flags decision input
++  variables that carry a protected characteristic directly, or match a
++  declared proxy pattern (zip code standing in for race is the
++  canonical lending example). **Declared-name screening only.** Full
++  disparate-impact statistical testing is deliberately out of scope: it
++  waits on an open product decision about whether Sentinel ever
++  captures real protected-characteristic data or works proxy-only.
++
++## Explicitly out of scope (this session)
++
++CPPA ADMT consumer-facing notice/opt-out/appeal rights (new capability
++class); HMDA-style aggregate geographic reporting (new rollup
++capability); actual hiring/insurance domain cassettes; Illinois
++applicant-facing AI-use notices; the banking fraud-escalation scoring
++decision (still deliberately open).
+diff --git a/sentinel_os/regulatory_cassettes/__init__.py b/sentinel_os/regulatory_cassettes/__init__.py
+new file mode 100644
+index 0000000..afe6dca
+--- /dev/null
++++ b/sentinel_os/regulatory_cassettes/__init__.py
+@@ -0,0 +1,11 @@
++"""Regulatory lens implementations.
++
++DELIBERATELY a separate directory from cassettes/ (the domain
++cassettes): the domain CassetteLoader auto-discovers cassettes/ by
++globbing *_cassette.py, and a regulatory lens must never be picked up
++by that path -- a lens is not operational policy and would (correctly)
++fail domain validation, which under fail_on_invalid=True would take
++down every harness construction. Separate directory, separate naming
++convention (no _cassette suffix), separate registry
++(regulatory_cassette_interface.RegulatoryCassetteRegistry).
++"""
+diff --git a/sentinel_os/regulatory_cassettes/cfpb_reg_b.py b/sentinel_os/regulatory_cassettes/cfpb_reg_b.py
+new file mode 100644
+index 0000000..3fcfe2c
+--- /dev/null
++++ b/sentinel_os/regulatory_cassettes/cfpb_reg_b.py
+@@ -0,0 +1,207 @@
++"""
++CFPB / ECOA / Regulation B lens -- the reference regulatory cassette.
++
++Checks lending-shaped decisions against two Reg B expectations:
++
++1. Adverse-action reason SPECIFICITY (12 CFR 1002.9): when an outcome
++   differs from what was requested, the stated reasons must be
++   specific to the case -- "does not meet our minimum credit
++   standards" and its relatives are the textbook failures. The
++   kernel's own invariant already guarantees a reason EXISTS on ANY
++   outcome mismatch (episode.validate_episode -- deliberately broader
++   than formal denials, covering approved-but-reduced shapes too);
++   this lens screens whether the reason that exists is specific or
++   boilerplate.
++
++2. Prohibited-basis INPUT screening: ECOA's prohibited bases (race,
++   color, religion, national origin, sex, marital status, age,
++   receipt of public assistance income) appearing directly in
++   decision inputs, and declared PROXY variables for them -- zip code
++   standing in for race being the canonical example from this repo's
++   own lending auditor-question catalog, and name-based (BISG-style)
++   proxying being the CFPB's own documented methodology risk.
++   Declared-name screening only; statistical disparate-impact testing
++   is deliberately out of scope (see regulatory_checks module
++   docstring for the open product decision it waits on).
++
++WHY THIS IS THE REFERENCE LENS: everything regulation-specific in this
++file is DATA -- the RegulationCheckProfile below and a few identity
++strings. The checking machinery lives in regulatory_checks and is
++shared. A CMS lens ("denial notices must cite specific current
++criteria, not generic algorithmic output") or a NAIC
++insurance-adverse-outcome lens is this file with different phrases and
++different proxy maps -- proven by test (a CMS-style profile runs
++through the same checker in Tests/test_regulatory_cassettes.py), not
++just asserted.
++
++This lens SCORES AND FLAGS FOR HUMAN REVIEW. It does not, and must
++never be described to, determine or certify ECOA / Reg B compliance.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, List, Tuple
++
++from regulatory_cassette_interface import (
++    ACTION_BLOCK,
++    MODE_LIVE,
++    MODE_OBSERVER,
++    DecisionMaterial,
++    RegulatoryCassette,
++    RegulatoryCassetteConfig,
++    RegulatoryFinding,
++)
++from regulatory_checks import (
++    RegulationCheckProfile,
++    check_proxy_variables,
++    check_reason_specificity,
++)
++
++CHECK_REASON_SPECIFICITY = "adverse_action_reason_specificity"
++CHECK_PROHIBITED_BASIS = "prohibited_basis_input_screen"
++
++_REGULATION = ("ECOA / Regulation B, 12 CFR Part 1002 "
++               "(adverse action notification, 1002.9)")
++
++# The Reg B profile: this dict-of-data IS the lens's regulatory
++# content. It rides in the snapshot and therefore in the content hash
++# the ledger binds at insertion -- editing a phrase here without
++# bumping the lens version trips the binding refusal, by design.
++CFPB_REG_B_PROFILE = RegulationCheckProfile(
++    regulation=_REGULATION,
++    # Boilerplate that, unaccompanied by case specifics, marks a reason
++    # as generic under Reg B's specific-principal-reasons expectation.
++    # (Presence only lowers the score -- "credit score 574 is below the
++    # 620 required for the amount requested" names a factor AND cites
++    # case values, and passes on those signals.)
++    generic_phrases=(
++        "does not meet",
++        "did not meet",
++        "minimum standards",
++        "credit standards",
++        "internal policy",
++        "internal criteria",
++        "policy reasons",
++        "proprietary",
++        "creditworthiness",
++        "credit score",
++        "risk score",
++        "risk model",
++        "model output",
++        "algorithm",
++        "algorithmic",
++        "automated decision",
++        "unable to approve",
++        "at this time",
++        "general standards",
++        "score threshold",
++        "overall profile",
++    ),
++    # Prohibited bases appearing DIRECTLY as input variable names.
++    # ECOA 701(a) list; age and public assistance carry limited
++    # permitted uses, which is exactly why the finding is a flag for
++    # human review, never a violation determination.
++    direct_protected_terms={
++        r"\brace\b": "race (ECOA prohibited basis)",
++        r"\bcolor\b": "color (ECOA prohibited basis)",
++        r"religio": "religion (ECOA prohibited basis)",
++        r"national[_ ]?origin": "national origin (ECOA prohibited basis)",
++        r"\bsex\b": "sex (ECOA prohibited basis)",
++        r"\bgender\b": "sex (ECOA prohibited basis)",
++        r"marital": "marital status (ECOA prohibited basis)",
++        r"\bage\b": "age (ECOA prohibited basis; limited permitted uses -- "
++                    "review required)",
++        r"public[_ ]?assistance": "receipt of public assistance income "
++                                  "(ECOA prohibited basis)",
++    },
++    # Declared proxy patterns: variables with documented history of
++    # standing in for a prohibited basis in lending. Name screening
++    # only.
++    proxy_variables={
++        r"zip": "race / national origin (geographic proxy)",
++        r"postal": "race / national origin (geographic proxy)",
++        r"census": "race / national origin (geographic proxy)",
++        r"neighborhood": "race / national origin (geographic proxy)",
++        r"geo": "race / national origin (geographic proxy)",
++        r"latitude|longitude": "race / national origin (geographic proxy)",
++        r"surname|last[_ ]?name": "race / national origin (BISG-style "
++                                  "name proxy)",
++        r"first[_ ]?name": "race / national origin / sex (name proxy)",
++        r"language": "national origin (language-preference proxy)",
++    },
++)
++
++
++class CFPBRegBLens(RegulatoryCassette):
++    """The CFPB / ECOA / Reg B reference lens.
++
++    Supports both modes. Default live behavior is FLAG-ONLY (screening
++    for human review -- decision 4 of this framework's architecture);
++    block_on_placeholder=True opts a live insertion into blocking
++    judgment when a recorded reason is a bare code / non-answer, the
++    one classification where "needs a human before this proceeds" is
++    hard to argue with. That switch is part of the profile and
++    therefore part of the content hash: a blocking variant is
++    DIFFERENT LENS CONTENT and must carry its own version string, or
++    the binding tripwire will refuse it -- which is the tripwire
++    doing its job.
++    """
++
++    MODES = (MODE_OBSERVER, MODE_LIVE)
++
++    def __init__(self, block_on_placeholder: bool = False,
++                 version: str = "1.0.0"):
++        self._block_on_placeholder = bool(block_on_placeholder)
++        self._version = str(version)
++
++    def get_config(self) -> RegulatoryCassetteConfig:
++        return RegulatoryCassetteConfig(
++            name="cfpb-ecoa-reg-b",
++            version=self._version,
++            description=("Screens adverse-action reason specificity and "
++                         "prohibited-basis / proxy input variables for "
++                         "lending-shaped decisions. Screening for human "
++                         "review; not a compliance determination."),
++            regulation=_REGULATION,
++            authority="Consumer Financial Protection Bureau (CFPB)",
++        )
++
++    def get_checks(self) -> Tuple[str, ...]:
++        return (CHECK_REASON_SPECIFICITY, CHECK_PROHIBITED_BASIS)
++
++    def get_profile(self) -> Dict[str, Any]:
++        return {
++            **CFPB_REG_B_PROFILE.as_dict(),
++            "block_on_placeholder": self._block_on_placeholder,
++        }
++
++    def review(self, material: DecisionMaterial) -> List[RegulatoryFinding]:
++        findings = check_reason_specificity(
++            material, CFPB_REG_B_PROFILE, check_name=CHECK_REASON_SPECIFICITY,
++        )
++        if self._block_on_placeholder:
++            findings = [
++                RegulatoryFinding(
++                    check=f.check, subject_id=f.subject_id,
++                    regulation=f.regulation, action=ACTION_BLOCK,
++                    classification=f.classification, score=f.score,
++                    evidence={**f.evidence,
++                              "escalated": "placeholder reasons block under "
++                                           "this lens configuration"},
++                ) if f.classification == "placeholder" else f
++                for f in findings
++            ]
++        findings.extend(check_proxy_variables(
++            material, CFPB_REG_B_PROFILE, check_name=CHECK_PROHIBITED_BASIS,
++        ))
++        return findings
++
++    def validate(self) -> bool:
++        config = self.get_config()
++        return (
++            config is not None
++            and bool(CFPB_REG_B_PROFILE.generic_phrases)
++            and bool(CFPB_REG_B_PROFILE.proxy_variables)
++            and bool(CFPB_REG_B_PROFILE.direct_protected_terms)
++            and len(self.get_checks()) == 2
++        )
+diff --git a/sentinel_os/regulatory_checks.py b/sentinel_os/regulatory_checks.py
+new file mode 100644
+index 0000000..9a400a8
+--- /dev/null
++++ b/sentinel_os/regulatory_checks.py
+@@ -0,0 +1,353 @@
++"""
++Regulatory checks -- reusable, regulation-parameterized screening.
++
++This module is the REUSABLE half of the regulatory-cassette framework:
++generic checker code, configured per regulation by a
++RegulationCheckProfile. The CFPB / ECOA / Reg B lens
++(regulatory_cassettes/cfpb_reg_b.py) is one profile; a CMS lens
++("denial notices must cite specific current criteria, not generic
++algorithmic output") or a NAIC insurance-adverse-outcome lens is
++another profile over the SAME functions here -- a configuration file,
++not a rewrite. That reusability is the point of this module; the CFPB
++lens is the reference proof it works.
++
++Two checks this session, both deterministic and fully explainable:
++
++1. check_reason_specificity -- does a recorded outcome reason read as
++   case-specific, or as generic/placeholder boilerplate? The kernel
++   already guarantees a reason EXISTS on any outcome mismatch
++   (episode.validate_episode -- any mismatch, not just denials); this
++   check screens whether the reason that exists actually says
++   anything. Grounded in the Reg B adverse-action requirement that
++   stated reasons be specific principal reasons, and in the same
++   "specific criteria, not generic algorithmic output" expectation CMS
++   applies to denial notices.
++
++2. check_proxy_variables -- flag input variables that are known
++   proxies for protected characteristics (zip code standing in for
++   race is the canonical lending example, straight from this repo's
++   own auditor-question catalog), and flag protected characteristics
++   present directly in decision inputs. DECLARED-PATTERN SCREENING
++   ONLY, scoped down on purpose: this does NOT compute statistical
++   correlation or disparate impact. Full disparate-impact testing
++   requires deciding whether Sentinel ever captures real
++   protected-characteristic data or works proxy-only -- an open
++   product decision that belongs to Wm, deliberately not guessed at
++   here. Until it is made, this check screens by declared variable
++   names, which needs no protected-class data at all.
++
++Every function here SCORES AND FLAGS FOR HUMAN REVIEW. Nothing in this
++module determines legal compliance, and nothing may be described as
++doing so (see regulatory_cassette_interface.SCREENING_DISCLAIMER).
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Mapping, Tuple
++
++from regulatory_cassette_interface import (
++    ACTION_FLAG,
++    DecisionMaterial,
++    RegulatoryFinding,
++)
++
++# Score vocabulary for the specificity check, kept as named constants so
++# the arithmetic below is legible as policy rather than magic numbers.
++_BASE_SCORE = 0.5           # a reason starts neutral
++_VALUE_REFERENCE_CREDIT = 0.25   # cites a concrete value (number/amount/date)
++_FIELD_REFERENCE_CREDIT = 0.25   # names an actual case field
++_GENERIC_HIT_PENALTY = 0.25      # per distinct generic phrase, capped
++_GENERIC_PENALTY_CAP = 0.5
++
++# Default pattern for "this reason cites a concrete value": any digit
++# sequence (amounts, scores, dates, criterion numbers, billing codes).
++# Profiles may override for regulations with different notions of a
++# concrete citation.
++_DEFAULT_VALUE_REFERENCE_PATTERN = r"\d"
++
++# Default placeholder shapes: pure codes ("R-12", "DECLINE_001"),
++# classic non-answers, and bare outcome restatements. A reason that is
++# only a code or only restates the outcome explains nothing.
++_DEFAULT_PLACEHOLDER_PATTERNS = (
++    r"^[A-Za-z]{1,10}[-_ ]?\d{1,6}$",
++    r"^(n/?a|none|tbd|pending|unknown|see\s+file|standard|policy)$",
++    r"^(denied|declined|rejected|adverse\s+action|not\s+approved)\.?$",
++    r"^reason(\s*\d+)?$",
++)
++
++
++@dataclass(frozen=True)
++class RegulationCheckProfile:
++    """One regulation's configuration of the shared checkers.
++
++    This dataclass IS the extension point: a new regulation is a new
++    profile instance (typically declared as data in that regulation's
++    lens module), never new checker code. Everything here is JSON-safe
++    via as_dict(), because the profile rides inside the lens snapshot
++    and is therefore part of the content hash the ledger binds --
++    changing a phrase list is changing the lens, and the binding
++    tripwire treats it that way.
++
++    Fields:
++      regulation           -- citation string findings carry.
++      generic_phrases      -- substrings that mark boilerplate for THIS
++                              regulation ("does not meet our standards",
++                              "algorithmic output", ...). Case-insensitive
++                              substring match; each distinct hit lowers
++                              the specificity score.
++      placeholder_patterns -- full-string regexes for reasons that are
++                              codes or non-answers; a match classifies
++                              the reason "placeholder" outright.
++      value_reference_pattern -- regex whose presence counts as citing a
++                              concrete value.
++      extra_case_fields    -- field names beyond the material's own
++                              (mismatched fields + input variables) that
++                              count as case references when named in a
++                              reason.
++      specific_score_threshold -- reasons scoring BELOW this flag as
++                              generic. 0.5 default: a reason with no
++                              specific signal and any generic hit flags;
++                              one concrete signal with no generic hit
++                              passes.
++      proxy_variables      -- variable-name pattern -> what it proxies
++                              for. Matched against input variable NAMES
++                              (word-ish, case-insensitive).
++      direct_protected_terms -- variable-name pattern -> the protected
++                              characteristic itself, for inputs that
++                              carry a protected characteristic directly.
++    """
++
++    regulation: str
++    generic_phrases: Tuple[str, ...] = ()
++    placeholder_patterns: Tuple[str, ...] = _DEFAULT_PLACEHOLDER_PATTERNS
++    value_reference_pattern: str = _DEFAULT_VALUE_REFERENCE_PATTERN
++    extra_case_fields: Tuple[str, ...] = ()
++    specific_score_threshold: float = 0.5
++    proxy_variables: Mapping[str, str] = field(default_factory=dict)
++    direct_protected_terms: Mapping[str, str] = field(default_factory=dict)
++
++    def as_dict(self) -> Dict[str, Any]:
++        """JSON-safe form for lens snapshots (content-hashed)."""
++        return {
++            "regulation": self.regulation,
++            "generic_phrases": sorted(self.generic_phrases),
++            "placeholder_patterns": list(self.placeholder_patterns),
++            "value_reference_pattern": self.value_reference_pattern,
++            "extra_case_fields": sorted(self.extra_case_fields),
++            "specific_score_threshold": float(self.specific_score_threshold),
++            "proxy_variables": dict(sorted(self.proxy_variables.items())),
++            "direct_protected_terms": dict(sorted(self.direct_protected_terms.items())),
++        }
++
++
++# ---------------------------------------------------------------------------
++# Check 1: reason specificity
++# ---------------------------------------------------------------------------
++
++def _field_name_appears(field_name: str, text_lower: str) -> bool:
++    """True when every token of a field name appears in the text as a
++    word ("credit_limit" matches "your credit limit was reduced",
++    "amount" matches "the amount requested"). Token-wise so snake_case
++    field names match natural prose."""
++    tokens = [t for t in re.split(r"[_\W]+", field_name.lower()) if t]
++    if not tokens:
++        return False
++    return all(re.search(rf"\b{re.escape(token)}\b", text_lower) for token in tokens)
++
++
++def assess_reason_specificity(reason: str, material: DecisionMaterial,
++                              profile: RegulationCheckProfile) -> Dict[str, Any]:
++    """Score ONE recorded reason for case-specificity under a profile.
++
++    Always returns the full assessment (score, classification,
++    evidence) whether or not it would flag -- check_reason_specificity
++    turns flagged assessments into findings; reports and tests can
++    read the assessment for passing reasons too.
++
++    The arithmetic, stated as policy: a reason starts neutral (0.5).
++    Citing a concrete value (+0.25) and naming an actual case field
++    (+0.25) are the two specific signals. Each distinct generic phrase
++    hit costs 0.25, capped at 0.5. A reason matching a placeholder
++    pattern is classified "placeholder" at score 0.0 regardless --
++    a bare code cannot buy its way back with a digit, which is also
++    why placeholder patterns are tested BEFORE value credit.
++    """
++    text = reason.strip()
++    text_lower = text.lower()
++
++    for pattern in profile.placeholder_patterns:
++        if re.fullmatch(pattern, text_lower, flags=re.IGNORECASE):
++            return {
++                "reason": reason,
++                "score": 0.0,
++                "classification": "placeholder",
++                "flagged": True,
++                "evidence": {
++                    "placeholder_pattern": pattern,
++                    "detail": "reason is a code or non-answer; it explains nothing "
++                              "about this case",
++                },
++            }
++
++    generic_hits = sorted({p for p in profile.generic_phrases
++                           if p.lower() in text_lower})
++    has_value = bool(re.search(profile.value_reference_pattern, text))
++
++    candidate_fields = list(material.mismatched_fields)
++    candidate_fields += list(material.input_fields.keys())
++    candidate_fields += list(profile.extra_case_fields)
++    referenced_fields = sorted({name for name in candidate_fields
++                                if _field_name_appears(name, text_lower)})
++
++    score = _BASE_SCORE
++    if has_value:
++        score += _VALUE_REFERENCE_CREDIT
++    if referenced_fields:
++        score += _FIELD_REFERENCE_CREDIT
++    score -= min(_GENERIC_HIT_PENALTY * len(generic_hits), _GENERIC_PENALTY_CAP)
++    score = max(0.0, min(1.0, score))
++
++    flagged = score < profile.specific_score_threshold
++    classification = "generic" if flagged else "specific"
++    return {
++        "reason": reason,
++        "score": score,
++        "classification": classification,
++        "flagged": flagged,
++        "evidence": {
++            "generic_phrase_hits": generic_hits,
++            "cites_concrete_value": has_value,
++            "case_fields_referenced": referenced_fields,
++            "score_meaning": "0.0-1.0, how case-specific this reason reads "
++                             "under this profile; a screening score, not a "
++                             "compliance probability",
++        },
++    }
++
++
++def check_reason_specificity(material: DecisionMaterial,
++                             profile: RegulationCheckProfile,
++                             check_name: str = "reason_specificity"
++                             ) -> List[RegulatoryFinding]:
++    """Screen every recorded reason on one decision; findings for the
++    ones that read generic/placeholder, plus a "missing" finding when
++    a mismatch is on record with no reason at all (reachable only for
++    ledger rows -- the kernel refuses to validate such an episode, so
++    live-mode material can never arrive reasonless with a mismatch).
++    """
++    findings: List[RegulatoryFinding] = []
++
++    if not material.reasons:
++        if material.mismatched_fields:
++            findings.append(RegulatoryFinding(
++                check=check_name,
++                subject_id=material.subject_id,
++                regulation=profile.regulation,
++                action=ACTION_FLAG,
++                classification="missing",
++                score=0.0,
++                evidence={
++                    "mismatched_fields": list(material.mismatched_fields),
++                    "detail": "outcome differs from what was requested and no "
++                              "reason is on record",
++                },
++            ))
++        return findings
++
++    for assessment in (assess_reason_specificity(r, material, profile)
++                       for r in material.reasons):
++        if assessment["flagged"]:
++            findings.append(RegulatoryFinding(
++                check=check_name,
++                subject_id=material.subject_id,
++                regulation=profile.regulation,
++                action=ACTION_FLAG,
++                classification=assessment["classification"],
++                score=float(assessment["score"]),
++                evidence={"reason": assessment["reason"],
++                          **assessment["evidence"]},
++            ))
++    return findings
++
++
++# ---------------------------------------------------------------------------
++# Check 2: proxy-variable / direct-protected-input screen
++# ---------------------------------------------------------------------------
++
++def _name_matches(pattern: str, variable_name: str) -> bool:
++    """Pattern match against a variable NAME (not its value):
++    case-insensitive regex search over the name AND over the name with
++    separators spaced out. The second form exists because \\b patterns
++    like r"\\brace\\b" would never fire on snake_case names
++    ("applicant_race" -- underscore is a word character, so there is no
++    boundary before "race"), and snake_case is exactly how decision
++    inputs are usually named."""
++    spaced = re.sub(r"[_\-]+", " ", variable_name)
++    return any(
++        re.search(pattern, candidate, flags=re.IGNORECASE) is not None
++        for candidate in (variable_name, spaced)
++    )
++
++
++def check_proxy_variables(material: DecisionMaterial,
++                          profile: RegulationCheckProfile,
++                          check_name: str = "proxy_variable_screen"
++                          ) -> List[RegulatoryFinding]:
++    """Screen the decision's input VARIABLE NAMES against the profile's
++    declared proxy and direct-protected patterns.
++
++    Direct hits are reported before proxy hits, and a variable that
++    matches a direct pattern is not double-reported as a proxy of
++    itself. Values are never inspected -- this is a declared-name
++    screen (see the module docstring for why statistical testing is
++    deliberately out of scope this session).
++    """
++    findings: List[RegulatoryFinding] = []
++    for name in sorted(material.input_fields):
++        direct = next((char for pattern, char
++                       in sorted(profile.direct_protected_terms.items())
++                       if _name_matches(pattern, name)), None)
++        if direct is not None:
++            findings.append(RegulatoryFinding(
++                check=check_name,
++                subject_id=material.subject_id,
++                regulation=profile.regulation,
++                action=ACTION_FLAG,
++                classification="direct_protected_characteristic",
++                score=1.0,
++                evidence={
++                    "variable": name,
++                    "characteristic": direct,
++                    "detail": "decision input carries a protected characteristic "
++                              "directly; flagged for human review of whether its "
++                              "use here is permitted",
++                    "score_meaning": "1.0 = declared name pattern matched; not a "
++                                     "measure of influence on the decision",
++                },
++            ))
++            continue
++        proxied = next((char for pattern, char
++                        in sorted(profile.proxy_variables.items())
++                        if _name_matches(pattern, name)), None)
++        if proxied is not None:
++            findings.append(RegulatoryFinding(
++                check=check_name,
++                subject_id=material.subject_id,
++                regulation=profile.regulation,
++                action=ACTION_FLAG,
++                classification="proxy_variable",
++                score=1.0,
++                evidence={
++                    "variable": name,
++                    "proxies_for": proxied,
++                    "detail": "decision input matches a declared proxy pattern "
++                              "for a protected characteristic; flagged for human "
++                              "review (declared-name screening only -- no "
++                              "statistical correlation is computed)",
++                    "score_meaning": "1.0 = declared name pattern matched; not a "
++                                     "measure of influence on the decision",
++                },
++            ))
++    return findings
+diff --git a/sentinel_os/regulatory_deck.py b/sentinel_os/regulatory_deck.py
+new file mode 100644
+index 0000000..f0daced
+--- /dev/null
++++ b/sentinel_os/regulatory_deck.py
+@@ -0,0 +1,366 @@
++"""
++Regulatory Deck -- where an auditor's lens is inserted and runs.
++
++The deck is the machine the regulatory cassettes go into. It owns the
++three guarantees the framework makes to an examiner:
++
++1. INSERTION IS ON THE RECORD. Inserting (or removing) a lens writes a
++   first-class hash-chained ledger event
++   (regulatory_cassette_inserted / regulatory_cassette_removed: who,
++   when, which lens identity, which mode, which content + code hash)
++   via governance/ledger_postgres.record_regulatory_cassette_event.
++   "When was the CFPB lens active" is a direct ledger query, not an
++   inference from an overloaded field.
++
++2. THE LENS IS WHAT IT SAYS IT IS. Insertion content-binds the lens's
++   full configuration snapshot through the SAME
++   bind_cassette_version machinery domain cassettes already use --
++   same tripwire, same guarantee: a lens whose configuration changed
++   under an unchanged version string is refused loud at insertion.
++
++3. NO SILENT LIVE ACTION, EVER. When a LIVE-mode lens flags or blocks
++   an episode's judgment, that action is itself written to the ledger
++   as a regulatory_disclosure event -- naming the regulation and the
++   specific check -- BEFORE the action takes effect, on the same hash
++   chain as everything else (no parallel logging path). If the
++   disclosure write fails, the action does not happen quietly: the
++   failure propagates and judgment does not proceed. This is the
++   framework's non-negotiable safeguard: fairness- or
++   compliance-driven steering of outputs that the record cannot see
++   is treated here as forbidden, full stop -- which is also the
++   posture the FTC's July 2026 Section 5 proposal takes toward
++   undisclosed output-steering. Disclosure is not hardening; it is
++   the condition for live mode existing at all.
++
++Judge, not actor: in live mode a "block" means the deck refuses to
++return judgment for the episode until a human reviews the disclosed
++findings (RegulatoryBlock). The deck never reaches into the deciding
++system and never rewrites an outcome. There is no adjustment path in
++this deck; the disclosure vocabulary reserves "adjust" so that if one
++is ever built, it cannot be built without a disclosure event type
++already waiting for it.
++
++Observer mode is exactly as safe as it sounds: review of decisions
++already in the immutable ledger, producing a report. The only ledger
++writes an observer-mode lens ever causes are its own insertion and
++removal events.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Tuple
++
++from cassette_forensics import compute_cassette_code_hash, compute_cassette_hash
++from episode import Episode, explain_episode, judge_episode
++from regulatory_cassette_interface import (
++    ACTION_BLOCK,
++    MODE_LIVE,
++    MODE_OBSERVER,
++    REGULATORY_MODES,
++    RegulatoryBlock,
++    RegulatoryCassette,
++    RegulatoryFinding,
++    SCREENING_DISCLAIMER,
++    material_from_episode,
++    material_from_ledger_row,
++    regulatory_cassette_version_of,
++    validate_regulatory_cassette,
++)
++
++
++@dataclass(frozen=True)
++class InsertedLens:
++    """One lens as inserted: the object plus the recorded facts of its
++    insertion (mode, hashes, who). What active() reports and what
++    disclosure events cite."""
++
++    identity: str
++    lens: RegulatoryCassette
++    mode: str
++    regulation: str
++    cassette_hash: str
++    cassette_code_hash: str
++    inserted_by: str
++
++
++@dataclass(frozen=True)
++class GovernedJudgment:
++    """What RegulatoryDeck.judge returns when judgment proceeds: the
++    domain cassette's own QualityResult, untouched, plus every
++    regulatory finding that was raised (and disclosed) along the way.
++    The findings ride NEXT TO the judgment, never inside it -- a lens
++    reviews the decision, it does not move the score."""
++
++    quality: Any
++    findings: Tuple[RegulatoryFinding, ...]
++
++
++class RegulatoryDeck:
++    """Insertion point and runtime for regulatory lenses.
++
++    A ledger is REQUIRED, not optional: without one, insertion cannot
++    be evidenced and live-mode disclosure cannot exist, and both are
++    the point. There is deliberately no offline construction path --
++    a deck that cannot write its record is not a deck, in exactly the
++    way an unbound cassette is not policy. (Tests exercising failure
++    behavior inject a stub ledger; production passes the real
++    PostgreSQLLedger.)
++    """
++
++    def __init__(self, ledger, default_authorized_by: Optional[str] = None):
++        if ledger is None:
++            raise ValueError(
++                "RegulatoryDeck requires a ledger: lens insertion events and "
++                "live-mode disclosure logging are non-negotiable, and both "
++                "need somewhere tamper-evident to land. There is no "
++                "ledgerless mode."
++            )
++        self.ledger = ledger
++        self.default_authorized_by = default_authorized_by
++        self._active: Dict[str, InsertedLens] = {}
++
++    # ------------------------------------------------------------------
++    # Insertion / removal -- the auditor-facing surface
++    # ------------------------------------------------------------------
++
++    def insert(self, lens: RegulatoryCassette, mode: str,
++               inserted_by: Optional[str] = None) -> Dict[str, Any]:
++        """Insert a lens in the given mode.
++
++        Order matters and is deliberate: validate (fail-loud), hash,
++        BIND (the content tripwire fires here, before anything is
++        active), then write the insertion event, then activate. A lens
++        that fails any step is never active and never was.
++        """
++        if mode not in REGULATORY_MODES:
++            raise ValueError(
++                f"Unknown regulatory mode '{mode}'; known: {list(REGULATORY_MODES)}"
++            )
++
++        snapshot = validate_regulatory_cassette(lens)
++        if mode not in lens.modes():
++            raise ValueError(
++                f"Lens '{regulatory_cassette_version_of(lens)}' does not "
++                f"support mode '{mode}' (declared MODES: {list(lens.modes())}). "
++                f"A lens attaches only in a mode it explicitly declared."
++            )
++
++        identity = regulatory_cassette_version_of(lens)
++        if identity in self._active:
++            raise ValueError(
++                f"Lens '{identity}' is already inserted (mode "
++                f"'{self._active[identity].mode}'). Remove it first; a second "
++                f"concurrent insertion of the same identity would make the "
++                f"active-window record ambiguous."
++            )
++
++        who = inserted_by or self.default_authorized_by
++        if not who or not str(who).strip():
++            raise ValueError(
++                "Insertion requires an identity (inserted_by): the insertion "
++                "event records WHO inserted the lens, and an anonymous "
++                "insertion is exactly the record an examiner cannot accept."
++            )
++
++        cassette_hash = compute_cassette_hash(snapshot)
++        cassette_code_hash = compute_cassette_code_hash(lens)
++        regulation = snapshot["regulation"]
++
++        # Same tamper-evidence machinery domain cassettes use -- the
++        # version string becomes a content commitment the first time
++        # this identity is bound, and a changed lens presenting the
++        # same string is refused loud right here.
++        self.ledger.bind_cassette_version(
++            identity, cassette_hash,
++            cassette_code_hash=cassette_code_hash,
++            authorized_by=str(who),
++        )
++
++        event = self.ledger.record_regulatory_cassette_event(
++            event="regulatory_cassette_inserted",
++            cassette_version=identity,
++            cassette_hash=cassette_hash,
++            cassette_code_hash=cassette_code_hash,
++            mode=mode,
++            regulation=regulation,
++            authorized_by=str(who),
++        )
++
++        entry = InsertedLens(
++            identity=identity, lens=lens, mode=mode, regulation=regulation,
++            cassette_hash=cassette_hash, cassette_code_hash=cassette_code_hash,
++            inserted_by=str(who),
++        )
++        self._active[identity] = entry
++        return {
++            "identity": identity,
++            "mode": mode,
++            "regulation": regulation,
++            "cassette_hash": cassette_hash,
++            "cassette_code_hash": cassette_code_hash,
++            "inserted_by": str(who),
++            "insertion_event_hash": event.get("current_hash"),
++        }
++
++    def remove(self, identity: str, removed_by: Optional[str] = None) -> Dict[str, Any]:
++        """Remove an inserted lens, on the record. The removal event is
++        what lets 'when was this lens active' have an end as well as a
++        beginning."""
++        if identity not in self._active:
++            raise KeyError(
++                f"No inserted lens '{identity}'; active: {sorted(self._active)}"
++            )
++        who = removed_by or self.default_authorized_by
++        if not who or not str(who).strip():
++            raise ValueError(
++                "Removal requires an identity (removed_by): the active-window "
++                "record needs who closed it, not just who opened it."
++            )
++        entry = self._active[identity]
++        event = self.ledger.record_regulatory_cassette_event(
++            event="regulatory_cassette_removed",
++            cassette_version=identity,
++            cassette_hash=entry.cassette_hash,
++            cassette_code_hash=entry.cassette_code_hash,
++            mode=entry.mode,
++            regulation=entry.regulation,
++            authorized_by=str(who),
++        )
++        del self._active[identity]
++        return {
++            "identity": identity,
++            "removed_by": str(who),
++            "removal_event_hash": event.get("current_hash"),
++        }
++
++    def active(self) -> List[Dict[str, Any]]:
++        """The currently inserted lenses, as recorded facts."""
++        return [
++            {
++                "identity": e.identity, "mode": e.mode,
++                "regulation": e.regulation, "cassette_hash": e.cassette_hash,
++                "inserted_by": e.inserted_by,
++            }
++            for e in self._active.values()
++        ]
++
++    # ------------------------------------------------------------------
++    # Observer mode -- read-only review of the recorded ledger
++    # ------------------------------------------------------------------
++
++    def observer_review(self, limit: int = 100,
++                        decision_cassette_version: Optional[str] = None
++                        ) -> Dict[str, Any]:
++        """Run every inserted lens over recorded governance decisions.
++
++        Read-only by construction: decisions are fetched through the
++        ledger's existing read path and findings are RETURNED, never
++        written. (Live-mode disclosure exists because live findings
++        alter what happens next; an observer report alters nothing, so
++        writing it into the chain would only manufacture noise.) Both
++        observer- and live-inserted lenses participate -- reading the
++        record is harmless in either mode.
++        """
++        decisions = self.ledger.get_decisions(
++            cassette_version=decision_cassette_version, limit=limit,
++        )
++        report_lenses: List[Dict[str, Any]] = []
++        for entry in self._active.values():
++            findings: List[RegulatoryFinding] = []
++            flagged_subjects = set()
++            for row in decisions:
++                material = material_from_ledger_row(row)
++                for finding in entry.lens.review(material):
++                    findings.append(finding)
++                    flagged_subjects.add(finding.subject_id)
++            report_lenses.append({
++                "identity": entry.identity,
++                "mode": entry.mode,
++                "regulation": entry.regulation,
++                "cassette_hash": entry.cassette_hash,
++                "decisions_reviewed": len(decisions),
++                "decisions_flagged": len(flagged_subjects),
++                "findings": [f.as_dict() for f in findings],
++            })
++        return {
++            "review_mode": MODE_OBSERVER,
++            "disclaimer": SCREENING_DISCLAIMER,
++            "lenses": report_lenses,
++        }
++
++    # ------------------------------------------------------------------
++    # Live mode -- the kernel judgment path, with disclosure-first
++    # ------------------------------------------------------------------
++
++    def _live_entries(self) -> List[InsertedLens]:
++        return [e for e in self._active.values() if e.mode == MODE_LIVE]
++
++    def _disclose(self, entry: InsertedLens, finding: RegulatoryFinding) -> None:
++        """Write one finding's disclosure event. Deliberately NO
++        try/except: a failed disclosure write must abort the action it
++        would have disclosed. Silence is the one outcome this method
++        is not allowed to produce."""
++        self.ledger.record_regulatory_disclosure(
++            cassette_version=entry.identity,
++            regulation=entry.regulation,
++            check=finding.check,
++            action=finding.action,
++            subject_id=finding.subject_id,
++            finding=finding.as_dict(),
++            cassette_hash=entry.cassette_hash,
++            authorized_by=entry.inserted_by,
++        )
++
++    def judge(self, domain_cassette, episode: Episode) -> GovernedJudgment:
++        """The live-governed judgment entry point.
++
++        Kernel validation and domain judgment run first (through
++        episode.judge_episode -- no judgment path admits an
++        unvalidated episode, this one included). Then every LIVE lens
++        reviews the episode; EVERY finding is disclosed to the ledger
++        as it is raised. Only after all findings from all lenses are
++        on the record does a block take effect (RegulatoryBlock), so
++        the chain always holds the complete picture of what the lenses
++        saw, not just the first thing that stopped the music.
++        """
++        quality = judge_episode(domain_cassette, episode)
++        all_findings: List[RegulatoryFinding] = []
++        blocking: List[RegulatoryFinding] = []
++        blocking_entry: Optional[InsertedLens] = None
++        for entry in self._live_entries():
++            for finding in entry.lens.review(material_from_episode(episode)):
++                self._disclose(entry, finding)  # fail-closed: may raise
++                all_findings.append(finding)
++                if finding.action == ACTION_BLOCK:
++                    blocking.append(finding)
++                    if blocking_entry is None:
++                        blocking_entry = entry
++        if blocking:
++            raise RegulatoryBlock(
++                lens_identity=blocking_entry.identity,
++                regulation=blocking_entry.regulation,
++                findings=tuple(all_findings),
++            )
++        return GovernedJudgment(quality=quality, findings=tuple(all_findings))
++
++    def explain(self, domain_cassette, episode: Episode) -> List[Dict[str, Any]]:
++        """Kernel explanation plus regulatory findings as factors.
++
++        Read-only, like the kernel's own explain: findings appear as
++        "regulatory_finding" factor entries but are NOT disclosed to
++        the ledger here, because explanation is a reporting surface --
++        nothing about the episode's handling changes when it is
++        explained. judge() is the decision path, and the decision path
++        is where disclosure is owed. (Explaining an episode twice must
++        not write two more ledger rows.)
++        """
++        factors = explain_episode(domain_cassette, episode)
++        for entry in self._live_entries():
++            for finding in entry.lens.review(material_from_episode(episode)):
++                factors.append({
++                    "factor": "regulatory_finding",
++                    "lens": entry.identity,
++                    **finding.as_dict(),
++                })
++        return factors
+diff --git a/sentinel_os/twin_custody.py b/sentinel_os/twin_custody.py
+index 8d3a1a0..e705763 100644
+--- a/sentinel_os/twin_custody.py
++++ b/sentinel_os/twin_custody.py
+@@ -257,6 +257,39 @@ def recompute_current_hash(row: Dict[str, Any]) -> str:
+         # cassette_hash + cassette_code_hash enter via the shared contract; the
+         # shipped column names match the canonical keys.
+         apply_optional_hashed_fields(canonical, row)
++    elif row.get("record_kind") in ("regulatory_cassette_inserted",
++                                    "regulatory_cassette_removed"):
++        # Mirrors ledger_postgres.record_regulatory_cassette_event().
++        # mode + regulation ride in the data JSONB (shipped).
++        d = row.get("data") or {}
++        canonical = {
++            "record_kind": row["record_kind"],
++            "cassette_version": row["cassette_version"],
++            "mode": d.get("mode"),
++            "regulation": d.get("regulation"),
++            "previous_hash": row["previous_hash"],
++        }
++        # cassette_hash + cassette_code_hash + authorized_by enter via the
++        # shared contract; the shipped column names match the canonical keys.
++        apply_optional_hashed_fields(canonical, row)
++    elif row.get("record_kind") == "regulatory_disclosure":
++        # Mirrors ledger_postgres.record_regulatory_disclosure(). The finding
++        # body was stored in decision_output; regulation/check/action/subject
++        # in data. NOTE: cassette_code_hash is never set on disclosure rows,
++        # so applying the full shared contract stays byte-identical to the
++        # writer (absent -> omitted).
++        d = row.get("data") or {}
++        canonical = {
++            "record_kind": "regulatory_disclosure",
++            "cassette_version": row["cassette_version"],
++            "regulation": d.get("regulation"),
++            "check": d.get("check"),
++            "action": d.get("action"),
++            "subject": d.get("subject"),
++            "finding": row["decision_output"],
++            "previous_hash": row["previous_hash"],
++        }
++        apply_optional_hashed_fields(canonical, row)
+     elif row.get("record_kind") == "decision_supersession":
+         # Mirrors ledger_postgres.supersede_decision(). Item 6. The writer
+         # stored the authorizing identity in the authorized_by column but hashed
+-- 
+2.43.0
+

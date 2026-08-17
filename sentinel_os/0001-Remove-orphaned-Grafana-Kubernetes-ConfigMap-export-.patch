@@ -1,0 +1,67 @@
+From 76b49cd77a66a37be9962d5905fe64dff741f1ad Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 15:11:26 +0000
+Subject: [PATCH 1/3] Remove orphaned Grafana Kubernetes ConfigMap export path
+
+export_grafana_kubernetes_configs and the two ConfigMap template
+constants it consumed (GRAFANA_DATASOURCE_CONFIG,
+GRAFANA_DASHBOARD_CONFIG) had no references anywhere in the repo --
+no callers, no tests, no docs. The constants existed only to feed the
+function. The module's live surface, GrafanaDashboard and
+generate_dashboard_json, is unchanged and still imported by
+api_server_resilient.py and Tests/test_resilience_observability.py.
+
+Deployment docs point at Deploy/grafana/ for dashboard provisioning,
+not at this k8s ConfigMap path.
+---
+ sentinel_os/grafana_dashboard.py | 37 --------------------------------
+ 1 file changed, 37 deletions(-)
+
+diff --git a/sentinel_os/grafana_dashboard.py b/sentinel_os/grafana_dashboard.py
+index e0dee80..5a08df2 100644
+--- a/sentinel_os/grafana_dashboard.py
++++ b/sentinel_os/grafana_dashboard.py
+@@ -168,40 +168,3 @@ def generate_dashboard_json() -> str:
+     dashboard = GrafanaDashboard()
+     config = dashboard.build()
+     return json.dumps(config, indent=2)
+-
+-# Example: Export dashboard provisioning YAML
+-GRAFANA_DATASOURCE_CONFIG = """
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: grafana-datasource
+-  namespace: iceberg
+-data:
+-  prometheus.yaml: |
+-    apiVersion: 1
+-    datasources:
+-    - name: Prometheus
+-      type: prometheus
+-      url: http://prometheus:9090
+-      access: proxy
+-      isDefault: true
+-"""
+-
+-GRAFANA_DASHBOARD_CONFIG = """
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: grafana-dashboard
+-  namespace: iceberg
+-data:
+-  iceberg-dashboard.json: |
+-    {DASHBOARD_JSON}
+-"""
+-
+-def export_grafana_kubernetes_configs(dashboard_json: str) -> tuple:
+-    """Export Kubernetes configs for Grafana deployment"""
+-    
+-    dashboard_config = GRAFANA_DASHBOARD_CONFIG.replace("{DASHBOARD_JSON}", 
+-                                                         dashboard_json.replace('"', '\\"'))
+-    
+-    return (GRAFANA_DATASOURCE_CONFIG, dashboard_config)
+-- 
+2.43.0
+

@@ -1,0 +1,276 @@
+From 3039bee752e7853a8ce37dc223012c0d0747e2ad Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 31 Jul 2026 21:58:09 +0000
+Subject: [PATCH 6/7] Lease heartbeat: wire the already-built renewal into the
+ live worker
+
+Final piece of item 4 on Wm's July 28 roadmap (AI cost tracking and this
+were the two remaining pieces; recommendation-impact testing is still
+open).
+
+Surprise going in: this wasn't greenfield work. queue_schema.py already
+had a complete, tested lease-claim-heartbeat-reap system -- heartbeat()
+was "grafted" in from a separate rebuild specifically because, per its
+own docstring, "the v1 engine had NO lease renewal -- a lease could only
+expire." But sentinel_worker.py, the actual production entrypoint, never
+called it. A worker claimed a job with the queue's default 30-second
+lease, then called process_call (a real Claude API call, a Postgres
+write, and as of this session's earlier cohort-equity-escalation work,
+sometimes a real network call to the twin) with nothing renewing that
+lease while it ran.
+
+Not a correctness bug -- the ledger's sid dedup already makes a
+redelivered-while-still-processing job safe, the same path the existing
+crash-recovery design relies on, and queue_schema.py's own Outcome enum
+already documents STALE as a fenced, expected case. But it was wasted
+work and a spurious retry/backoff on every call slow enough to approach
+the lease.
+
+Fix: the reaper's existing background thread (already running on a
+timer, already recovering OTHER workers' abandoned leases) now also
+heartbeats THIS worker's own in-flight job, tracked via a new
+self._current_job reference set/cleared only around the process_call
+call in handle_one. No new thread per job -- a single SentinelWorker
+only ever processes one job at a time, so one shared timer covers both
+jobs. reap_interval_s (default 5s) against the queue's default 30s lease
+already leaves several renewals of margin.
+
+4 new tests, including one that proves the danger was real before this
+fix (a slow claim with nothing heartbeating it really does get reclaimed
+by a concurrent reap sweep) and one proving the fix closes it (the same
+slow call survives via the reaper's heartbeat, one ledger row, no
+redelivery). Fixed one ruff finding in my own first draft of the danger
+test (unused claimed-job variable) before committing.
+
+Full suite 735 passed / 6 skipped, twice back-to-back. Ruff and bandit
+clean on both touched files.
+---
+ sentinel_os/sentinel_worker.py      | 73 +++++++++++++++++++++-
+ sentinel_os/test_sentinel_worker.py | 95 +++++++++++++++++++++++++++++
+ 2 files changed, 167 insertions(+), 1 deletion(-)
+
+diff --git a/sentinel_os/sentinel_worker.py b/sentinel_os/sentinel_worker.py
+index 5b2754f..bfe0f24 100644
+--- a/sentinel_os/sentinel_worker.py
++++ b/sentinel_os/sentinel_worker.py
+@@ -49,6 +49,24 @@ Reaping (crash recovery for OTHER workers' abandoned leases) runs on a
+ timer in a background thread per worker, not only on the worker's own
+ idle moments -- so recovery keeps happening even while every worker is
+ saturated with claimed jobs.
++
++HEARTBEAT (2026-07-31): queue_schema.py's heartbeat() -- lease renewal
++grafted in from the rebuild, per its own docstring the original v1 engine
++"had NO lease renewal -- a lease could only expire" -- existed but was
++never actually called anywhere in this file. A worker claimed a job with
++the queue's default 30-second lease, then called process_call (a real
++Claude API call, a Postgres write, and as of this session's own cohort-
++equity-escalation work, sometimes a real network call to the twin) with
++nothing renewing that lease while it ran. A slow call could outlive its
++lease and get reaped and redelivered to a different worker while the
++first worker was still legitimately working on it -- not a correctness
++bug (the ledger's sid dedup already makes redelivery safe, same as the
++crash-recovery path above; STALE from a lost heartbeat is handled the
++same fenced way ack/fail already are, per queue_schema.py's own Outcome
++docstring), but wasted work and a spurious retry/backoff. Fixed by having
++the SAME reaper timer also heartbeat whichever job this worker currently
++holds -- see start_reaper()'s docstring for why that reuses the existing
++thread instead of spawning a new one per job.
+ """
+ from __future__ import annotations
+ 
+@@ -101,6 +119,14 @@ class SentinelWorker:
+         self.idle_log_every = idle_log_every
+         self._stop = threading.Event()
+         self._reaper_thread: Optional[threading.Thread] = None
++        # The job (if any) this worker is currently inside process_call for
++        # -- set/cleared only by handle_one, on the claim/dispatch thread.
++        # Read by the reaper thread every tick to decide whether there's
++        # anything to heartbeat. A single-writer reference swap like this
++        # is safe to read from another thread without a lock under
++        # CPython's GIL -- the reader always sees a complete ClaimedJob or
++        # None, never a torn value.
++        self._current_job: Optional[ClaimedJob] = None
+         self.processed = 0
+         self.acked = 0
+         self.failed = 0
+@@ -109,7 +135,21 @@ class SentinelWorker:
+     def start_reaper(self) -> None:
+         """Background thread: recovers ANY worker's abandoned leases,
+         not just this one's, on a fixed timer independent of this
+-        worker's claim loop."""
++        worker's claim loop.
++
++        This same timer also heartbeats THIS worker's own in-flight job
++        (self._current_job), if it has one -- see module docstring's
++        HEARTBEAT section. Reusing the reaper's existing thread/timer
++        instead of spawning a dedicated heartbeat thread per job works
++        because a single SentinelWorker only ever processes one job at
++        a time (run_forever's claim loop is sequential, not concurrent)
++        -- there is never more than one job that could need a heartbeat
++        from this worker, so one shared timer covers both jobs with no
++        extra thread-per-job overhead. reap_interval_s (default 5s)
++        against the queue's default 30s lease leaves several renewals'
++        worth of margin before expiry; a caller that wants a shorter
++        lease should pass a proportionally shorter reap_interval_s too.
++        """
+ 
+         def _loop():
+             while not self._stop.is_set():
+@@ -127,6 +167,30 @@ class SentinelWorker:
+                         )
+                 except Exception:
+                     logger.exception("Reap sweep failed; will retry next interval")
++                job = self._current_job
++                if job is not None:
++                    try:
++                        outcome = self.queue.heartbeat(job)
++                        if outcome is not Outcome.OK:
++                            # STALE: already reaped/reclaimed by someone
++                            # else. GONE: already completed. Either way
++                            # this worker no longer owns it -- nothing to
++                            # do here, ack()/fail()'s own fence (and the
++                            # ledger's sid dedup if it gets reprocessed
++                            # elsewhere) already make this safe; logging
++                            # is purely so an operator can see it happened.
++                            logger.warning(
++                                "Heartbeat did not renew the in-flight "
++                                "job's lease -- it may already be "
++                                "reclaimed by another worker",
++                                extra={"extra_data": {
++                                    "job_id": job.id,
++                                    "worker_id": self.worker_id,
++                                    "outcome": outcome.value}},
++                            )
++                    except Exception:
++                        logger.exception(
++                            "Heartbeat call raised; will retry next interval")
+                 self._stop.wait(self.reap_interval_s)
+ 
+         self._reaper_thread = threading.Thread(
+@@ -147,6 +211,7 @@ class SentinelWorker:
+         call_sid = job.payload.get("sid", job.id)
+         log_ctx = {"job_id": job.id, "call_sid": call_sid,
+                   "attempt": job.attempt, "worker_id": self.worker_id}
++        self._current_job = job
+         try:
+             result = self.harness.process_call(job.payload)
+         except Exception as exc:
+@@ -162,6 +227,12 @@ class SentinelWorker:
+             )
+             self.failed += 1
+             return outcome
++        finally:
++            # Only this method (the claim/dispatch thread) ever writes
++            # _current_job -- clearing it here, in both the exception and
++            # normal-return paths, is what stops the reaper from
++            # heartbeating a job this worker is done with.
++            self._current_job = None
+ 
+         error = result.get("error")
+ 
+diff --git a/sentinel_os/test_sentinel_worker.py b/sentinel_os/test_sentinel_worker.py
+index 2f1355d..8f45596 100644
+--- a/sentinel_os/test_sentinel_worker.py
++++ b/sentinel_os/test_sentinel_worker.py
+@@ -266,3 +266,98 @@ def test_multiple_workers_share_one_queue_no_dup_no_loss(harness, redis_url):
+             if d["input_data"].get("call_sid") in sids]
+     assert len(rows) == n, "no duplicate ledger rows across concurrent workers"
+     assert q.stats()["counters"]["completed"] == n
++
++
++# ------------------------------------------------------------- heartbeat --
++# 2026-07-31: queue_schema.py's heartbeat() (lease renewal, grafted in from
++# the rebuild) existed but was never called from this file -- see module
++# docstring's HEARTBEAT section. These tests prove the fix both ways: the
++# danger is real without it, and the reaper-driven heartbeat closes it.
++
++def test_without_heartbeat_a_slow_call_would_get_reclaimed(harness, redis_url):
++    """Documents the bug this session fixed, not the fix itself: claim a
++    job with a short lease, run something slow (simulating a real
++    process_call) WITHOUT ever heartbeating, and confirm a concurrent
++    reap sweep -- exactly what start_reaper()'s timer does on every other
++    worker -- really does reclaim it out from under the still-working
++    claim. If this test ever starts failing, something upstream (Redis
++    lease semantics, reap_expired's own logic) changed, not this file."""
++    q = TransmissionQueue(name="hb-danger-" + uuid.uuid4().hex[:8], redis_url=redis_url)
++    q.enqueue(good_record("HBDANGER1"), job_id="HBDANGER1")
++    job = q.claim("slow-worker", lease_ms=300, wait_timeout_s=2.0)
++    assert job is not None
++
++    time.sleep(0.5)                       # no heartbeat sent -- lease lapses
++    report = q.reap_expired()
++    assert report["requeued"] == ["HBDANGER1"], (
++        "a lease with nothing renewing it must be reclaimed -- this is "
++        "the exact failure mode heartbeat wiring exists to prevent")
++
++
++def test_reaper_heartbeats_this_workers_in_flight_job(harness, redis_url):
++    """The fix: a slow process_call's lease survives, via the SAME reaper
++    timer, even though the lease alone is far too short to cover it."""
++    q = TransmissionQueue(name="hb-fix-" + uuid.uuid4().hex[:8], redis_url=redis_url)
++    w = SentinelWorker(harness, q, worker_id="hb-worker", reap_interval_s=0.1)
++
++    real_process_call = harness.process_call
++
++    def slow_process_call(payload):
++        time.sleep(0.8)                   # several times the 250ms lease
++        return real_process_call(payload)
++
++    harness.process_call = slow_process_call
++    try:
++        q.enqueue(good_record("HBFIX1"), job_id="HBFIX1")
++        job = q.claim(w.worker_id, lease_ms=250, wait_timeout_s=2.0)
++        w.start_reaper()
++        try:
++            outcome = w.handle_one(job)
++        finally:
++            w.stop()
++    finally:
++        harness.process_call = real_process_call
++
++    assert outcome is Outcome.OK
++    assert w.acked == 1
++    assert w.failed == 0
++    rows = [d for d in harness.ledger.get_decisions(limit=50)
++            if d["input_data"].get("call_sid") == "HBFIX1"]
++    assert len(rows) == 1, (
++        "exactly one ledger row -- if the lease had lapsed and the job "
++        "got redelivered to a second worker, either this worker's own "
++        "ack would come back non-OK, or there would be a second row"
++    )
++
++
++def test_current_job_is_cleared_after_handling_so_the_reaper_stops_touching_it(
++    harness, redis_url,
++):
++    """A completed job must not keep getting heartbeated forever -- once
++    handle_one returns, _current_job goes back to None."""
++    q = TransmissionQueue(name="hb-clear-" + uuid.uuid4().hex[:8], redis_url=redis_url)
++    w = SentinelWorker(harness, q, worker_id="hb-clear-worker")
++    q.enqueue(good_record("HBCLEAR1"), job_id="HBCLEAR1")
++    job = q.claim(w.worker_id, wait_timeout_s=2.0)
++
++    assert w._current_job is None          # nothing in flight yet
++    w.handle_one(job)
++    assert w._current_job is None          # cleared after handling
++
++
++def test_reaper_tolerates_no_in_flight_job(harness, redis_url):
++    """The common case: reaper ticks happen constantly while a worker is
++    idle between claims. Must not error just because there's nothing to
++    heartbeat."""
++    q = TransmissionQueue(name="hb-idle-" + uuid.uuid4().hex[:8], redis_url=redis_url)
++    w = SentinelWorker(harness, q, worker_id="hb-idle-worker", reap_interval_s=0.1)
++    w.start_reaper()
++    time.sleep(0.35)                       # several idle reaper ticks
++    w.stop()
++    # No exception escaping the background thread is the assertion --
++    # nothing here would raise visibly in the test process if the reaper
++    # thread itself died, so this is really just "the worker is still
++    # usable afterward":
++    q.enqueue(good_record("HBIDLE1"), job_id="HBIDLE1")
++    job = q.claim(w.worker_id, wait_timeout_s=2.0)
++    assert w.handle_one(job) is Outcome.OK
+-- 
+2.43.0
+

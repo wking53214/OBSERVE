@@ -1,0 +1,303 @@
+From d881bc036e96b085ce6ed34637eb60d0f0e071c6 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Thu, 23 Jul 2026 22:06:43 +0000
+Subject: [PATCH] CI: run test_twin_live.py too, via a native Postgres instead
+ of the Docker service
+
+The remaining honest gap flagged in the twin-live-infra commit: GitHub
+Actions' services: postgres: block is a separate Docker container reached
+only over TCP, and test_twin_live.py's whole design depends on peer auth --
+an OS user connecting to Postgres over a Unix domain socket the two share.
+There is no socket to share with a containerized service, so no amount of
+test-side fixing could ever make it pass against that setup.
+
+Fix: replace the services: postgres: container with a natively
+apt-installed Postgres on the runner itself (same package, same default
+pg_hba.conf 'local all all peer' rule this repo's own dev containers use),
+provisioned with the matching iceberg/iceberg superuser + database, then
+provision the twin suite's OS identities via the now-committed
+scripts/twin_ensure_services.sh before running the full suite with no
+exclusions at all. Redis keeps its existing Docker service container --
+it has no peer-auth-style identity boundary to preserve, so TCP is fine.
+
+Verification method and its limits, stated plainly: I cannot run a real
+GitHub Actions job from this environment, so this is not verified the way
+everything else delivered this session was. What I did instead: extracted
+every run: block from the actual workflow YAML and replayed them, in
+order, in a freshly-purged environment (Postgres, Redis, and all three OS
+identities removed entirely, not just reset) using a small local sudo
+stub that faithfully preserves flag semantics (-u, -E) so the commands
+executing are byte-identical to what the workflow specifies -- this is
+the same base OS GitHub's ubuntu-latest runner uses. Result: full suite,
+no exclusions, 383/383. One step ('Install dependencies', plain
+Usage:
+  pip <command> [options]
+
+Commands:
+  install                     Install packages.
+  download                    Download packages.
+  uninstall                   Uninstall packages.
+  freeze                      Output installed packages in requirements format.
+  inspect                     Inspect the python environment.
+  list                        List installed packages.
+  show                        Show information about installed packages.
+  check                       Verify installed packages have compatible dependencies.
+  config                      Manage local and global configuration.
+  search                      Search PyPI for packages.
+  cache                       Inspect and manage pip's wheel cache.
+  index                       Inspect information available from package indexes.
+  wheel                       Build wheels from your requirements.
+  hash                        Compute hashes of package archives.
+  completion                  A helper command used for command completion.
+  debug                       Show information useful for debugging.
+  help                        Show help for commands.
+
+General Options:
+  -h, --help                  Show help.
+  --debug                     Let unhandled exceptions propagate outside the
+                              main subroutine, instead of logging them to
+                              stderr.
+  --isolated                  Run pip in an isolated mode, ignoring
+                              environment variables and user configuration.
+  --require-virtualenv        Allow pip to only run in a virtual environment;
+                              exit with an error otherwise.
+  --python <python>           Run pip with the specified Python interpreter.
+  -v, --verbose               Give more output. Option is additive, and can be
+                              used up to 3 times.
+  -V, --version               Show version and exit.
+  -q, --quiet                 Give less output. Option is additive, and can be
+                              used up to 3 times (corresponding to WARNING,
+                              ERROR, and CRITICAL logging levels).
+  --log <path>                Path to a verbose appending log.
+  --no-input                  Disable prompting for input.
+  --keyring-provider <keyring_provider>
+                              Enable the credential lookup via the keyring
+                              library if user input is allowed. Specify which
+                              mechanism to use [disabled, import, subprocess].
+                              (default: disabled)
+  --proxy <proxy>             Specify a proxy in the form
+                              scheme://[user:passwd@]proxy.server:port.
+  --retries <retries>         Maximum number of retries each connection should
+                              attempt (default 5 times).
+  --timeout <sec>             Set the socket timeout (default 15 seconds).
+  --exists-action <action>    Default action when a path already exists:
+                              (s)witch, (i)gnore, (w)ipe, (b)ackup, (a)bort.
+  --trusted-host <hostname>   Mark this host or host:port pair as trusted,
+                              even though it does not have valid or any HTTPS.
+  --cert <path>               Path to PEM-encoded CA certificate bundle. If
+                              provided, overrides the default. See 'SSL
+                              Certificate Verification' in pip documentation
+                              for more information.
+  --client-cert <path>        Path to SSL client certificate, a single file
+                              containing the private key and the certificate
+                              in PEM format.
+  --cache-dir <dir>           Store the cache data in <dir>.
+  --no-cache-dir              Disable the cache.
+  --disable-pip-version-check
+                              Don't periodically check PyPI to determine
+                              whether a new version of pip is available for
+                              download. Implied with --no-index.
+  --no-color                  Suppress colored output.
+  --no-python-version-warning
+                              Silence deprecation warnings for upcoming
+                              unsupported Pythons.
+  --use-feature <feature>     Enable new functionality, that may be backward
+                              incompatible.
+  --use-deprecated <feature>  Enable deprecated functionality, that will be
+                              removed in the future.) fails standalone in THIS sandbox specifically
+because its system Python is externally-managed (Debian/apt Python, PEP
+668) -- that step is unmodified from the version already confirmed green
+on real GitHub Actions in an earlier session (buildlog: 'CONFIRMED GREEN
+on GitHub Actions, Run #31'), and GitHub's setup-python action installs a
+standalone Python build that doesn't carry that restriction, so this is a
+sandbox artifact, not a workflow bug -- but it means I could not verify
+that ONE step end-to-end myself, only reason about why it should still
+work. Recommend opening this branch as a PR against main (not pushing
+directly) so a real Actions run confirms it before merging -- the
+workflow only triggers on push to main or a PR targeting main, so a
+direct branch push alone won't even run it.
+
+Also updates the stale bandit comment: test_twin_live.py is no longer
+excluded from the security scan either (it wasn't run in this workflow
+before, so scanning it was reporting on dead code); the one new finding
+(a deliberate 0o777 chmod on a /tmp scratch dir needed for the
+cross-identity file exchange between sentinelsvc/twincustomer/
+twincustodian) is documented in the comment, not silently absorbed.
+
+Base: twin-live-infra (4659471), which is itself unmodified and safe to
+apply/merge independent of whether this commit is.
+---
+ .github/workflows/tests.yml | 129 +++++++++++++++++++++---------------
+ 1 file changed, 76 insertions(+), 53 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index f587f7b..c51cd59 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -14,25 +14,14 @@ jobs:
+         working-directory: sentinel_os
+ 
+     services:
+-      postgres:
+-        image: postgres:16
+-        env:
+-          POSTGRES_USER: iceberg
+-          POSTGRES_PASSWORD: iceberg
+-          POSTGRES_DB: iceberg
+-        ports:
+-          - 5432:5432
+-        options: >-
+-          --health-cmd pg_isready
+-          --health-interval 10s
+-          --health-timeout 5s
+-          --health-retries 5
+       # test_queue_identity_converter.py's ingress/worker pair expects an
+       # already-running Redis on the default port (REDIS_URL =
+       # "redis://localhost:6379/0"), unlike test_sentinel_worker.py /
+       # test_rate_limiter_v2.py, which spawn their own redis-server
+       # subprocess on custom ports and only need the binary (installed
+-      # below), not this service.
++      # below), not this service. Redis has no peer-auth-style identity
++      # boundary to preserve, so a Docker service container (TCP) is fine
++      # for it -- unlike Postgres, see below.
+       redis:
+         image: redis:7
+         ports:
+@@ -72,6 +61,49 @@ jobs:
+           sudo apt-get update -qq
+           sudo apt-get install -y -qq redis-server
+ 
++      - name: "Install native Postgres (replaces the old services/postgres container)"
++        run: |
++          # test_twin_live.py's whole design depends on real peer auth: an
++          # OS user (sentinelsvc/twincustomer/twincustodian) connecting to
++          # Postgres over a Unix domain socket, with Postgres mapping that
++          # OS identity directly to a same-named role -- no password, no
++          # network hop. A `services: postgres: image: postgres:16`
++          # Docker container is reachable only over TCP from this runner;
++          # there is no Unix socket to share with it, so peer auth cannot
++          # work against it no matter how the rest of this job is
++          # configured. Installing Postgres natively on the runner itself
++          # (same package, same default pg_hba.conf `local all all peer`
++          # rule) gives the real shared socket instead -- the same setup
++          # this repo's own dev containers use, verified locally to pass
++          # the full suite (383/383) twice back-to-back from a clean state.
++          sudo apt-get install -y -qq postgresql
++          sudo service postgresql start
++          # Match the iceberg/iceberg superuser + iceberg database every
++          # DSN in this repo already assumes (same identity the old
++          # Docker-container POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB
++          # env vars provided).
++          sudo -u postgres psql -c "CREATE ROLE iceberg WITH LOGIN SUPERUSER PASSWORD 'iceberg';"
++          sudo -u postgres psql -c "CREATE DATABASE iceberg OWNER iceberg;"
++          # Readiness check equivalent to the old service's --health-cmd
++          # pg_isready, since there's no Docker healthcheck for a native
++          # install to wait on.
++          for i in $(seq 1 30); do
++            pg_isready -h localhost -p 5432 && break
++            sleep 1
++          done
++
++      - name: Provision the twin live-suite's OS identities
++        run: |
++          # scripts/twin_ensure_services.sh is the same idempotent setup
++          # this repo now documents for local/dev-container use -- three
++          # OS identities (sentinelsvc, twincustomer, twincustodian), a
++          # matching peer-auth Postgres role per identity, and sentinelsvc
++          # granted into ledger_reader. Running it here means CI provisions
++          # test_twin_live.py's infrastructure the identical way a human
++          # would, rather than a CI-only special case.
++          sudo install -m 0755 scripts/twin_ensure_services.sh /usr/local/bin/twin_ensure_services
++          sudo /usr/local/bin/twin_ensure_services
++
+       - name: Generate ephemeral TLS cert for tests
+         run: |
+           mkdir -p certs
+@@ -81,36 +113,22 @@ jobs:
+ 
+       - name: Run test suite
+         run: |
+-          # Full repo, not just Tests/ -- 9 of 10 root-level test_*.py files
+-          # (twin_custody, sentinel_worker, production_harness_breakers,
+-          # rate_limiter_v2, queue_identity_converter, circuit_breaker,
+-          # queue_schema, api_server_v2, grafts) were previously never
+-          # collected or run by CI at all; now they are.
+-          #
+-          # test_twin_live.py is still explicitly excluded here, but for a
+-          # different and narrower reason than before: its OS-identity
+-          # (sentinelsvc/twincustomer/twincustodian), peer-auth Postgres
+-          # setup is now real, committed, reproducible code --
+-          # scripts/twin_ensure_services.sh -- and running it locally (or
+-          # in any environment with a NATIVE Postgres install sharing a
+-          # Unix socket with the test process) makes this suite pass
+-          # 383/383 alongside everything else, verified twice back-to-back
+-          # from a clean state. What it can't do is run against THIS
+-          # workflow's Postgres specifically: the `services: postgres:`
+-          # block above is a separate Docker container reached over TCP,
+-          # and peer auth requires the client and server to share the same
+-          # Unix domain socket -- there is no socket to share with a
+-          # containerized service. Closing this in CI would mean replacing
+-          # the services: postgres block with a natively apt-installed
+-          # Postgres on the runner for this job, which is a real (and
+-          # separable) infra change, not a one-line fix -- flagged as
+-          # follow-up, not attempted here.
+-          python -m pytest . --ignore=test_twin_live.py -v --tb=short
++          # Full repo, NO exclusions -- test_twin_live.py's infrastructure
++          # is now real, committed code (scripts/twin_ensure_services.sh,
++          # provisioned above) and this job now has a native Postgres to
++          # peer-auth against, so there is no remaining reason to exclude
++          # it here. Runs as root (test_twin_live.py's own documented
++          # assumption -- it uses `runuser` internally to drop into
++          # sentinelsvc/twincustomer/twincustodian for the OS-identity
++          # boundary tests; the pytest process itself needs root to do
++          # that) with PATH preserved so it finds the packages installed
++          # above.
++          sudo -E env "PATH=$PATH" python -m pytest . -v --tb=short
+ 
+       - name: Summarize results
+         if: always()
+         run: |
+-          python -m pytest . --ignore=test_twin_live.py -q --tb=no || true
++          sudo -E env "PATH=$PATH" python -m pytest . -q --tb=no || true
+ 
+       - name: Lint (ruff, report-only)
+         if: always()
+@@ -125,17 +143,22 @@ jobs:
+       - name: Security scan (bandit, report-only)
+         if: always()
+         run: |
+-          # Report-only for now: current findings include one High-severity
+-          # issue (test_queue_identity_converter.py:58, subprocess with
++          # Report-only for now. Two High-severity findings as of this
++          # commit: test_queue_identity_converter.py:58 (subprocess with
+           # shell=True and an interpolated f-string -- shell-injection-shaped,
+-          # test-only code but worth fixing) plus assorted Low/Medium items
+-          # (hardcoded test credentials, f-string SQL construction in a
+-          # test helper). This is exactly the class of issue that would
+-          # have auto-caught the TLS private key committed to git history
+-          # earlier -- bandit's B105/B106 hardcoded-secret checks flag that
+-          # pattern. Fix the current findings, then make this a real gate.
+-          # test_twin_live.py is still excluded here too (kept consistent
+-          # with the pytest exclusion above -- it's not run in this
+-          # workflow at all, so scanning it here would report on dead code
+-          # from this job's point of view).
+-          bandit -r . -x ./Tests,./test_twin_live.py || true
++          # test-only code but worth fixing), plus one new finding now that
++          # test_twin_live.py is scanned for the first time (it's no longer
++          # excluded, now that it actually runs in this job): a 0o777 chmod
++          # on a /tmp scratch directory (test_twin_live.py:308) -- deliberate
++          # and documented in the code (cross-user file exchange between the
++          # sentinelsvc/twincustomer/twincustodian identity-boundary tests
++          # needs a world-traversable dir, since pytest's default tmp_path
++          # lives under a 700-mode directory those other OS users can't
++          # enter), not a real vulnerability, but flagged here rather than
++          # silently narrowed around. Assorted Low/Medium items elsewhere
++          # (hardcoded test credentials, f-string SQL construction in a test
++          # helper) are the same class of issue that would have auto-caught
++          # the TLS private key committed to git history earlier -- bandit's
++          # B105/B106 hardcoded-secret checks flag that pattern. Fix the
++          # current findings, then make this a real gate.
++          bandit -r . -x ./Tests || true
+-- 
+2.43.0
+

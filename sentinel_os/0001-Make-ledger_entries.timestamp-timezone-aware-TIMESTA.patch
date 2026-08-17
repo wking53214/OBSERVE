@@ -1,0 +1,93 @@
+From 041959792730d471e23101dfd75dd0ec4c424663 Mon Sep 17 00:00:00 2001
+From: William King <wm@sentinel-os.local>
+Date: Sat, 1 Aug 2026 10:04:16 +0000
+Subject: [PATCH] Make ledger_entries.timestamp timezone-aware (TIMESTAMPTZ)
+
+The column was TIMESTAMP (no zone), DEFAULT CURRENT_TIMESTAMP -- which
+writes local wall-clock time under whatever timezone the Postgres
+session is configured with. Every caller that filters by time window
+(get_decisions_by_node_in_window, get_unscored_shadow_runs,
+recommendation_impact.py) builds its since/until window in real UTC.
+On any server/session not set to UTC, real rows land outside the
+window and the query silently returns nothing -- reproduced exactly
+against test_recommendation_impact_integration.py by setting the
+session timezone to America/New_York.
+
+Fresh installs now create the column as TIMESTAMPTZ directly. Existing
+installs get a guarded ALTER COLUMN TYPE migration (same
+lock-avoidance pattern as every other migration block in
+_initialize_schema: a plain information_schema read decides whether
+the ALTER is needed before taking the exclusive lock). The USING
+clause reinterprets already-written naive values under the current
+session timezone -- the same timezone CURRENT_TIMESTAMP used to write
+them -- so existing rows convert to the correct absolute instant
+rather than shifting.
+
+timestamp is never part of any hashed canonical_entry, so this cannot
+affect any decision's hash or break chain verification.
+
+Verified: fresh-install path and existing-table migration path both
+tested under a non-UTC session timezone; full suite re-run clean
+(752 passed/6 skipped, only pre-existing TLS-cert fixture failures
+unrelated to this change) with zero regressions.
+---
+ sentinel_os/governance/ledger_postgres.py | 36 ++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index 09ed429..8b34e3b 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -268,7 +268,7 @@ class PostgreSQLLedger:
+             cursor.execute("""
+                 CREATE TABLE IF NOT EXISTS ledger_entries (
+                     id SERIAL PRIMARY KEY,
+-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
++                    timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                     action_type VARCHAR(50),
+                     node VARCHAR(100),
+                     previous_value FLOAT,
+@@ -412,6 +412,40 @@ class PostgreSQLLedger:
+                         ON ledger_entries(shadow_run_hash)
+                         WHERE shadow_run_hash IS NOT NULL;
+                 """)
++            # Item 10: timestamp column made timezone-aware. The original
++            # TIMESTAMP (no zone) column stored CURRENT_TIMESTAMP under
++            # whatever timezone the Postgres session happened to be
++            # configured with. On any server/session not set to UTC, that
++            # meant rows were stamped in local wall-clock time while every
++            # caller (get_decisions_by_node_in_window, get_unscored_shadow_runs,
++            # recommendation_impact.py) builds its since/until window in real
++            # UTC -- a mismatch invisible until the window is narrow enough,
++            # or the offset large enough, that real rows fall outside it.
++            # That's what surfaced as get_decisions_by_node_in_window
++            # returning zero rows for windows that should have matched.
++            # A plain information_schema read (AccessShareLock only, same
++            # lock-avoidance posture as existing_columns above) so a normal
++            # boot against an already-migrated ledger never takes the
++            # ACCESS EXCLUSIVE lock ALTER COLUMN TYPE requires.
++            # USING reinterprets each existing naive value under the
++            # CURRENT session timezone -- the same timezone CURRENT_TIMESTAMP
++            # used to write it -- so already-written rows convert to the
++            # correct absolute instant rather than silently shifting.
++            # timestamp is never part of any hashed canonical_entry (see
++            # append_decision/append), so this migration cannot affect any
++            # decision's hash or break chain verification.
++            cursor.execute("""
++                SELECT data_type FROM information_schema.columns
++                WHERE table_schema = 'public' AND table_name = 'ledger_entries'
++                  AND column_name = 'timestamp';
++            """)
++            ts_row = cursor.fetchone()
++            if ts_row and ts_row[0] == "timestamp without time zone":
++                cursor.execute("""
++                    ALTER TABLE ledger_entries
++                        ALTER COLUMN timestamp TYPE TIMESTAMPTZ
++                        USING timestamp AT TIME ZONE current_setting('TIMEZONE');
++                """)
+             conn.commit()
+         finally:
+             self.pool.putconn(conn)
+-- 
+2.43.0
+

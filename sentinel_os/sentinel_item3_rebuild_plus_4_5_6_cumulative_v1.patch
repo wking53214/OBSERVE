@@ -1,0 +1,2508 @@
+diff --git a/sentinel_os/Tests/test_cassette_governs_every_decision.py b/sentinel_os/Tests/test_cassette_governs_every_decision.py
+new file mode 100644
+index 0000000..5ae72ea
+--- /dev/null
++++ b/sentinel_os/Tests/test_cassette_governs_every_decision.py
+@@ -0,0 +1,501 @@
++"""
++test_cassette_governs_every_decision -- Items #4-#6 proof suite.
++
++Item #3 proved the cassette DECLARES the policy. This suite proves the
++RUNNING SYSTEM OBEYS it, at decision time, on real calls, with the
++evidence in the ledger:
++
++- the cassette's governance_trigger decides which calls reach the
++  governor, and swapping the cassette changes the very next decision
++  (nothing is cached);
++- every ledger decision row carries the cassette version and the full
++  policy snapshot that governed it -- and a row without a cassette
++  version is REFUSED (tripwire);
++- friction is one rule (friction_core.compute_friction), one threshold
++  (the cassette's), on every path -- production harness, cassette
++  harness, simulator;
++- auto-discovery is locked down: an invalid cassette halts a default
++  load_all, is skipped only in explicit debug mode, and cannot touch an
++  explicit production_mode load of a different domain.
++
++PostgreSQL-backed tests run against a live iceberg/iceberg@localhost
++database and skip cleanly (with a stated reason) when it is absent.
++"""
++
++import os
++import sys
++import uuid
++
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++sys.path.insert(0, os.path.dirname(__file__))
++
++from cassette_schema import CassetteValidationError, validate_cassette
++from cassette_interface import CassetteConfig
++from cassette_loader import CassetteLoader
++from cassettes.ivr_cassette import IvrCassette
++from governance.friction_core import compute_friction
++from production_harness import IcebergProductionHarness
++
++from test_cassette_source_of_truth import (
++    ConfigurableCassette,
++    _good_params,
++    scan_for_hardcodes,
++)
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++# --------------------------------------------------------------------------
++# Infrastructure: live-PostgreSQL detection, harness configs, stub governor,
++# tunable cassettes with unique versions for ledger isolation.
++# --------------------------------------------------------------------------
++
++def _pg_available() -> bool:
++    try:
++        import psycopg2
++        conn = psycopg2.connect(
++            host="localhost", port=5432, dbname="iceberg",
++            user="iceberg", password="iceberg", connect_timeout=2,
++        )
++        conn.close()
++        return True
++    except Exception:
++        return False
++
++
++PG_AVAILABLE = _pg_available()
++requires_pg = pytest.mark.skipif(
++    not PG_AVAILABLE,
++    reason="live PostgreSQL (iceberg/iceberg@localhost:5432) not available",
++)
++
++PG_CONFIG = {
++    "postgres_host": "localhost", "postgres_port": 5432,
++    "postgres_db": "iceberg", "postgres_user": "iceberg",
++    "postgres_password": "iceberg",
++    "claude_api_key": None, "twilio_account_sid": None,
++}
++OFFLINE_CONFIG = {
++    "postgres_host": None, "claude_api_key": None, "twilio_account_sid": None,
++}
++
++
++class StubDecider:
++    """Recording governor stand-in: same contract as the Claude decider,
++    fully deterministic, no network."""
++
++    def __init__(self, safe: bool = True, reasoning: str = "stub: within declared bounds"):
++        self.safe = safe
++        self.reasoning = reasoning
++        self.calls = []
++
++    def safety_check(self, action, details):
++        self.calls.append((action, dict(details)))
++        return {
++            "safe": self.safe, "risk_level": "low",
++            "reasoning": self.reasoning,
++            "recommendations": [], "confidence": 0.99,
++        }
++
++
++class TunedCassette(ConfigurableCassette):
++    """A valid IVR-shaped cassette with tunable governance values and a
++    UNIQUE version string, so ledger rows written by one test are
++    queryable in isolation from every other test's rows."""
++
++    def __init__(self, trigger=None, long_wait=None, bounds=None, tag=""):
++        params = _good_params()
++        if trigger is not None:
++            params["governance_trigger"]["value"] = trigger
++        if long_wait is not None:
++            params["long_wait_threshold"]["value"] = float(long_wait)
++        if bounds is not None:
++            params["expected_wait_bounds"]["value"] = [float(bounds[0]), float(bounds[1])]
++        super().__init__(params)
++        self._version = f"{tag or 'tuned'}-{uuid.uuid4().hex[:10]}"
++
++    def get_config(self) -> CassetteConfig:
++        return CassetteConfig(
++            name="tuned-test", version=self._version,
++            description="behavioral conformance test cassette", domain="ivr",
++        )
++
++
++def _call(duration: int, sid: str = None):
++    """A completed billing call. With the parser's 0.1/0.5/0.4 split,
++    per-node waits are (0.1d, 0.5d, 0.4d) -- so against a 30s threshold:
++    duration 55 -> friction 0, 70 -> 1, 250 -> 2, 400 -> 3."""
++    return {
++        "sid": sid or f"CA{duration}{uuid.uuid4().hex[:6]}",
++        "status": "completed", "duration": duration,
++        "from": "+16125551111", "to": "+billing",
++    }
++
++
++# --------------------------------------------------------------------------
++# friction_core: the rule itself.
++# --------------------------------------------------------------------------
++
++def test_compute_friction_basic():
++    """One breaching wait is one friction event; a non-breaching wait
++    is none; the threshold is whatever the caller passes."""
++    assert compute_friction(150, 30) == 1
++    assert compute_friction(25, 30) == 0
++    assert compute_friction(500, 120) == 1
++    assert compute_friction(45, 120) == 0
++
++
++def test_compute_friction_boundary():
++    """Strictly greater-than: a wait EQUAL to the threshold is not
++    friction. The cassette declares the line; the rule stands exactly
++    on it."""
++    assert compute_friction(30, 30) == 0
++    assert compute_friction(30.0001, 30) == 1
++    assert compute_friction(0, 0) == 0
++
++
++# --------------------------------------------------------------------------
++# Item #5: the running system obeys the cassette at decision time.
++# --------------------------------------------------------------------------
++
++def test_swap_cassette_changes_next_decision():
++    """Decision-time read, not cached: swap the governing cassette and
++    the VERY NEXT call is judged under the new trigger."""
++    harness = IcebergProductionHarness(OFFLINE_CONFIG, cassette=TunedCassette(trigger=2))
++    stub = StubDecider()
++    harness.claude_decider = stub
++
++    r1 = harness.process_call(_call(250))     # friction 2 >= trigger 2
++    assert r1["governed"] is True and len(stub.calls) == 1
++
++    harness.swap_cassette(TunedCassette(trigger=3))
++    r2 = harness.process_call(_call(250))     # friction 2 < trigger 3
++    assert r2["governed"] is False and len(stub.calls) == 1
++
++    harness.swap_cassette(TunedCassette(trigger=1))
++    r3 = harness.process_call(_call(70))      # friction 1 >= trigger 1
++    assert r3["governed"] is True and len(stub.calls) == 2
++
++
++def test_friction_from_cassette_threshold():
++    """The measured friction count follows the cassette's threshold:
++    same call, swapped threshold, different count."""
++    harness = IcebergProductionHarness(OFFLINE_CONFIG, cassette=TunedCassette(long_wait=30))
++    r30 = harness.process_call(_call(250))    # waits 25/125/100 vs 30 -> 2
++    assert r30["friction_count"] == 2
++
++    harness.swap_cassette(TunedCassette(long_wait=110))
++    r110 = harness.process_call(_call(250))   # 125 > 110 only -> 1
++    assert r110["friction_count"] == 1
++
++    harness.swap_cassette(TunedCassette(long_wait=500))
++    r500 = harness.process_call(_call(250))   # nothing breaches -> 0
++    assert r500["friction_count"] == 0
++
++
++def test_bad_cassette_halts_harness():
++    """A cassette that cannot state its contract does not run: harness
++    construction raises with the missing parameter NAMED, and no
++    partially-initialized harness exists."""
++    params = _good_params()
++    del params["governance_trigger"]
++    with pytest.raises(CassetteValidationError) as exc:
++        IcebergProductionHarness(OFFLINE_CONFIG, cassette=ConfigurableCassette(params))
++    assert "governance_trigger" in str(exc.value)
++
++
++def test_friction_unified_across_paths():
++    """One rule, one threshold, every path: the raw rule, the production
++    harness, the cassette harness, and the simulator all agree.
++    (The Twilio ingest heuristic is Item #7 scope and deliberately not
++    on the governance path.)"""
++    # The rule itself.
++    assert compute_friction(150, 30) == 1
++    assert compute_friction(25, 30) == 0
++
++    # Production harness: measured count equals the rule applied to the
++    # parsed per-node waits.
++    harness = IcebergProductionHarness(OFFLINE_CONFIG, cassette=IvrCassette())
++    duration = 250
++    result = harness.process_call(_call(duration))
++    expected = sum(
++        compute_friction(w, 30.0)
++        for w in (duration * 0.1, duration * 0.5, duration * 0.4)
++    )
++    assert result["friction_count"] == expected == 2
++
++    # Cassette harness: same rule, cassette threshold, no fallback.
++    from cassette_harness import CassetteHarness
++    boombox = CassetteHarness("ivr", OFFLINE_CONFIG)
++    assert boombox._count_friction({"duration": 150}, []) == 1
++    assert boombox._count_friction({"duration": 25}, []) == 0
++
++    # Simulator: same rule, cassette threshold.
++    from iceberg_complete_simulator import IcebergCompleteSimulator
++    from Engines.simple_rl_trainer import SimpleRLTrainer
++    from observe_perceive_core import ObserveCore
++    from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
++    import tempfile
++    sim = IcebergCompleteSimulator(
++        LogRotationManager(LocalDiskAdapter(tempfile.mkdtemp()), seed="815"),
++        SimpleRLTrainer(state_dim=10, action_dim=2, lr=0.001),
++        ObserveCore(), IvrCassette(),
++    )
++    assert sim._wait_friction(150) == 1
++    assert sim._wait_friction(25) == 0
++
++
++# --------------------------------------------------------------------------
++# Item #5: the ledger is the proof surface.
++# --------------------------------------------------------------------------
++
++@requires_pg
++def test_governance_trigger_from_cassette_governs_decision():
++    """The cassette's trigger decides who reaches the governor, and the
++    ledger shows it: trigger 2 records a decision for a friction-2
++    call; trigger 3 records nothing for the same call."""
++    governed_cassette = TunedCassette(trigger=2, tag="gov")
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=governed_cassette)
++    harness.claude_decider = StubDecider()
++    r = harness.process_call(_call(250))
++    assert r["governed"] is True
++    rows = harness.ledger.get_decisions(cassette_version=r["cassette_version"])
++    assert len(rows) == 1
++
++    strict_cassette = TunedCassette(trigger=3, tag="strict")
++    harness.swap_cassette(strict_cassette)
++    r2 = harness.process_call(_call(250))
++    assert r2["governed"] is False
++    assert harness.ledger.get_decisions(cassette_version=r2["cassette_version"]) == []
++    harness.shutdown()
++
++
++@requires_pg
++def test_every_ledger_decision_has_cassette_version():
++    """No decision without its policy: every row carries a non-empty
++    cassette_version AND a non-empty policy snapshot."""
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=TunedCassette(trigger=1, tag="ver"))
++    harness.claude_decider = StubDecider()
++    r = harness.process_call(_call(70))
++    rows = harness.ledger.get_decisions(cassette_version=r["cassette_version"])
++    assert rows, "governed call must produce a decision row"
++    for row in rows:
++        assert row["cassette_version"], "decision row missing cassette_version"
++        assert row["policy_parameters"].get("parameters"), "decision row missing policy snapshot"
++        assert row["policy_parameters"].get("schema_version"), "snapshot missing schema_version"
++    harness.shutdown()
++
++
++@requires_pg
++def test_decision_without_cassette_version_rejected():
++    """The tripwire: the ledger REFUSES a decision that cannot name the
++    policy that governed it. ValueError, nothing written."""
++    from governance.ledger_postgres import PostgreSQLLedger, GovernanceDecisionRecord
++    ledger = PostgreSQLLedger(host="localhost", dbname="iceberg",
++                              user="iceberg", password="iceberg")
++    with pytest.raises(ValueError):
++        ledger.append_decision(GovernanceDecisionRecord(
++            action_type="governance_decision", node="billing_queue",
++            cassette_version="",  # the missing policy identity
++            input_data={"friction_count": 2},
++            policy_parameters={"schema_version": "1.0.0", "parameters": {"x": 1}},
++            reasoning="tripwire probe", output={"approved": True},
++        ))
++    with pytest.raises(ValueError):
++        ledger.append_decision(GovernanceDecisionRecord(
++            action_type="governance_decision", node="billing_queue",
++            cassette_version="ivr:probe:0.0.1",
++            input_data={"friction_count": 2},
++            policy_parameters={},  # the missing policy snapshot
++            reasoning="tripwire probe", output={"approved": True},
++        ))
++    ledger.close()
++
++
++@requires_pg
++def test_cassette_version_links_decision_to_policy():
++    """Two cassette versions, two decisions, and the ledger keeps them
++    straight: filtering by version returns exactly that version's
++    decision, carrying that version's trigger."""
++    v1 = TunedCassette(trigger=2, tag="link1")
++    v2 = TunedCassette(trigger=1, tag="link2")
++    v1_version = validate_cassette(v1).cassette_version
++    v2_version = validate_cassette(v2).cassette_version
++
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=v1)
++    harness.claude_decider = StubDecider()
++    harness.process_call(_call(250))          # friction 2 governed under v1
++    harness.swap_cassette(v2)
++    harness.process_call(_call(70))           # friction 1 governed under v2
++
++    rows_v1 = harness.ledger.get_decisions(cassette_version=v1_version)
++    rows_v2 = harness.ledger.get_decisions(cassette_version=v2_version)
++    assert len(rows_v1) == 1 and len(rows_v2) == 1
++    assert rows_v1[0]["input_data"]["governance_trigger"] == 2
++    assert rows_v2[0]["input_data"]["governance_trigger"] == 1
++    assert rows_v1[0]["policy_parameters"]["cassette_version"] == v1_version
++    assert rows_v2[0]["policy_parameters"]["cassette_version"] == v2_version
++    harness.shutdown()
++
++
++@requires_pg
++def test_policy_snapshot_matches_cassette():
++    """The snapshot in the ledger IS the cassette that governed: the
++    recorded long_wait_threshold equals the declared one, and changes
++    when the declaration changes."""
++    c45 = TunedCassette(trigger=1, long_wait=45, tag="snap45")
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=c45)
++    harness.claude_decider = StubDecider()
++    r = harness.process_call(_call(100))      # waits 10/50/40 vs 45 -> friction 1
++    rows = harness.ledger.get_decisions(cassette_version=r["cassette_version"])
++    snap = rows[0]["policy_parameters"]["parameters"]
++    assert snap["long_wait_threshold"]["value"] == 45.0
++
++    c60 = TunedCassette(trigger=1, long_wait=60, tag="snap60")
++    harness.swap_cassette(c60)
++    r2 = harness.process_call(_call(150))     # waits 15/75/60 vs 60 -> friction 1
++    rows2 = harness.ledger.get_decisions(cassette_version=r2["cassette_version"])
++    assert rows2[0]["policy_parameters"]["parameters"]["long_wait_threshold"]["value"] == 60.0
++    harness.shutdown()
++
++
++@requires_pg
++def test_healing_bounds_in_policy_snapshot():
++    """The cassette's healing band rides in every decision's snapshot,
++    so an auditor can see which clamp bounds were in force."""
++    cassette = TunedCassette(trigger=1, bounds=(7.5, 90.0), tag="bounds")
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=cassette)
++    harness.claude_decider = StubDecider()
++    r = harness.process_call(_call(70))
++    rows = harness.ledger.get_decisions(cassette_version=r["cassette_version"])
++    snap = rows[0]["policy_parameters"]["parameters"]["expected_wait_bounds"]
++    assert snap["value"] == [7.5, 90.0]
++    harness.shutdown()
++
++
++@requires_pg
++def test_real_call_end_to_end_proves_cassette_governs():
++    """The forensic walkthrough as one test: a real call parses,
++    measures friction under the cassette threshold, crosses the
++    cassette trigger, gets a governor verdict, and lands in the ledger
++    with version + snapshot + reasoning + output. Then the cassette is
++    swapped and the SAME call no longer reaches the governor -- and the
++    ledger shows nothing for the new version."""
++    cassette = TunedCassette(trigger=2, tag="e2e")
++    version = validate_cassette(cassette).cassette_version
++    harness = IcebergProductionHarness(PG_CONFIG, cassette=cassette)
++    stub = StubDecider(safe=True, reasoning="within declared bounds; reversible")
++    harness.claude_decider = stub
++
++    result = harness.process_call(_call(250))
++    assert result["friction_count"] == 2
++    assert result["governed"] is True
++    assert result["cassette_version"] == version
++
++    rows = harness.ledger.get_decisions(cassette_version=version)
++    assert len(rows) == 1
++    row = rows[0]
++    assert row["output"]["approved"] is True
++    assert row["reasoning"] == "within declared bounds; reversible"
++    assert row["input_data"]["friction_count"] == 2
++    assert row["input_data"]["governance_trigger"] == 2
++    assert row["policy_parameters"]["parameters"]["governance_trigger"]["value"] == 2
++
++    # Swap the policy: same behavior, different verdict, no new row.
++    strict = TunedCassette(trigger=5, tag="e2e-strict")
++    strict_version = validate_cassette(strict).cassette_version
++    harness.swap_cassette(strict)
++    result2 = harness.process_call(_call(250))
++    assert result2["governed"] is False
++    assert len(stub.calls) == 1, "governor must not run below the new trigger"
++    assert harness.ledger.get_decisions(cassette_version=strict_version) == []
++    harness.shutdown()
++
++
++# --------------------------------------------------------------------------
++# Item #4: auto-discovery lockdown.
++# --------------------------------------------------------------------------
++
++_BAD_CASSETTE_SOURCE = '''\
++"""A cassette missing its governance_trigger -- must NOT load."""
++import copy
++from cassette_interface import CassetteConfig
++from cassettes.ivr_cassette import IvrCassette
++
++class BadCassette(IvrCassette):
++    def get_config(self) -> CassetteConfig:
++        return CassetteConfig(name="bad", version="0.0.1",
++                              description="broken test cassette",
++                              domain="brokenco")
++
++    def get_governance_parameters(self):
++        params = copy.deepcopy(IvrCassette._GOVERNANCE_PARAMETERS)
++        del params["governance_trigger"]
++        return params
++'''
++
++
++def _make_cassette_dir(tmp_path):
++    """A cassette directory holding one valid cassette (the real IVR
++    file, copied verbatim) and one invalid one."""
++    src = os.path.join(REPO_ROOT, "cassettes", "ivr_cassette.py")
++    with open(src, "r", encoding="utf-8") as fh:
++        (tmp_path / "ivr_cassette.py").write_text(fh.read())
++    (tmp_path / "bad_cassette.py").write_text(_BAD_CASSETTE_SOURCE)
++    return str(tmp_path)
++
++
++def test_auto_discovery_fails_on_bad_cassette(tmp_path):
++    """Production posture (the default): ONE invalid cassette halts the
++    whole load. No partial registry ever exists."""
++    loader = CassetteLoader(_make_cassette_dir(tmp_path))
++    with pytest.raises(CassetteValidationError) as exc:
++        loader.load_all_cassettes()
++    assert "governance_trigger" in str(exc.value)
++
++
++def test_auto_discovery_skips_bad_in_debug_mode(tmp_path):
++    """Debug posture (explicit opt-in only): the invalid cassette is
++    skipped with a warning, the valid one loads."""
++    loader = CassetteLoader(_make_cassette_dir(tmp_path))
++    registry = loader.load_all_cassettes(fail_on_invalid=False)
++    keys = sorted(registry.cassettes)
++    assert keys == ["ivr:standard-ivr"], f"only the valid cassette may load, got {keys}"
++
++
++def test_production_mode_ignores_bad_neighbors(tmp_path):
++    """Explicit production load: production_mode('ivr') loads exactly
++    the named domain and never opens the broken neighbor file."""
++    cassette_dir = _make_cassette_dir(tmp_path)
++    cassette = CassetteLoader.production_mode("ivr", cassette_dir=cassette_dir)
++    assert cassette.get_config().domain == "ivr"
++    assert validate_cassette(cassette).float_value("long_wait_threshold") == 30.0
++
++
++# --------------------------------------------------------------------------
++# The backstop still bites: reintroduce a hardcode, the scanner names it.
++# --------------------------------------------------------------------------
++
++def test_hardcode_reintroduction_fails_scanner():
++    """Write a governance-path-shaped file containing `if duration > 30:`
++    and prove the scanner reports it with file and line."""
++    probe_rel = "_tripwire_probe.py"
++    probe_abs = os.path.join(REPO_ROOT, probe_rel)
++    try:
++        with open(probe_abs, "w", encoding="utf-8") as fh:
++            fh.write("def check(duration):\n")
++            fh.write("    if duration > 30:\n")
++            fh.write("        return 1\n")
++            fh.write("    return 0\n")
++        violations = scan_for_hardcodes(REPO_ROOT, extra_files=[probe_rel])
++        probe_hits = [v for v in violations if v[0] == probe_rel]
++        assert probe_hits, "scanner must catch the reintroduced literal"
++        rel, lineno, snippet, reason = probe_hits[0]
++        assert lineno == 2 and "> 30" in snippet and reason
++        # And nothing ELSE in the real codebase tripped.
++        assert [v for v in violations if v[0] != probe_rel] == []
++    finally:
++        if os.path.exists(probe_abs):
++            os.remove(probe_abs)
+diff --git a/sentinel_os/Tests/test_cassette_source_of_truth.py b/sentinel_os/Tests/test_cassette_source_of_truth.py
+new file mode 100644
+index 0000000..e2bd4df
+--- /dev/null
++++ b/sentinel_os/Tests/test_cassette_source_of_truth.py
+@@ -0,0 +1,350 @@
++"""
++test_cassette_source_of_truth -- Item #3 proof suite.
++
++Proves the cassette is the single, typed, versioned source of truth for
++governance parameters: the schema is declared and enforced fail-loud;
++valid cassettes validate and invalid ones are rejected with the FULL
++violation list; typed accessors refuse type confusion; every load path
++(loader, registry, core injection) validates; the harness and simulator
++read the cassette rather than any literal; and -- the backstop -- a
++scanner walks the governance-path files and fails if any banned literal
++has crept back in.
++"""
++
++import os
++import re
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++
++from cassette_schema import (
++    SCHEMA_VERSION,
++    CassetteValidationError,
++    GovernanceParameters,
++    validate_cassette,
++    validate_governance_parameters,
++    cassette_version_of,
++)
++from cassette_interface import Cassette, CassetteConfig, QualityResult, CassetteRegistry
++from cassette_loader import CassetteLoader
++from cassettes.ivr_cassette import IvrCassette
++from cassettes.banking_cassette import BankingCassette
++from sentinel_core import SentinelCore
++
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++# --------------------------------------------------------------------------
++# A deliberately broken cassette: valid Cassette subclass, invalid schema.
++# Each instance can omit or corrupt exactly one governance parameter so
++# individual tests can target one violation.
++# --------------------------------------------------------------------------
++class ConfigurableCassette(IvrCassette):
++    """IVR cassette whose governance declaration can be mutated per-test."""
++
++    def __init__(self, params):
++        self._params = params
++
++    def get_config(self) -> CassetteConfig:
++        return CassetteConfig(
++            name="configurable-test", version="9.9.9",
++            description="test cassette", domain="ivr",
++        )
++
++    def get_governance_parameters(self):
++        import copy
++        return copy.deepcopy(self._params)
++
++
++def _good_params():
++    import copy
++    return copy.deepcopy(IvrCassette._GOVERNANCE_PARAMETERS)
++
++
++def test_schema_version_declared():
++    """The schema announces its own version, and it rides in snapshots."""
++    assert SCHEMA_VERSION
++    params = validate_cassette(IvrCassette())
++    assert params.snapshot()["schema_version"] == SCHEMA_VERSION
++
++
++def test_ivr_cassette_passes_validation():
++    """The reference IVR cassette validates and reads back its declared
++    values (30.0 / 2 / (4, 120))."""
++    params = validate_cassette(IvrCassette())
++    assert params.cassette_version == "ivr:standard-ivr:1.1.0"
++    assert params.float_value("long_wait_threshold") == 30.0
++    assert params.int_value("governance_trigger") == 2
++    assert params.range_value("expected_wait_bounds") == (4.0, 120.0)
++
++
++def test_banking_cassette_passes_validation():
++    """Banking validates with its OWN different values -- two domains,
++    two policies, one schema."""
++    params = validate_cassette(BankingCassette())
++    assert params.cassette_version == "banking:banking-v1:1.1.0"
++    assert params.float_value("long_wait_threshold") == 45.0
++    assert params.range_value("expected_wait_bounds") == (15.0, 300.0)
++
++
++def test_missing_required_parameter_is_named():
++    """Dropping a required parameter fails, and the error names it."""
++    params = _good_params()
++    del params["governance_trigger"]
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(ConfigurableCassette(params))
++    assert any("governance_trigger" in v for v in exc.value.violations)
++
++
++def test_out_of_range_value_fails():
++    """A declared value outside its own [min, max] is a violation."""
++    params = _good_params()
++    params["long_wait_threshold"]["value"] = 9999.0  # max is 600
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(ConfigurableCassette(params))
++    assert any("outside declared range" in v for v in exc.value.violations)
++
++
++def test_contradictory_range_fails():
++    """A range whose lo >= hi is a contradiction and is rejected."""
++    params = _good_params()
++    params["expected_wait_bounds"]["value"] = [120.0, 4.0]  # inverted
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(ConfigurableCassette(params))
++    assert any("range lo" in v and "hi" in v for v in exc.value.violations)
++
++
++def test_missing_metadata_slot_fails():
++    """A parameter missing a forensic metadata slot fails validation."""
++    params = _good_params()
++    del params["long_wait_threshold"]["metadata"]["justification"]
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(ConfigurableCassette(params))
++    assert any("metadata slot" in v and "justification" in v for v in exc.value.violations)
++
++
++def test_all_violations_reported_together():
++    """Multiple faults in one cassette are reported in ONE error, not
++    one-at-a-time -- an auditor sees the whole picture at once."""
++    params = _good_params()
++    del params["governance_trigger"]                      # violation 1
++    params["long_wait_threshold"]["value"] = 9999.0        # violation 2
++    params["expected_wait_bounds"]["value"] = [120.0, 4.0] # violation 3
++    with pytest.raises(CassetteValidationError) as exc:
++        validate_cassette(ConfigurableCassette(params))
++    assert len(exc.value.violations) >= 3
++
++
++def test_typed_accessors_enforce_types():
++    """Asking for the wrong type is a contract violation, not a silent
++    coercion."""
++    params = validate_cassette(IvrCassette())
++    with pytest.raises(TypeError):
++        params.int_value("long_wait_threshold")   # it's a float
++    with pytest.raises(TypeError):
++        params.float_value("governance_trigger")  # it's an int
++    with pytest.raises(TypeError):
++        params.float_value("expected_wait_bounds")  # it's a range
++
++
++def test_registry_validates_fail_loud():
++    """Registering an invalid cassette raises CassetteValidationError --
++    registration is a load path and admits nothing unvalidated."""
++    params = _good_params()
++    del params["expected_wait_bounds"]
++    registry = CassetteRegistry()
++    with pytest.raises(CassetteValidationError):
++        registry.register(ConfigurableCassette(params))
++
++
++def test_sentinel_core_rejects_invalid_cassette():
++    """Injecting an invalid cassette straight into the core still gets
++    validated -- injection is a load path too."""
++    params = _good_params()
++    params["long_wait_threshold"]["value"] = -5.0  # must be > 0
++    with pytest.raises(CassetteValidationError):
++        SentinelCore(ConfigurableCassette(params))
++
++
++def test_harness_friction_threshold_from_cassette():
++    """The production harness reads its friction threshold from the
++    cassette AT DECISION TIME: swap the cassette, and the very next
++    call's friction observation changes.
++
++    Observed through emotion: long-wait friction events feed the
++    emotional model, so a threshold no wait can breach must leave
++    frustration at exactly 0.0."""
++    from production_harness import IcebergProductionHarness
++
++    harness = IcebergProductionHarness(
++        {"postgres_host": None, "claude_api_key": None, "twilio_account_sid": None}
++    )
++    call = {"sid": "CAX", "status": "completed", "duration": 400,
++            "from": "+16125551111", "to": "+billing"}
++    r_default = harness.process_call(call)
++    assert r_default["emotion_frustration"] > 0.0, \
++        "with the declared 30s threshold, a 400s call must show wait friction"
++
++    # Swap to a cassette declaring a 500s threshold: no wait in a 400s
++    # call can breach it, so friction-driven frustration must be zero.
++    params = _good_params()
++    params["long_wait_threshold"]["value"] = 500.0
++    harness.swap_cassette(ConfigurableCassette(params))
++    r_swapped = harness.process_call(
++        {"sid": "CAX2", "status": "completed", "duration": 400,
++         "from": "+16125552222", "to": "+billing"})
++    assert r_swapped["emotion_frustration"] == 0.0
++    assert r_swapped["cassette_version"] == "ivr:configurable-test:9.9.9"
++
++
++def test_governance_trigger_inclusive_semantics():
++    """friction_count == trigger IS governed (inclusive >=). Proven at
++    the harness with a recording stub decider so no network is needed."""
++    from production_harness import IcebergProductionHarness
++
++    class StubDecider:
++        def __init__(self):
++            self.calls = 0
++        def safety_check(self, action, details):
++            self.calls += 1
++            return {"safe": True, "risk_level": "low", "reasoning": "stub",
++                    "recommendations": [], "confidence": 0.99}
++
++    harness = IcebergProductionHarness(
++        {"postgres_host": None, "claude_api_key": None, "twilio_account_sid": None}
++    )
++    stub = StubDecider()
++    harness.claude_decider = stub
++
++    # A quiet call stays under the trigger: not governed.
++    r_quiet = harness.process_call(
++        {"sid": "CAY0", "status": "completed", "duration": 55,
++         "from": "+16125551111", "to": "+billing"})
++    assert r_quiet["governed"] is False
++    assert stub.calls == 0
++
++    # A 400s call reaches friction_count == trigger territory:
++    # inclusive >= means it IS governed and the governor runs.
++    r_hot = harness.process_call(
++        {"sid": "CAY1", "status": "completed", "duration": 400,
++         "from": "+16125551111", "to": "+billing"})
++    assert r_hot["governed"] is True
++    assert r_hot["friction_count"] >= r_hot["governance_trigger"]
++    assert stub.calls == 1, "friction_count >= trigger must be governed (inclusive)"
++
++
++def test_healing_bounds_from_cassette_in_simulator():
++    """The simulator's heal band is the cassette's expected_wait_bounds,
++    read through validation -- not a literal in the simulator."""
++    from iceberg_complete_simulator import IcebergCompleteSimulator
++    from Engines.simple_rl_trainer import SimpleRLTrainer
++    from observe_perceive_core import ObserveCore
++    from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
++    import tempfile
++
++    sim = IcebergCompleteSimulator(
++        LogRotationManager(LocalDiskAdapter(tempfile.mkdtemp()), seed="815"),
++        SimpleRLTrainer(state_dim=10, action_dim=2, lr=0.001),
++        ObserveCore(),
++        IvrCassette(),
++    )
++    band = sim._heal_band()
++    assert (band.lo, band.hi) == (4.0, 120.0)
++
++
++# --------------------------------------------------------------------------
++# The scanner: a backstop against literal reintroduction. Importable so
++# the Item #4-6 suite can reuse it to prove a fresh hardcode is caught.
++# --------------------------------------------------------------------------
++
++# Files on the governance path where a bare threshold/bound literal would
++# be a second source of truth competing with the cassette.
++_GOVERNANCE_PATH_FILES = {
++    "production_harness.py",
++    "cassette_harness.py",
++    "sentinel_core.py",
++    "iceberg_complete_simulator.py",
++    "load_test.py",
++    "run_adaptive.py",
++    "claude_governance_api.py",
++    os.path.join("governance", "self_heal_v1.py"),
++    os.path.join("governance", "recommend_v1.py"),
++}
++
++# Whole files exempt from the scan, each for a stated reason.
++_EXEMPT_FILES = {
++    # Cassettes ARE the declaration site -- literals belong here.
++    os.path.join("cassettes", "ivr_cassette.py"),
++    os.path.join("cassettes", "banking_cassette.py"),
++    os.path.join("cassettes", "__init__.py"),
++    # The proof suites legitimately name numbers to assert on.
++    os.path.join("Tests", "test_cassette_source_of_truth.py"),
++    os.path.join("Tests", "test_cassette_governs_every_decision.py"),
++    # friction_core holds the RULE but no threshold of its own.
++    os.path.join("governance", "friction_core.py"),
++    # drift_core_v1 is sealed v1 (statistical policy), flagged for v2.
++    os.path.join("governance", "drift_core_v1.py"),
++    # Item #7 scope: ingest heuristics unify with friction_core when the
++    # ingest path joins the production flow.
++    "twilio_log_ingestion.py",
++    # Item #7 scope: observe_perceive_core long_wait threshold.
++    "observe_perceive_core.py",
++}
++
++# (compiled pattern, human description). Applied to every governance-path
++# file except exemptions.
++_BANNED_PATTERNS = [
++    (re.compile(r"HealBand\(\s*(?:lo\s*=\s*)?\d"), "HealBand(...) built from a numeric literal"),
++    (re.compile(r"friction_count\s*>\s*[1-9]"), "friction_count gated on a numeric literal"),
++    (re.compile(r"friction_count\s*>=\s*[1-9]"), "friction_count gated on a numeric literal (inclusive)"),
++    (re.compile(r'["\']band_(?:lo|hi)["\']\s*:\s*\d'), "band_lo/band_hi literal in a dict"),
++    (re.compile(r'\.get\(\s*["\']long_wait_threshold["\']\s*,\s*\d'), "long_wait_threshold .get() with a literal fallback"),
++    (re.compile(r"\blo_bound\s*=\s*\d|\bhi_bound\s*=\s*\d"), "lo_bound/hi_bound literal assignment"),
++    (re.compile(r"\bgovernance_trigger\s*=\s*\d"), "governance_trigger literal assignment"),
++    (re.compile(r">\s*30(?:\.0)?\b"), "bare > 30 wait-threshold literal"),
++]
++
++
++def scan_for_hardcodes(root: str = REPO_ROOT, extra_files=None):
++    """Walk the governance-path files and return a list of
++    (file, line_number, snippet, reason) for every banned literal found.
++
++    Only the governance-path file set is scanned, and exempt files are
++    skipped -- the goal is "no second source of truth on the paths that
++    make decisions", not "no number anywhere". A module that joins the
++    governance path joins _GOVERNANCE_PATH_FILES in the same change.
++    extra_files lets a caller put additional paths under the same scan
++    (used by the reintroduction test to prove detection works).
++    """
++    violations = []
++    for rel in sorted(set(_GOVERNANCE_PATH_FILES) | set(extra_files or [])):
++        if rel in _EXEMPT_FILES:
++            continue
++        path = os.path.join(root, rel)
++        if not os.path.exists(path):
++            continue
++        with open(path, "r", encoding="utf-8") as fh:
++            for lineno, line in enumerate(fh, start=1):
++                code = line.split("#", 1)[0]  # ignore comments
++                if not code.strip():
++                    continue
++                for pattern, reason in _BANNED_PATTERNS:
++                    if pattern.search(code):
++                        violations.append((rel, lineno, line.rstrip(), reason))
++    return violations
++
++
++def test_no_governance_hardcodes_in_codebase():
++    """The backstop: no banned literal on any governance-path file.
++
++    If this fails, a threshold or bound has been written as a literal
++    somewhere it would compete with the cassette -- move it into the
++    cassette declaration instead.
++    """
++    violations = scan_for_hardcodes(REPO_ROOT)
++    assert not violations, "Governance hardcodes reintroduced:\n" + "\n".join(
++        f"  {f}:{ln}  [{reason}]  {snippet.strip()}" for f, ln, snippet, reason in violations
++    )
+diff --git a/sentinel_os/Tests/test_critical_integration.py b/sentinel_os/Tests/test_critical_integration.py
+index 533013f..cf1ec0a 100644
+--- a/sentinel_os/Tests/test_critical_integration.py
++++ b/sentinel_os/Tests/test_critical_integration.py
+@@ -2,6 +2,8 @@ import sys
+ import os
+ import tempfile
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ 
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, DriftSignal
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+@@ -62,7 +64,8 @@ def test_clamping_boundaries():
+     tmp = tempfile.mkdtemp()
+     ledger = LogRotationManager(LocalDiskAdapter(tmp), seed="815")
+     store = InMemoryParameterStore()
+-    band = HealBand(lo=4.0, hi=120.0)
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo=lo, hi=hi)
+     
+     signal = DriftSignal(
+         node="test", baseline_value=20.0, current_value=500.0,
+@@ -71,8 +74,11 @@ def test_clamping_boundaries():
+     
+     records = heal([signal], store, band, ledger, kind="expected_wait")
+     
+-    assert records[0].applied == 120.0, f"Should clamp to 120, got {records[0].applied}"
+-    print(f"  ✓ PASSED - Extreme value (500s) clamped to ceiling (120s)")
++    # Clamp ceiling is the cassette's expected_wait_bounds hi -- assert
++    # against the cassette, not a literal, so this test tracks the
++    # source of truth instead of duplicating it.
++    assert records[0].applied == hi, f"Should clamp to {hi}, got {records[0].applied}"
++    print(f"  ✓ PASSED - Extreme value (500s) clamped to ceiling ({hi}s)")
+     return True
+ 
+ def main():
+diff --git a/sentinel_os/Tests/test_e2e_adaptive.py b/sentinel_os/Tests/test_e2e_adaptive.py
+index 4d84b79..ecf22f7 100644
+--- a/sentinel_os/Tests/test_e2e_adaptive.py
++++ b/sentinel_os/Tests/test_e2e_adaptive.py
+@@ -3,6 +3,8 @@ import os
+ import random
+ import tempfile
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ 
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+@@ -38,7 +40,8 @@ def test_end_to_end_adaptive_pipeline():
+     
+     # 4. Self-heal
+     store = InMemoryParameterStore()
+-    band = HealBand(lo=4.0, hi=120.0)
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo=lo, hi=hi)
+     records = heal(breached, store, band, ledger, kind="expected_wait")
+     
+     print(f"\nHealed {len(records)} parameter(s):")
+diff --git a/sentinel_os/Tests/test_rl_governance_integration.py b/sentinel_os/Tests/test_rl_governance_integration.py
+index 1f62e08..8c3be7e 100644
+--- a/sentinel_os/Tests/test_rl_governance_integration.py
++++ b/sentinel_os/Tests/test_rl_governance_integration.py
+@@ -4,6 +4,8 @@ import tempfile
+ import array_ops as np
+ np.random.seed(42)
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ 
+ from Engines.simple_rl_trainer import SimpleRLTrainer
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+@@ -22,7 +24,8 @@ def test_complete_rl_governance_integration():
+     baseline_holds = {"fast_queue": [20.0]*50, "slow_queue": [50.0]*50}
+     baseline = baseline_from_holds(baseline_holds, DriftPolicy())
+     store = InMemoryParameterStore()
+-    band = HealBand(4.0, 120.0)
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo, hi)
+     
+     print("\n[BATCH 1] Initial routing (before training)")
+     print("  RL: Training on mixed quality calls")
+diff --git a/sentinel_os/Tests/test_twilio_to_adaptive.py b/sentinel_os/Tests/test_twilio_to_adaptive.py
+index 8a45046..aa88ff8 100644
+--- a/sentinel_os/Tests/test_twilio_to_adaptive.py
++++ b/sentinel_os/Tests/test_twilio_to_adaptive.py
+@@ -2,6 +2,8 @@ import sys
+ import os
+ import tempfile
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "observe"))
+ 
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+@@ -43,7 +45,8 @@ def test_twilio_to_adaptive_simplified():
+     
+     print("\n=== Self-heal with clamping ===")
+     store = InMemoryParameterStore()
+-    band = HealBand(lo=4.0, hi=120.0)
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo=lo, hi=hi)
+     records = heal(breached, store, band, ledger, kind="expected_wait")
+     
+     print(f"Applied {len(records)} heal(s):")
+diff --git a/sentinel_os/adaptive_config.py b/sentinel_os/adaptive_config.py
+index 019ae05..a0854b8 100644
+--- a/sentinel_os/adaptive_config.py
++++ b/sentinel_os/adaptive_config.py
+@@ -14,8 +14,9 @@ CONFIG = {
+     },
+     "self_heal": {
+         "kind": "expected_wait",
+-        "band_lo": 4.0,
+-        "band_hi": 120.0,
++        # Heal band is NOT configured here -- it comes from the governing
++        # cassette (expected_wait_bounds). A band literal in this file
++        # would be a second source of truth competing with the cassette.
+     },
+     "data": {
+         "baseline_seed": 815,
+diff --git a/sentinel_os/cassette_harness.py b/sentinel_os/cassette_harness.py
+index 2a366c3..7e566cc 100644
+--- a/sentinel_os/cassette_harness.py
++++ b/sentinel_os/cassette_harness.py
+@@ -8,6 +8,8 @@ import os
+ from typing import Dict, Optional
+ from cassette_loader import CassetteLoader
+ from cassette_interface import Cassette
++from cassette_schema import validate_cassette
++from governance.friction_core import compute_friction
+ from resilient_harness import ResilientHarness
+ from operational_resilience import setup_logging
+ 
+@@ -162,17 +164,15 @@ class CassetteHarness:
+         ]
+     
+     def _count_friction(self, call_data: Dict, journey: list) -> int:
+-        """Count friction events"""
+-        friction = 0
+-        duration = int(call_data.get("duration", 0))
+-        
+-        thresholds = self.cassette.get_friction_thresholds()
+-        long_wait = thresholds.get("long_wait_threshold", 30)
+-        
+-        if duration > long_wait:
+-            friction += 1
+-        
+-        return friction
++        """Count friction events through the unified rule.
++
++        The threshold is the cassette's declared long_wait_threshold --
++        read via schema validation, with NO literal fallback. A cassette
++        that cannot state its threshold is a halt, not a silent 30.
++        """
++        duration = float(call_data.get("duration", 0))
++        long_wait = validate_cassette(self.cassette).float_value("long_wait_threshold")
++        return compute_friction(duration, long_wait)
+     
+     def shutdown(self):
+         """Cleanup"""
+diff --git a/sentinel_os/cassette_interface.py b/sentinel_os/cassette_interface.py
+index 3f23b88..1d970fa 100644
+--- a/sentinel_os/cassette_interface.py
++++ b/sentinel_os/cassette_interface.py
+@@ -70,6 +70,17 @@ class Cassette(ABC):
+     def get_friction_thresholds(self) -> Dict[str, float]:
+         """Domain-specific friction detection thresholds"""
+         pass
++
++    @abstractmethod
++    def get_governance_parameters(self) -> Dict[str, Dict]:
++        """The typed governance declaration this domain runs under.
++
++        Shape and required parameters are defined by cassette_schema
++        (SCHEMA_VERSION). Every value the engine reads on the
++        governance path comes from here -- validated on load, read at
++        decision time. See cassette_schema.validate_cassette.
++        """
++        pass
+     
+     @abstractmethod
+     def get_healing_bounds(self) -> Dict[str, tuple]:
+@@ -93,13 +104,20 @@ class CassetteRegistry:
+         self.cassettes = {}
+     
+     def register(self, cassette: Cassette):
+-        """Register a cassette"""
++        """Register a cassette (fail-loud).
++
++        Full schema validation runs here, not just the cassette's own
++        self-check: an invalid cassette raises CassetteValidationError
++        carrying the complete violation list. Registration is a load
++        path, and no load path admits an unvalidated cassette.
++        """
++        from cassette_schema import validate_cassette
++
+         config = cassette.get_config()
+         key = f"{config.domain}:{config.name}"
+-        
+-        if not cassette.validate():
+-            raise Exception(f"Cassette {key} validation failed")
+-        
++
++        validate_cassette(cassette)
++
+         self.cassettes[key] = cassette
+     
+     def get(self, domain: str) -> Cassette:
+diff --git a/sentinel_os/cassette_loader.py b/sentinel_os/cassette_loader.py
+index 5b1cc23..321eead 100644
+--- a/sentinel_os/cassette_loader.py
++++ b/sentinel_os/cassette_loader.py
+@@ -9,6 +9,7 @@ import sys
+ from pathlib import Path
+ from typing import Dict, Optional
+ from cassette_interface import Cassette, CassetteRegistry
++from cassette_schema import CassetteValidationError, validate_cassette
+ 
+ class CassetteLoader:
+     """Load cassettes from files"""
+@@ -44,27 +45,62 @@ class CassetteLoader:
+             # Get class and instantiate
+             class_obj = getattr(module, class_name)
+             cassette = class_obj()
+-            
+-            return cassette
+         except Exception as e:
+             raise ImportError(f"Failed to load cassette {cassette_name}: {e}")
++
++        # Fail-loud schema validation on the load path itself. A
++        # cassette that cannot state its governance contract does not
++        # load -- there is no partial load and no fallback default.
++        validate_cassette(cassette)
++
++        return cassette
+     
+-    def load_all_cassettes(self) -> CassetteRegistry:
+-        """Auto-discover and load all cassettes"""
+-        
++    def load_all_cassettes(self, fail_on_invalid: bool = True) -> CassetteRegistry:
++        """Auto-discover and load all cassettes.
++
++        fail_on_invalid=True (the default) is the ONLY production
++        posture: the first invalid cassette raises and nothing runs.
++        Auto-discovery that silently skips a broken cassette turns a
++        policy failure into a print statement -- the system would keep
++        serving calls under whatever subset happened to load.
++
++        fail_on_invalid=False is for debug/admin tooling only (cassette
++        inventory, migration triage), where seeing the survivors next
++        to the skip warnings is the point.
++        """
++
+         cassette_files = self.cassette_dir.glob("*_cassette.py")
+-        
++
+         for cassette_file in cassette_files:
+             cassette_name = cassette_file.stem.replace("_cassette", "")
+-            
++
+             try:
+                 cassette = self.load_cassette(cassette_name)
+                 self.registry.register(cassette)
+                 print(f"✓ Loaded cassette: {cassette_name}")
++            except CassetteValidationError:
++                if fail_on_invalid:
++                    raise
++                print(f"⚠ Skipped invalid cassette: {cassette_name}")
+             except Exception as e:
+-                print(f"✗ Failed to load cassette {cassette_name}: {e}")
+-        
++                if fail_on_invalid:
++                    raise
++                print(f"⚠ Skipped unloadable cassette: {cassette_name} ({e})")
++
+         return self.registry
++
++    @classmethod
++    def production_mode(cls, domain: str, cassette_dir: str = "./cassettes") -> Cassette:
++        """Production entry point: load EXACTLY the named domain's
++        cassette -- explicit selection, full fail-loud validation, and
++        NO directory glob. A broken or malicious neighbor file in the
++        cassette directory cannot break, delay, or hijack this load,
++        because it is never opened.
++        """
++        loader = cls(cassette_dir)
++        cassette = loader.load_cassette(domain)
++        loader.registry.register(cassette)
++        return cassette
+     
+     def get_cassette_for_domain(self, domain: str) -> Cassette:
+         """Get cassette for specific domain"""
+diff --git a/sentinel_os/cassette_schema.py b/sentinel_os/cassette_schema.py
+new file mode 100644
+index 0000000..0865847
+--- /dev/null
++++ b/sentinel_os/cassette_schema.py
+@@ -0,0 +1,318 @@
++"""
++Cassette Schema -- the typed, versioned configuration contract.
++
++Every governance parameter the running system reads MUST be declared
++here-shaped: named, typed, bounded (min/max), documented, and carrying
++the forensic metadata slots (approval_date, justification,
++last_reviewed). The cassette is the single source of truth; the engine
++reads, it never decides.
++
++Validation is fail-loud and total: an invalid cassette raises
++CassetteValidationError carrying EVERY violation found, not just the
++first. There are deliberately no fallback defaults anywhere in this
++module -- a missing parameter is a halt, not a guess, because a value
++the cassette never declared is a value no auditor can trace.
++
++Schema versioning: SCHEMA_VERSION identifies the shape of the
++declaration itself and rides inside every ledger policy snapshot, so a
++decision recorded today can still be interpreted after the schema
++evolves.
++"""
++
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Tuple
++
++SCHEMA_VERSION = "1.0.0"
++
++# Forensic metadata slots. Item #3 scope: the slots must EXIST on every
++# parameter (keys present); enforcement of their contents (approval
++# aging, justification quality) is Item #8+ scope.
++METADATA_SLOTS = ("approval_date", "justification", "last_reviewed")
++
++ALLOWED_TYPES = ("float", "int", "range")
++
++# Parameters the governance path cannot run without. A cassette may
++# declare more; it may not declare fewer.
++REQUIRED_GOVERNANCE_PARAMETERS: Dict[str, str] = {
++    # A wait longer than this, at any node, is one friction event.
++    "long_wait_threshold": "float",
++    # friction_count >= this value routes the call to the governor
++    # (inclusive semantics -- the cassette declares the line, the
++    # engine stands on it).
++    "governance_trigger": "int",
++    # Self-healing clamp band for the expected_wait parameter.
++    "expected_wait_bounds": "range",
++}
++
++
++class CassetteValidationError(Exception):
++    """A cassette failed schema validation. Carries the full violation
++    list so one load attempt reports every problem at once."""
++
++    def __init__(self, cassette_label: str, violations: List[str]):
++        self.cassette_label = cassette_label
++        self.violations = list(violations)
++        lines = "\n".join(f"  - {v}" for v in self.violations)
++        super().__init__(
++            f"Cassette '{cassette_label}' failed schema validation "
++            f"({len(self.violations)} violation(s)):\n{lines}"
++        )
++
++
++@dataclass(frozen=True)
++class ParameterSpec:
++    """One validated governance parameter, exactly as declared."""
++
++    name: str
++    value: Any
++    type: str
++    min_value: float
++    max_value: float
++    unit: str
++    description: str
++    metadata: Dict[str, Any] = field(default_factory=dict)
++
++    def as_snapshot(self) -> Dict[str, Any]:
++        """JSON-safe form for the ledger's policy snapshot."""
++        return {
++            "value": list(self.value) if self.type == "range" else self.value,
++            "type": self.type,
++            "min": self.min_value,
++            "max": self.max_value,
++            "unit": self.unit,
++            "description": self.description,
++            "metadata": dict(self.metadata),
++        }
++
++
++class GovernanceParameters:
++    """The validated, typed view of a cassette's governance declaration.
++
++    This is what the engine reads at decision time. Accessors are
++    type-strict: asking for a float where the cassette declared an int
++    is a contract violation and raises, because a silent coercion is a
++    second place the value's meaning could live.
++    """
++
++    def __init__(self, cassette_version: str, parameters: Dict[str, ParameterSpec]):
++        self.cassette_version = cassette_version
++        self._parameters = dict(parameters)
++
++    def names(self) -> List[str]:
++        return sorted(self._parameters)
++
++    def _get(self, name: str, expected_type: str) -> ParameterSpec:
++        if name not in self._parameters:
++            raise KeyError(
++                f"Cassette '{self.cassette_version}' declares no parameter "
++                f"'{name}'; declared: {self.names()}"
++            )
++        spec = self._parameters[name]
++        if spec.type != expected_type:
++            raise TypeError(
++                f"Parameter '{name}' is declared '{spec.type}', "
++                f"accessed as '{expected_type}'"
++            )
++        return spec
++
++    def float_value(self, name: str) -> float:
++        return float(self._get(name, "float").value)
++
++    def int_value(self, name: str) -> int:
++        return int(self._get(name, "int").value)
++
++    def range_value(self, name: str) -> Tuple[float, float]:
++        lo, hi = self._get(name, "range").value
++        return (float(lo), float(hi))
++
++    def snapshot(self) -> Dict[str, Any]:
++        """The full policy snapshot a ledger decision record carries:
++        every parameter, with bounds and metadata, plus the schema and
++        cassette versions that make the record self-describing."""
++        return {
++            "schema_version": SCHEMA_VERSION,
++            "cassette_version": self.cassette_version,
++            "parameters": {
++                name: spec.as_snapshot()
++                for name, spec in sorted(self._parameters.items())
++            },
++        }
++
++
++def cassette_version_of(cassette) -> str:
++    """Canonical identity string a ledger row uses to name the policy
++    that governed it: domain:name:version."""
++    config = cassette.get_config()
++    return f"{config.domain}:{config.name}:{config.version}"
++
++
++def _validate_one_parameter(name: str, raw: Any, violations: List[str]) -> ParameterSpec:
++    if not isinstance(raw, dict):
++        violations.append(f"parameter '{name}': declaration must be a dict, got {type(raw).__name__}")
++        return None
++
++    for required_key in ("value", "type", "min", "max", "unit", "description", "metadata"):
++        if required_key not in raw:
++            violations.append(f"parameter '{name}': missing required field '{required_key}'")
++    if violations and any(f"parameter '{name}': missing required field" in v for v in violations):
++        return None
++
++    ptype = raw["type"]
++    if ptype not in ALLOWED_TYPES:
++        violations.append(f"parameter '{name}': type '{ptype}' not in {ALLOWED_TYPES}")
++        return None
++
++    value = raw["value"]
++    min_v, max_v = raw["min"], raw["max"]
++    ok = True
++
++    if not isinstance(min_v, (int, float)) or not isinstance(max_v, (int, float)):
++        violations.append(f"parameter '{name}': min/max must be numeric")
++        ok = False
++    elif min_v > max_v:
++        violations.append(f"parameter '{name}': min {min_v} > max {max_v} (contradictory bounds)")
++        ok = False
++
++    if ptype == "float":
++        if not isinstance(value, (int, float)) or isinstance(value, bool):
++            violations.append(f"parameter '{name}': declared float, value is {type(value).__name__}")
++            ok = False
++        elif ok and not (min_v <= float(value) <= max_v):
++            violations.append(
++                f"parameter '{name}': value {value} outside declared range [{min_v}, {max_v}]"
++            )
++    elif ptype == "int":
++        if not isinstance(value, int) or isinstance(value, bool):
++            violations.append(f"parameter '{name}': declared int, value is {type(value).__name__}")
++            ok = False
++        elif ok and not (min_v <= value <= max_v):
++            violations.append(
++                f"parameter '{name}': value {value} outside declared range [{min_v}, {max_v}]"
++            )
++    elif ptype == "range":
++        if (not isinstance(value, (list, tuple)) or len(value) != 2
++                or not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in value)):
++            violations.append(f"parameter '{name}': declared range, value must be [lo, hi] numerics")
++            ok = False
++        else:
++            lo, hi = float(value[0]), float(value[1])
++            if lo >= hi:
++                violations.append(
++                    f"parameter '{name}': range lo {lo} >= hi {hi} (contradictory range)"
++                )
++            if ok and isinstance(min_v, (int, float)) and isinstance(max_v, (int, float)):
++                if not (min_v <= lo and hi <= max_v):
++                    violations.append(
++                        f"parameter '{name}': range [{lo}, {hi}] outside declared "
++                        f"bounds [{min_v}, {max_v}]"
++                    )
++
++    metadata = raw.get("metadata")
++    if not isinstance(metadata, dict):
++        violations.append(f"parameter '{name}': metadata must be a dict with slots {METADATA_SLOTS}")
++    else:
++        for slot in METADATA_SLOTS:
++            if slot not in metadata:
++                violations.append(f"parameter '{name}': missing metadata slot '{slot}'")
++
++    if not isinstance(raw.get("description"), str) or not raw.get("description", "").strip():
++        violations.append(f"parameter '{name}': description must be a non-empty string")
++
++    return ParameterSpec(
++        name=name,
++        value=tuple(value) if ptype == "range" and isinstance(value, (list, tuple)) else value,
++        type=ptype,
++        min_value=float(min_v) if isinstance(min_v, (int, float)) else float("nan"),
++        max_value=float(max_v) if isinstance(max_v, (int, float)) else float("nan"),
++        unit=str(raw.get("unit", "")),
++        description=str(raw.get("description", "")),
++        metadata=dict(metadata) if isinstance(metadata, dict) else {},
++    )
++
++
++def validate_governance_parameters(cassette) -> GovernanceParameters:
++    """Validate a cassette's governance declaration against the schema.
++
++    Raises CassetteValidationError with the complete violation list, or
++    returns the typed GovernanceParameters view. Nothing is defaulted,
++    nothing is repaired: the cassette is either the source of truth or
++    it does not load.
++    """
++    label = cassette_version_of(cassette)
++    violations: List[str] = []
++
++    getter = getattr(cassette, "get_governance_parameters", None)
++    if not callable(getter):
++        raise CassetteValidationError(
++            label, ["cassette does not implement get_governance_parameters()"]
++        )
++
++    raw_params = getter()
++    if not isinstance(raw_params, dict):
++        raise CassetteValidationError(
++            label, [f"get_governance_parameters() must return a dict, got {type(raw_params).__name__}"]
++        )
++
++    specs: Dict[str, ParameterSpec] = {}
++
++    for name, expected_type in REQUIRED_GOVERNANCE_PARAMETERS.items():
++        if name not in raw_params:
++            violations.append(f"missing required governance parameter '{name}' ({expected_type})")
++            continue
++        declared_type = raw_params[name].get("type") if isinstance(raw_params[name], dict) else None
++        if declared_type != expected_type:
++            violations.append(
++                f"parameter '{name}': must be declared type '{expected_type}', got '{declared_type}'"
++            )
++
++    for name, raw in sorted(raw_params.items()):
++        spec = _validate_one_parameter(name, copy.deepcopy(raw), violations)
++        if spec is not None:
++            specs[name] = spec
++
++    # Cross-parameter contradiction checks (only meaningful when the
++    # individual parameters parsed cleanly).
++    if "long_wait_threshold" in specs and specs["long_wait_threshold"].type == "float":
++        if float(specs["long_wait_threshold"].value) <= 0:
++            violations.append("parameter 'long_wait_threshold': must be > 0 seconds")
++    if "governance_trigger" in specs and specs["governance_trigger"].type == "int":
++        if int(specs["governance_trigger"].value) < 0:
++            violations.append("parameter 'governance_trigger': must be >= 0 friction events")
++
++    if violations:
++        raise CassetteValidationError(label, violations)
++
++    return GovernanceParameters(label, specs)
++
++
++def validate_cassette(cassette) -> GovernanceParameters:
++    """The single fail-loud validation entry point for EVERY load path:
++    loader, registry, harness construction, and direct injection alike.
++
++    Structural checks first (config present, queues non-empty, the
++    cassette's own self-check), then the full governance-parameter
++    schema. Returns the typed parameters so callers validate and read
++    in one step.
++    """
++    label = cassette_version_of(cassette)
++    violations: List[str] = []
++
++    config = cassette.get_config()
++    if config is None:
++        violations.append("get_config() returned None")
++    queues = cassette.get_queue_definitions()
++    if not queues:
++        violations.append("get_queue_definitions() returned no queues")
++    try:
++        if cassette.validate() is not True:
++            violations.append("cassette.validate() self-check did not return True")
++    except Exception as exc:  # a self-check that crashes is a failed self-check
++        violations.append(f"cassette.validate() raised: {exc}")
++
++    if violations:
++        raise CassetteValidationError(label, violations)
++
++    return validate_governance_parameters(cassette)
+diff --git a/sentinel_os/cassettes/banking_cassette.py b/sentinel_os/cassettes/banking_cassette.py
+index b62ed62..0b9eac1 100644
+--- a/sentinel_os/cassettes/banking_cassette.py
++++ b/sentinel_os/cassettes/banking_cassette.py
+@@ -4,19 +4,73 @@ Banking Cassette - Domain-specific implementation for financial services
+ Same boom box, completely different rules for banking context
+ """
+ 
++import copy
++
+ from cassette_interface import Cassette, CassetteConfig, QualityResult
+ from typing import Dict, List
+ 
+ class BankingCassette(Cassette):
+     """Banking/financial services cassette"""
+     
++    # THE declaration site for banking governance numbers (see
++    # cassette_schema). Banking judges the same call differently by
++    # design: longer wait tolerance (security verification), same
++    # inclusive trigger.
++    _GOVERNANCE_PARAMETERS = {
++        "long_wait_threshold": {
++            "value": 45.0,
++            "type": "float",
++            "min": 1.0,
++            "max": 600.0,
++            "unit": "seconds",
++            "description": "A wait longer than this at any node counts as one friction event.",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Security verification steps legitimately hold banking callers longer than a standard IVR.",
++                "last_reviewed": None,
++            },
++        },
++        "governance_trigger": {
++            "value": 2,
++            "type": "int",
++            "min": 0,
++            "max": 100,
++            "unit": "friction events",
++            "description": "Calls with friction_count >= this value are routed to the governor (inclusive).",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Matches the prior min_friction_for_governance=2 declaration for this domain.",
++                "last_reviewed": None,
++            },
++        },
++        "expected_wait_bounds": {
++            "value": [15.0, 300.0],
++            "type": "range",
++            "min": 0.0,
++            "max": 3600.0,
++            "unit": "seconds",
++            "description": "Self-healing clamp band for the expected_wait parameter (stricter floor for verification).",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Healing below 15s would bypass mandatory verification pacing; above 300s is an outage, not a target.",
++                "last_reviewed": None,
++            },
++        },
++    }
++
+     def get_config(self) -> CassetteConfig:
+         return CassetteConfig(
+             name="banking-v1",
+-            version="1.0.0",
++            # 1.0.0 -> 1.1.0: governance parameters became typed schema
++            # declarations (Item #3).
++            version="1.1.0",
+             description="Financial services & banking",
+             domain="banking"
+         )
++
++    def get_governance_parameters(self) -> Dict[str, Dict]:
++        """The typed governance declaration (see cassette_schema)."""
++        return copy.deepcopy(self._GOVERNANCE_PARAMETERS)
+     
+     def get_queue_definitions(self) -> Dict[str, Dict]:
+         """Banking-specific queues (completely different from IVR)"""
+@@ -132,16 +186,16 @@ class BankingCassette(Cassette):
+     def get_friction_thresholds(self) -> Dict[str, float]:
+         """Banking-specific friction (MORE SENSITIVE to security)"""
+         return {
+-            "long_wait_threshold": 45.0,  # Longer tolerance for security
++            "long_wait_threshold": self._GOVERNANCE_PARAMETERS["long_wait_threshold"]["value"],
+             "repeat_penalty": 0.3,  # Repeats worse in banking
+             "denial_penalty": 0.4,  # Denials worse (security failures)
+-            "min_friction_for_governance": 2,
++            "min_friction_for_governance": self._GOVERNANCE_PARAMETERS["governance_trigger"]["value"],
+         }
+     
+     def get_healing_bounds(self) -> Dict[str, tuple]:
+         """Banking-specific healing bounds (STRICTER)"""
+         return {
+-            "expected_wait": (15.0, 300.0),  # Longer for security verification
++            "expected_wait": tuple(self._GOVERNANCE_PARAMETERS["expected_wait_bounds"]["value"]),
+             "staffing_agents": (2, 15),  # Minimum 2 for compliance
+             "fraud_detection_threshold": (0.1, 0.9),  # Sensitivity range
+             "escalation_rate": (0.2, 0.8),  # Expected fraud escalation
+diff --git a/sentinel_os/cassettes/ivr_cassette.py b/sentinel_os/cassettes/ivr_cassette.py
+index 735f571..f709df5 100644
+--- a/sentinel_os/cassettes/ivr_cassette.py
++++ b/sentinel_os/cassettes/ivr_cassette.py
+@@ -4,19 +4,75 @@ IVR Cassette - Reference implementation for call center IVR
+ Domain-specific rules for traditional voice IVR
+ """
+ 
++import copy
++
+ from cassette_interface import Cassette, CassetteConfig, QualityResult
+ from typing import Dict, List
+ 
+ class IvrCassette(Cassette):
+     """Call center IVR cassette - what we've been building"""
+     
++    # THE declaration site. Every governance number the engine reads
++    # about this domain lives in this one dict -- typed, bounded,
++    # documented, with forensic metadata slots. The engine reads it
++    # through cassette_schema validation; nothing downstream may
++    # restate these values as literals.
++    _GOVERNANCE_PARAMETERS = {
++        "long_wait_threshold": {
++            "value": 30.0,
++            "type": "float",
++            "min": 1.0,
++            "max": 600.0,
++            "unit": "seconds",
++            "description": "A wait longer than this at any node counts as one friction event.",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Callers audibly disengage past ~30s of dead air in a standard voice IVR.",
++                "last_reviewed": None,
++            },
++        },
++        "governance_trigger": {
++            "value": 2,
++            "type": "int",
++            "min": 0,
++            "max": 100,
++            "unit": "friction events",
++            "description": "Calls with friction_count >= this value are routed to the governor (inclusive).",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Two measured friction events on one call indicates a systemic path problem, not caller noise.",
++                "last_reviewed": None,
++            },
++        },
++        "expected_wait_bounds": {
++            "value": [4.0, 120.0],
++            "type": "range",
++            "min": 0.0,
++            "max": 3600.0,
++            "unit": "seconds",
++            "description": "Self-healing clamp band for the expected_wait parameter.",
++            "metadata": {
++                "approval_date": None,
++                "justification": "Below 4s the sensor chases noise; above 120s the heal target itself is the outage.",
++                "last_reviewed": None,
++            },
++        },
++    }
++
+     def get_config(self) -> CassetteConfig:
+         return CassetteConfig(
+             name="standard-ivr",
+-            version="1.0.0",
++            # 1.0.0 -> 1.1.0: governance parameters became typed schema
++            # declarations (Item #3); governance_trigger declared at 2
++            # with inclusive (>=) semantics.
++            version="1.1.0",
+             description="Traditional call center IVR",
+             domain="ivr"
+         )
++
++    def get_governance_parameters(self) -> Dict[str, Dict]:
++        """The typed governance declaration (see cassette_schema)."""
++        return copy.deepcopy(self._GOVERNANCE_PARAMETERS)
+     
+     def get_queue_definitions(self) -> Dict[str, Dict]:
+         """IVR-specific queues"""
+@@ -120,18 +176,24 @@ class IvrCassette(Cassette):
+         }
+     
+     def get_friction_thresholds(self) -> Dict[str, float]:
+-        """IVR-specific friction thresholds"""
++        """IVR-specific friction thresholds.
++
++        Governance-relevant values are NOT restated here; they are
++        derived from the single declaration above so there is exactly
++        one place this domain's judgment lives.
++        """
+         return {
+-            "long_wait_threshold": 30.0,
++            "long_wait_threshold": self._GOVERNANCE_PARAMETERS["long_wait_threshold"]["value"],
+             "repeat_penalty": 0.2,
+             "denial_penalty": 0.3,
+-            "min_friction_for_governance": 1,
++            "min_friction_for_governance": self._GOVERNANCE_PARAMETERS["governance_trigger"]["value"],
+         }
+     
+     def get_healing_bounds(self) -> Dict[str, tuple]:
+-        """IVR-specific healing bounds"""
++        """IVR-specific healing bounds (expected_wait derives from the
++        governance declaration above -- one source of truth)."""
+         return {
+-            "expected_wait": (4.0, 120.0),
++            "expected_wait": tuple(self._GOVERNANCE_PARAMETERS["expected_wait_bounds"]["value"]),
+             "staffing_agents": (1, 20),
+             "menu_size": (3, 10),
+         }
+diff --git a/sentinel_os/claude_governance_api.py b/sentinel_os/claude_governance_api.py
+index 7ce534e..a5310bf 100644
+--- a/sentinel_os/claude_governance_api.py
++++ b/sentinel_os/claude_governance_api.py
+@@ -11,11 +11,32 @@ import json
+ class ClaudeGovernanceDecider:
+     """Uses real Claude API for governance decisions"""
+     
+-    def __init__(self, api_key: Optional[str] = None):
+-        """Initialize Claude client"""
+-        self.client = anthropic.Anthropic(api_key=api_key)
++    def __init__(self, api_key: Optional[str] = None, governance_params=None):
++        """Initialize Claude client.
++
++        The client is only constructed when an API key is actually
++        provided -- constructing it unconditionally made the decider
++        impossible to build in any environment without a key (every
++        harness test, every offline run). governance_params, when
++        supplied, is the validated GovernanceParameters view so fallback
++        bounds come from the cassette instead of literals baked in here.
++        """
++        self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
+         self.model = "claude-opus-4-6"
++        self.governance_params = governance_params
+         self.decisions = []
++
++    def _fallback_bounds(self):
++        """Healing bounds for the JSON-parse fallback path, sourced from
++        the cassette when available. No cassette wired in -> no invented
++        numbers: the fields are omitted rather than defaulted."""
++        if self.governance_params is None:
++            return None, None
++        try:
++            lo, hi = self.governance_params.range_value("expected_wait_bounds")
++            return lo, hi
++        except (KeyError, TypeError):
++            return None, None
+     
+     def decide_healing_bounds(self, queue_name: str, current_wait: float,
+                              baseline_wait: float, drift_magnitude: float) -> Dict:
+@@ -35,13 +56,19 @@ Respond ONLY with valid JSON:
+ {{
+     "should_heal": true/false,
+     "reasoning": "brief explanation",
+-    "lo_bound": 4.0,
+-    "hi_bound": 120.0,
++    "lo_bound": <from governance bounds>,
++    "hi_bound": <from governance bounds>,
+     "target_wait": proposed_target_in_seconds,
+     "confidence": 0.0-1.0
+ }}
+ """
+-        
++
++        if self.client is None:
++            raise RuntimeError(
++                "ClaudeGovernanceDecider has no API client (no api_key was "
++                "provided); cannot request a live healing-bounds decision"
++            )
++
+         message = self.client.messages.create(
+             model=self.model,
+             max_tokens=200,
+@@ -55,15 +82,18 @@ Respond ONLY with valid JSON:
+         try:
+             decision = json.loads(response_text)
+         except json.JSONDecodeError:
+-            # Fallback if Claude doesn't return valid JSON
++            # Fallback if Claude doesn't return valid JSON. Bounds come
++            # from the cassette, not from literals living in this file.
++            lo_bound, hi_bound = self._fallback_bounds()
+             decision = {
+                 "should_heal": True,
+                 "reasoning": "Claude response parsing failed, defaulting to heal",
+-                "lo_bound": 4.0,
+-                "hi_bound": 120.0,
+                 "target_wait": baseline_wait * 1.2,
+                 "confidence": 0.3
+             }
++            if lo_bound is not None:
++                decision["lo_bound"] = lo_bound
++                decision["hi_bound"] = hi_bound
+         
+         decision["queue"] = queue_name
+         self.decisions.append(decision)
+@@ -169,7 +199,13 @@ Respond ONLY with valid JSON:
+     
+     def safety_check(self, action: str, details: Dict) -> Dict:
+         """Ask Claude: is this governance action safe?"""
+-        
++
++        if self.client is None:
++            raise RuntimeError(
++                "ClaudeGovernanceDecider has no API client (no api_key was "
++                "provided); cannot run a live safety_check"
++            )
++
+         prompt = f"""
+ You are an AI safety auditor for IVR systems. Evaluate this governance action:
+ 
+diff --git a/sentinel_os/governance/friction_core.py b/sentinel_os/governance/friction_core.py
+new file mode 100644
+index 0000000..246ca44
+--- /dev/null
++++ b/sentinel_os/governance/friction_core.py
+@@ -0,0 +1,34 @@
++"""
++Friction Core -- the one place a wait becomes friction.
++
++Before this module the same question ("is this wait long enough to
++count?") was answered by a literal 30 in the production harness, a
++`.get(..., 30)` fallback in the cassette harness, a `> 30.0` in the
++simulator's observer, and a different 300/120 ladder in the Twilio
++ingest heuristic. Four thresholds meant four ways to disagree.
++
++Now every governance path calls compute_friction, and the threshold is
++passed in -- sourced from the cassette by the caller. This module holds
++the RULE (strict greater-than, one event per breaching wait); it holds
++no threshold of its own, by design, so there is no number here for a
++future edit to quietly diverge from the cassette.
++
++(Item #7 scope: the Twilio ingest heuristics in
++twilio_log_ingestion._count_friction unify with this module when the
++ingest path is integrated into the production flow.)
++"""
++
++from __future__ import annotations
++
++
++def compute_friction(duration: float, long_wait_threshold: float) -> int:
++    """Return the friction contributed by one wait.
++
++    A wait STRICTLY greater than the threshold is one friction event;
++    a wait equal to or below it is none. The threshold is the
++    cassette's long_wait_threshold, passed in by the caller -- this
++    function never sources or defaults it.
++    """
++    if duration > long_wait_threshold:
++        return 1
++    return 0
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index 0b19e00..84a379c 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -6,10 +6,39 @@ Replaces LocalDiskAdapter with real database: transactions, durability, ACID
+ 
+ import json
+ import hashlib
+-from typing import List, Dict, Optional
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
+ import psycopg2
+ from psycopg2.pool import SimpleConnectionPool
+ 
++
++@dataclass
++class GovernanceDecisionRecord:
++    """One structured, forensically complete governance decision.
++
++    Every field a regulator would ask for rides in the record AND
++    inside the SHA-256 chain: which policy governed (cassette_version +
++    the full policy_parameters snapshot), what the system saw
++    (input_data), what the governor reasoned (reasoning), and what came
++    out (output, approvals AND rejections alike).
++
++    applied_value mirrors previous_value with parameter_changed=False
++    unless a parameter was actually written: this system records
++    advisory decisions, and a fabricated "applied" number would be a
++    forged fact in a tamper-evident ledger.
++    """
++
++    action_type: str
++    node: str
++    cassette_version: str
++    input_data: Dict[str, Any]
++    policy_parameters: Dict[str, Any]
++    reasoning: str
++    output: Dict[str, Any]
++    previous_value: float = 0.0
++    applied_value: float = 0.0
++    parameter_changed: bool = False
++
+ class PostgreSQLLedger:
+     """Production ledger backed by PostgreSQL"""
+     
+@@ -49,6 +78,21 @@ class PostgreSQLLedger:
+                 CREATE INDEX IF NOT EXISTS idx_node ON ledger_entries(node);
+                 CREATE INDEX IF NOT EXISTS idx_hash ON ledger_entries(current_hash);
+             """)
++            # In-place migration for structured governance decisions.
++            # Legacy rows keep their shape (columns stay NULL); new
++            # decision rows fill them. The hash chain is shared: legacy
++            # append() and structured append_decision() interleave on
++            # one chain, each hashing its own canonical form.
++            cursor.execute("""
++                ALTER TABLE ledger_entries
++                    ADD COLUMN IF NOT EXISTS record_kind VARCHAR(40) DEFAULT 'legacy',
++                    ADD COLUMN IF NOT EXISTS cassette_version VARCHAR(200),
++                    ADD COLUMN IF NOT EXISTS input_data JSONB,
++                    ADD COLUMN IF NOT EXISTS policy_parameters JSONB,
++                    ADD COLUMN IF NOT EXISTS decision_output JSONB;
++                CREATE INDEX IF NOT EXISTS idx_cassette_version
++                    ON ledger_entries(cassette_version);
++            """)
+             conn.commit()
+         finally:
+             self.pool.putconn(conn)
+@@ -111,6 +155,152 @@ class PostgreSQLLedger:
+         finally:
+             self.pool.putconn(conn)
+     
++    def append_decision(self, record: GovernanceDecisionRecord) -> bool:
++        """Append one structured governance decision (transaction).
++
++        TRIPWIRE: a decision without a cassette_version is an error,
++        not a warning. The whole point of the record is "which policy
++        governed this" -- a row that cannot answer that is refused
++        before it ever touches the chain. Same for the policy snapshot
++        itself.
++
++        All forensic fields are inside the canonical form that gets
++        hashed, so editing any of them after the fact breaks the chain.
++        """
++
++        if not isinstance(record, GovernanceDecisionRecord):
++            raise TypeError(
++                f"append_decision requires GovernanceDecisionRecord, got {type(record).__name__}"
++            )
++        if not record.cassette_version or not isinstance(record.cassette_version, str):
++            raise ValueError(
++                "Governance decision rejected: cassette_version is required on every "
++                "decision record (ledger tripwire -- no decision may be recorded "
++                "without the policy version that governed it)"
++            )
++        if not isinstance(record.policy_parameters, dict) or not record.policy_parameters:
++            raise ValueError(
++                "Governance decision rejected: policy_parameters snapshot is required "
++                "(the record must carry the parameters that governed it)"
++            )
++        if not isinstance(record.input_data, dict):
++            raise ValueError("Governance decision rejected: input_data must be a dict")
++        if not isinstance(record.output, dict) or not record.output:
++            raise ValueError("Governance decision rejected: output must be a non-empty dict")
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++
++            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
++
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries
++                ORDER BY id DESC LIMIT 1
++            """)
++            row = cursor.fetchone()
++            previous_hash = row[0] if row else "genesis"
++
++            data = {
++                "record_kind": "governance_decision",
++                "parameter_changed": bool(record.parameter_changed),
++            }
++
++            canonical_entry = {
++                "record_kind": "governance_decision",
++                "action_type": record.action_type,
++                "node": record.node,
++                "cassette_version": record.cassette_version,
++                "input_data": record.input_data,
++                "policy_parameters": record.policy_parameters,
++                "reasoning": record.reasoning,
++                "output": record.output,
++                "previous_value": record.previous_value,
++                "applied_value": record.applied_value,
++                "parameter_changed": bool(record.parameter_changed),
++                "previous_hash": previous_hash,
++            }
++            current_hash = hashlib.sha256(
++                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
++            ).hexdigest()
++
++            cursor.execute("""
++                INSERT INTO ledger_entries
++                (action_type, node, previous_value, applied_value, reason,
++                 previous_hash, current_hash, data,
++                 record_kind, cassette_version, input_data, policy_parameters,
++                 decision_output)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++            """, (record.action_type, record.node, record.previous_value,
++                  record.applied_value, record.reasoning,
++                  previous_hash, current_hash, json.dumps(data),
++                  "governance_decision", record.cassette_version,
++                  json.dumps(record.input_data),
++                  json.dumps(record.policy_parameters),
++                  json.dumps(record.output)))
++            conn.commit()
++            return True
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
++    @staticmethod
++    def _as_json(raw):
++        if isinstance(raw, (dict, list)):
++            return raw
++        if raw:
++            return json.loads(raw)
++        return {}
++
++    def get_decisions(self, cassette_version: Optional[str] = None,
++                      limit: int = 100) -> List[Dict]:
++        """Retrieve structured governance decisions, newest first.
++
++        "Show me every decision this cassette version governed" is one
++        call (and one SQL query -- see CASSETTE_GOVERNS_INTEGRATION)."""
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            query = """
++                SELECT id, timestamp, action_type, node, previous_value,
++                       applied_value, reason, previous_hash, current_hash,
++                       cassette_version, input_data, policy_parameters,
++                       decision_output
++                FROM ledger_entries
++                WHERE record_kind = 'governance_decision'
++            """
++            params: list = []
++            if cassette_version is not None:
++                query += " AND cassette_version = %s"
++                params.append(cassette_version)
++            query += " ORDER BY id DESC LIMIT %s"
++            params.append(limit)
++            cursor.execute(query, tuple(params))
++
++            decisions = []
++            for row in cursor.fetchall():
++                decisions.append({
++                    "id": row[0],
++                    "timestamp": row[1].isoformat() if row[1] else None,
++                    "action_type": row[2],
++                    "node": row[3],
++                    "previous_value": row[4],
++                    "applied_value": row[5],
++                    "reasoning": row[6],
++                    "previous_hash": row[7],
++                    "current_hash": row[8],
++                    "cassette_version": row[9],
++                    "input_data": self._as_json(row[10]),
++                    "policy_parameters": self._as_json(row[11]),
++                    "output": self._as_json(row[12]),
++                })
++            return decisions
++        finally:
++            self.pool.putconn(conn)
++
+     def get_entries(self, limit: int = 100) -> List[Dict]:
+         """Retrieve recent entries"""
+         
+diff --git a/sentinel_os/iceberg_complete_simulator.py b/sentinel_os/iceberg_complete_simulator.py
+index e8b1bad..17ff357 100644
+--- a/sentinel_os/iceberg_complete_simulator.py
++++ b/sentinel_os/iceberg_complete_simulator.py
+@@ -8,10 +8,13 @@ sys.path.insert(0, os.path.dirname(__file__))
+ 
+ from Model.Build_Graph import build_graph
+ from Engines.simple_rl_trainer import SimpleRLTrainer
+-from observe_perceive_core import ObserveCore, synthesize_percept
++from observe_perceive_core import ObserveCore, synthesize_percept, FrictionEvent
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
++from governance.friction_core import compute_friction
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ 
+ import numpy as np
+ import random
+@@ -19,12 +22,26 @@ import random
+ class IcebergCompleteSimulator:
+     """Full Iceberg: graph routing + RL training + governance + perception"""
+     
+-    def __init__(self, ledger, rl_trainer, observe_core):
++    def __init__(self, ledger, rl_trainer, observe_core, cassette=None):
+         self.graph = build_graph()
+         self.ledger = ledger
+         self.rl_trainer = rl_trainer
+         self.observe = observe_core
++        # Governing cassette: the heal band and the wait-friction
++        # threshold both come from here, validated fail-loud.
++        self.cassette = cassette or CassetteLoader().load_cassette("ivr")
++        validate_cassette(self.cassette)
+         self.call_history = []
++
++    def _heal_band(self) -> HealBand:
++        """Heal band straight from the cassette (one source of truth)."""
++        lo, hi = validate_cassette(self.cassette).range_value("expected_wait_bounds")
++        return HealBand(lo, hi)
++
++    def _wait_friction(self, wait: float) -> int:
++        """Wait-friction via the unified rule, cassette threshold."""
++        threshold = validate_cassette(self.cassette).float_value("long_wait_threshold")
++        return compute_friction(wait, threshold)
+         
+     def simulate_call(self, caller_id: str, intent: str):
+         """Route one caller through real graph, collect data, train RL"""
+@@ -60,11 +77,22 @@ class IcebergCompleteSimulator:
+             
+             total_wait += wait
+             
+-            # OBSERVE: Detect friction
++            # OBSERVE: repeats still come from the observer; long-wait
++            # friction now comes from the unified compute_friction path
++            # with the cassette's threshold (the observer's own internal
++            # long-wait rule is Item #7 scope and is bypassed here so
++            # the two never double-count).
+             event = self.observe.observe_transition(caller_id, current_node, next_node, wait)
+-            if event:
++            if event and event.type != "long_wait":
+                 friction_events.append(event)
+-            
++            if self._wait_friction(wait):
++                threshold = validate_cassette(self.cassette).float_value("long_wait_threshold")
++                friction_events.append(FrictionEvent(
++                    node=next_node, type="long_wait",
++                    severity=min((wait - threshold) / max(threshold, 1.0), 1.0),
++                    timestamp=0.0,
++                ))
++
+             current_node = next_node
+         
+         # PERCEIVE: Infer outcome and emotional state
+@@ -113,9 +141,9 @@ class IcebergCompleteSimulator:
+             breached = [s for s in signals if s.breached]
+             
+             if breached:
+-                # Self-heal
++                # Self-heal -- clamp band from the cassette.
+                 store = InMemoryParameterStore()
+-                band = HealBand(4.0, 120.0)
++                band = self._heal_band()
+                 recs = heal(breached, store, band, self.ledger, kind="expected_wait")
+                 print(f"  Governance: Detected {len(breached)} drift(s), healed {len(recs)}")
+         
+@@ -131,7 +159,9 @@ def main():
+     rl_trainer = SimpleRLTrainer(state_dim=10, action_dim=2, lr=0.001)
+     observe = ObserveCore()
+     
+-    simulator = IcebergCompleteSimulator(ledger, rl_trainer, observe)
++    simulator = IcebergCompleteSimulator(
++        ledger, rl_trainer, observe, CassetteLoader().load_cassette("ivr")
++    )
+     
+     print("\n[BATCH 1] 50 callers through real graph")
+     results1, loss1 = simulator.run_batch(50)
+diff --git a/sentinel_os/load_test.py b/sentinel_os/load_test.py
+index b8c2ea0..cc19aa3 100755
+--- a/sentinel_os/load_test.py
++++ b/sentinel_os/load_test.py
+@@ -8,6 +8,8 @@ from load_test_config import LOAD_TEST_CONFIG
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ import random
+ import tempfile
+ 
+@@ -65,7 +67,8 @@ def run_load_test(scale_name: str):
+     print(f"[4/4] Applying self-healing...", end="", flush=True)
+     t0 = time.time()
+     store = InMemoryParameterStore()
+-    band = HealBand(4.0, 120.0)
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo, hi)
+     records = heal(breached, store, band, ledger, kind="expected_wait")
+     t1 = time.time()
+     t_heal = t1 - t0
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 52ed650..976c41b 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -18,6 +18,9 @@ from claude_governance_api import ClaudeGovernanceDecider
+ from observe_perceive_core import ObserveCore, synthesize_percept, EmotionalState, FrictionEvent
+ from sentinel_core import SentinelCore
+ from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
++from governance.ledger_postgres import GovernanceDecisionRecord
++from governance.friction_core import compute_friction
+ from queue_staffing_bayes_integration import (
+     StaffingCoordinator, BayesianIntentEngine, QueueState
+ )
+@@ -25,19 +28,32 @@ from queue_staffing_bayes_integration import (
+ class IcebergProductionHarness:
+     """Complete production system: all components wired together"""
+     
+-    def __init__(self, config: Dict):
+-        """Initialize production system"""
+-        
++    def __init__(self, config: Dict, cassette=None):
++        """Initialize production system.
++
++        The cassette is THE governing policy for this harness. It is
++        loaded (or injected), schema-validated fail-loud, and every
++        governance number read later in process_call comes from it --
++        never from a literal in this file.
++        """
++
+         self.config = config
+-        
++
++        # Governing cassette: injected, or loaded for the configured
++        # domain. Validated here so an invalid policy halts construction.
++        self.cassette = cassette or CassetteLoader().load_cassette(
++            config.get("cassette_domain", "ivr")
++        )
++        validate_cassette(self.cassette)
++
+         # Data sources
+         self.twilio_parser = TwilioLogParser()
+         self.twilio_adapter = None  # Will init if API key provided
+-        
++
+         # Observability
+         self.metrics = PrometheusMetrics()
+         self.observer = ObserveCore()
+-        self.sentinel = SentinelCore(CassetteLoader().load_cassette("ivr"))
++        self.sentinel = SentinelCore(self.cassette)
+         
+         # Persistence
+         self.ledger = None  # Will init if DB config provided
+@@ -73,7 +89,8 @@ class IcebergProductionHarness:
+         if self.config.get("claude_api_key"):
+             try:
+                 self.claude_decider = ClaudeGovernanceDecider(
+-                    api_key=self.config.get("claude_api_key")
++                    api_key=self.config.get("claude_api_key"),
++                    governance_params=self._params(),
+                 )
+                 print("✓ Claude governance API connected")
+             except Exception as e:
+@@ -92,18 +109,47 @@ class IcebergProductionHarness:
+             except Exception as e:
+                 print(f"⚠ Twilio not available: {e}")
+     
++    def _params(self):
++        """Re-validate and read the cassette AT DECISION TIME, fresh on
++        every call. Never cached: if the governing policy is swapped,
++        the very next decision must see it -- a cached snapshot would be
++        a second, stale source of truth."""
++        return validate_cassette(self.cassette)
++
++    def swap_cassette(self, cassette) -> None:
++        """Replace the governing cassette (validated fail-loud). The
++        next process_call reads the new policy; nothing is cached across
++        the swap."""
++        validate_cassette(cassette)
++        self.cassette = cassette
++        self.sentinel = SentinelCore(cassette)
++
+     def process_call(self, twilio_record: Dict) -> Dict:
+         """Process one call through complete pipeline"""
+-        
++
++        # Read the governing policy fresh, at decision time.
++        params = self._params()
++        long_wait = params.float_value("long_wait_threshold")
++        governance_trigger = params.int_value("governance_trigger")
++
+         # 1. Parse Twilio record
+         journey = self.twilio_parser.parse_call_log(twilio_record)
+         if not journey:
+             return {"error": "Failed to parse call"}
+-        
+-        # 2. Observe friction
++
++        # 2. Observe friction -- ONE rule (friction_core), ONE threshold
++        # (the cassette's), applied to the per-node waits actually
++        # measured on this call. This measured friction_count is what
++        # governs everything downstream: quality scoring, the metrics
++        # drift record, and the governance gate. The parser's own
++        # heuristic estimate (journey.friction_count) no longer rides
++        # the governance path.
+         friction_events = []
++        friction_count = 0
+         for node in journey.journey:
+-            if journey.wait_times.get(node, 0) > 30:
++            node_wait = journey.wait_times.get(node, 0)
++            if compute_friction(node_wait, long_wait):
++                friction_count += 1
+                 friction_events.append(
+                     FrictionEvent(node=node, type="long_wait", severity=0.5, timestamp=0)
+                 )
+@@ -117,8 +163,8 @@ class IcebergProductionHarness:
+         first_queue = next((n for n in journey.journey if "queue" in n), "general_queue")
+         intent_signal = self.sentinel.infer_intent(journey.journey, first_queue)
+         quality_score = self.sentinel.score_outcome_quality(
+-            journey.resolved, journey.total_duration, 
+-            journey.friction_count, emotion
++            journey.resolved, journey.total_duration,
++            friction_count, emotion
+         )
+         
+         # 5. Record metrics
+@@ -128,7 +174,7 @@ class IcebergProductionHarness:
+             resolution_time=journey.total_duration
+         )
+         
+-        if journey.friction_count > 0:
++        if friction_count > 0:
+             self.metrics.record_drift_detection(first_queue, 0.2)
+         
+         # 6. Bayes: Update intent success rates
+@@ -138,36 +184,55 @@ class IcebergProductionHarness:
+             journey.total_duration
+         )
+         
+-        # 7. Claude governance: Ask for decision (if connected)
++        # 7. Governance gate: the cassette's trigger decides who is
++        # governed (inclusive >=), and the measured friction_count is
++        # what's tested. governed here means "the governor ran".
+         claude_decision = None
+-        if self.claude_decider and journey.friction_count > 2:
++        governed = friction_count >= governance_trigger
++        if self.claude_decider and governed:
+             try:
+                 claude_decision = self.claude_decider.safety_check(
+                     "heal_queue",
+                     {
+                         "queue": first_queue,
+                         "wait_time": journey.total_duration,
+-                        "friction_count": journey.friction_count
++                        "friction_count": friction_count
+                     }
+                 )
+             except Exception as e:
+                 print(f"Claude decision failed: {e}")
+         
+-        # 8. Ledger: Record decision (if connected)
+-        if self.ledger and claude_decision and claude_decision.get("safe"):
++        # 8. Ledger: record the governance DECISION -- approvals and
++        # rejections alike, whenever the governor actually ran. The
++        # record carries the cassette version and the full policy
++        # snapshot that governed it, so every row is traceable to the
++        # policy in force. applied_value mirrors previous (advisory:
++        # nothing was written), parameter_changed=False.
++        if self.ledger and claude_decision is not None:
+             try:
+-                self.ledger.append(
+-                    action_type="governance",
++                approved = bool(claude_decision.get("safe"))
++                self.ledger.append_decision(GovernanceDecisionRecord(
++                    action_type="governance_decision",
+                     node=first_queue,
+-                    previous_value=journey.total_duration,
+-                    applied_value=journey.total_duration * 0.8,
+-                    reason=f"Quality: {quality_score.quality_tier.value}",
+-                    data={
++                    cassette_version=params.cassette_version,
++                    input_data={
+                         "caller_id": journey.caller_id,
++                        "friction_count": friction_count,
++                        "governance_trigger": governance_trigger,
++                        "wait_time": journey.total_duration,
+                         "quality_tier": quality_score.quality_tier.value,
+-                        "claude_safe": True
+-                    }
+-                )
++                    },
++                    policy_parameters=params.snapshot(),
++                    reasoning=claude_decision.get("reasoning", ""),
++                    output={
++                        "approved": approved,
++                        "risk_level": claude_decision.get("risk_level"),
++                        "confidence": claude_decision.get("confidence"),
++                    },
++                    previous_value=journey.total_duration,
++                    applied_value=journey.total_duration,
++                    parameter_changed=False,
++                ))
+             except Exception as e:
+                 print(f"Ledger append failed: {e}")
+         
+@@ -178,7 +243,11 @@ class IcebergProductionHarness:
+             "intent": intent_signal.queue_chosen,
+             "emotion_frustration": emotion.frustration,
+             "claude_safe": claude_decision.get("safe") if claude_decision else None,
+-            "metrics_recorded": True
++            "metrics_recorded": True,
++            "friction_count": friction_count,
++            "governed": governed,
++            "governance_trigger": governance_trigger,
++            "cassette_version": params.cassette_version,
+         }
+     
+     def process_batch(self, twilio_records: list) -> Dict:
+diff --git a/sentinel_os/run_adaptive.py b/sentinel_os/run_adaptive.py
+index 8c0ae44..71507c9 100755
+--- a/sentinel_os/run_adaptive.py
++++ b/sentinel_os/run_adaptive.py
+@@ -7,6 +7,8 @@ from adaptive_config import CONFIG
+ from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
++from cassette_loader import CassetteLoader
++from cassette_schema import validate_cassette
+ import random
+ 
+ def main():
+@@ -62,7 +64,8 @@ def main():
+     # Self-heal
+     print("\n[5/5] Applying self-healing...")
+     store = InMemoryParameterStore()
+-    band = HealBand(CONFIG["self_heal"]["band_lo"], CONFIG["self_heal"]["band_hi"])
++    lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
++    band = HealBand(lo, hi)
+     records = heal(
+         breached,
+         store,
+diff --git a/sentinel_os/sentinel_core.py b/sentinel_os/sentinel_core.py
+index 501187b..f003a20 100644
+--- a/sentinel_os/sentinel_core.py
++++ b/sentinel_os/sentinel_core.py
+@@ -81,6 +81,12 @@ class SentinelCore:
+                 "fallback. Load one first, e.g. "
+                 "CassetteLoader().load_cassette('ivr')."
+             )
++        # Injection is a load path too: a cassette handed straight to
++        # the core gets the same fail-loud schema validation as one
++        # that came through the loader. (Import is local to keep this
++        # module importable in isolation.)
++        from cassette_schema import validate_cassette
++        validate_cassette(cassette)
+         self.cassette = cassette
+ 
+     def infer_intent(self, journey: List[str], first_queue_chosen: str) -> IntentSignal:
+diff --git a/sentinel_os/twilio_log_ingestion.py b/sentinel_os/twilio_log_ingestion.py
+index 496e7db..ba7d11c 100644
+--- a/sentinel_os/twilio_log_ingestion.py
++++ b/sentinel_os/twilio_log_ingestion.py
+@@ -65,7 +65,9 @@ class TwilioLogParser:
+         # In real system, would parse IVR logs/recordings
+         journey = self._reconstruct_journey(twilio_record)
+         
+-        # Calculate friction
++        # Calculate friction (ingest-side heuristic ESTIMATE -- see
++        # _count_friction; the production harness measures its own
++        # friction from wait_times against the cassette threshold)
+         friction_count = self._count_friction(twilio_record, journey)
+         
+         # Determine abandonment reason
+@@ -75,7 +77,7 @@ class TwilioLogParser:
+             caller_id=f"twilio_{sid[:8]}",
+             timestamp=timestamp,
+             journey=journey,
+-            wait_times=self._extract_wait_times(twilio_record),
++            wait_times=self._extract_wait_times(twilio_record, journey),
+             total_duration=float(duration),
+             resolved=resolved,
+             friction_count=friction_count,
+@@ -107,20 +109,44 @@ class TwilioLogParser:
+         journey.append("exit")
+         return journey
+     
+-    def _extract_wait_times(self, record: Dict) -> Dict[str, float]:
+-        """Extract wait times from call metadata"""
+-        
++    def _extract_wait_times(self, record: Dict, journey: List[str]) -> Dict[str, float]:
++        """Extract per-node wait times, keyed by the ACTUAL journey nodes.
++
++        Previously this returned generic keys ("queue", "agent") that
++        never matched the reconstructed journey's node names
++        ("billing_queue", "agent_a"), so any per-node lookup downstream
++        silently found nothing -- the harness could never see more than
++        the intent_menu wait. Keying by the real nodes makes per-node
++        friction measurement possible.
++
++        The 0.1/0.5/0.4 split ratios remain an ingest heuristic
++        (Item #7 scope: replace with real IVR event timestamps when the
++        ingest path is integrated into the production flow).
++        """
++
+         duration = float(record.get("duration", 0))
+-        
+-        # Heuristic: split duration across queues
+-        return {
+-            "intent_menu": duration * 0.1,
+-            "queue": duration * 0.5,
+-            "agent": duration * 0.4,
+-        }
++
++        waits: Dict[str, float] = {}
++        queue_node = next((n for n in journey if "queue" in n), None)
++        if "intent_menu" in journey:
++            waits["intent_menu"] = duration * 0.1
++        if queue_node:
++            waits[queue_node] = duration * 0.5
++        if "agent_a" in journey:
++            waits["agent_a"] = duration * 0.4
++        return waits
+     
+     def _count_friction(self, record: Dict, journey: List[str]) -> int:
+-        """Estimate friction from call patterns"""
++        """Estimate friction from call patterns.
++
++        Item #7 scope: these 300/120/10 duration heuristics are an
++        ingest-side ESTIMATE and deliberately NOT unified with
++        governance/friction_core in Items #4-#6; they unify when the
++        ingest path is integrated into the production flow. The
++        production harness does NOT use this estimate on the
++        governance path -- it measures friction itself from wait_times
++        against the cassette's threshold.
++        """
+         
+         friction = 0
+         duration = int(record.get("duration", 0))

@@ -1,0 +1,10 @@
+-- KEYS[1]=processing zset  ARGV[1]=job_id ARGV[2]=claim_token ARGV[3]=lease_seconds ARGV[4]=job key prefix
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local jk = ARGV[4] .. ARGV[1]
+if redis.call('HGET', jk, 'claim_token') ~= ARGV[2] then return 0 end
+if redis.call('HGET', jk, 'status') ~= 'processing' then return 0 end
+local lease = now + tonumber(ARGV[3])
+redis.call('HSET', jk, 'lease_expires_at', lease, 'updated_at', now)
+redis.call('ZADD', KEYS[1], 'XX', lease, ARGV[1])
+return 1

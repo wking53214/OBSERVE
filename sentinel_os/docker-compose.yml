@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  iceberg:
+    build: .
+    container_name: iceberg-main
+    ports:
+      - "9090:9090"
+    environment:
+      PYTHONUNBUFFERED: 1
+      ICEBERG_ENV: production
+      # Previously unset -- api_server_resilient.py defaulted to
+      # POSTGRES_HOST=localhost, which inside this container does not
+      # resolve to the ledger service below (compose gives each service
+      # its own network namespace; "ledger" is the DNS name to use).
+      POSTGRES_HOST: ledger
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: iceberg_ledger
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: change_me_in_prod
+      # Required as of the ICEBERG_LEDGER_RUNTIME_USER fail-closed fix -- the
+      # app refuses to boot without a declared non-owner runtime identity.
+      # ledger_reader is created automatically by ledger_immutability.sql;
+      # its password is self-provisioned from RUNTIME_PASSWORD below on every
+      # startup (see PostgreSQLLedger._provision_runtime_password), so this
+      # is the only place the value needs to be set.
+      ICEBERG_LEDGER_RUNTIME_USER: ledger_reader
+      ICEBERG_LEDGER_RUNTIME_PASSWORD: change_me_in_prod_too
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+    volumes:
+      - ./data:/data
+      - ./logs:/app/logs
+    restart: always
+    depends_on:
+      ledger:
+        condition: service_healthy
+    healthcheck:
+      # Previously "python3 -c 'import sys; sys.exit(0)'" -- always exits
+      # 0 regardless of whether the app is actually up, so Docker would
+      # report this container healthy even if the server crashed on
+      # startup. Curl the real /health endpoint instead.
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  ledger:
+    image: postgres:15-alpine
+    container_name: iceberg-ledger
+    environment:
+      POSTGRES_DB: iceberg_ledger
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: change_me_in_prod
+    volumes:
+      - ./ledger_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      # Previously no healthcheck at all: depends_on only waited for this
+      # container to START, not for Postgres inside it to actually be
+      # ready to accept connections -- so iceberg-main routinely started
+      # first and hit "Connection refused" against a ledger that hadn't
+      # finished booting yet. pg_isready gates the iceberg service's
+      # startup on genuine readiness, same check tests.yml's CI uses.
+      test: ["CMD-SHELL", "pg_isready -U iceberg -d iceberg_ledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  ledger_data:
+  data:
+
+networks:
+  default:
+    name: iceberg-network

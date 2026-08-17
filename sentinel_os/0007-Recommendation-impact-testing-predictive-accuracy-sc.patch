@@ -1,0 +1,1323 @@
+From 8cf3f2fa456aad93a0a3edbfbcdc38f2ea66ce36 Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 31 Jul 2026 23:07:49 +0000
+Subject: [PATCH 7/7] Recommendation impact testing (predictive-accuracy scope)
+
+Final piece of Wm's July 28 roadmap item 4. Scoped July 31 (his decision)
+to predictive-accuracy measurement, not true A/B impact testing: every
+recommendation this generates is a SHADOW RUN, computed from real ledger
+data and recorded to the chain, never acted on. True impact testing would
+require wiring decide_healing_bounds/decide_queue_reordering into the
+live decision path first -- a separate, much bigger product decision;
+only safety_check runs live today.
+
+decide_staffing_adjustment is deliberately excluded -- it needs real-time
+agent headcount and this system has no data source for that anywhere.
+Fabricating one would violate the same never-guess discipline the rest of
+the codebase holds to (event_v1.py's Provenance Rule).
+
+New ledger primitives (governance/ledger_postgres.py): two append-only
+record kinds, recommendation_shadow_run and recommendation_shadow_score
+(a score is always a NEW row referencing the run's hash, never a mutation
+-- an append-only chain has no other way to attach a fact that wasn't
+knowable until later). shadow_run_hash joins the shared canonical_fields
+contract as Item 9 -- given its own dedicated column rather than reusing
+replaces_hash, which already has a specific, different, fail-closed-
+enforced meaning elsewhere (obligation_supersession.py). Also added
+get_decisions_by_node_in_window, a real time-windowed per-queue read.
+
+Caught mid-build and fixed: a botched edit briefly deleted a method
+signature line (caught by a syntax check before it went anywhere), and
+the new record kinds needed matching branches in THREE places, not one
+-- the writer, PostgreSQLLedger.verify_chain()'s own explicit
+reconstruction (an undocumented third site, same gotcha as ai_cost's
+delivery), and twin_custody.py's recompute_current_hash (the officially
+documented witness side). All three now agree.
+
+Also found and fixed a real gap in this session's EARLIER ai_cost work:
+SHIPPED_COLUMNS (twin_custody.py -- the actual list twin_shipper.py uses
+to decide what reaches a twin) never had ai_cost added, so that data
+would never have shipped to any twin despite hashing and verifying
+correctly locally. Fixed in the same pass as adding shadow_run_hash to
+the same list.
+
+recommendation_impact.py: two shadow-run generators (healing_bounds,
+queue_reordering) and two scorers, all pulling real data via
+get_decisions_by_node_in_window and skipping (returning None, not
+fabricating) whenever fewer than 5 real calls exist in a window. Scoring
+uses a directional check (did the real outcome move toward the predicted
+target relative to where it started) rather than forcing exact-value
+matching, since Erlang-C-style targets are estimates, not guarantees.
+Includes a CLI (run/score subcommands, --dry-run, JSON summaries) matching
+obligation_sweep.py's existing CLI shape.
+
+33 new tests: 6 ledger-level (hash/verify/refuse-unknown-hash/filtering),
+12 fake-ledger unit tests for the aggregation and scoring math, 3 real-
+Postgres integration tests (window filtering by node and time, and one
+true end-to-end pipeline test using a real ledger, real windowed pull,
+and a real fail-closed ClaudeGovernanceDecider -- same no-API-key
+convention test_sentinel_worker.py already uses for real-without-network
+testing). One own-test bug fixed along the way (invalid *args-with-default
+syntax) and one own-test timing bug fixed (the two-window healing-bounds
+pull needs genuinely time-separated data, not six rows inserted at once).
+
+Full suite 756 passed / 6 skipped, twice back-to-back (one unrelated
+throughput test flaked once under sandbox load, confirmed passing in
+isolation and on a clean re-run -- test_api_server_v2.py, untouched by
+this change). Ruff and bandit clean; bandit's only finding anywhere in
+the touched files is the same pre-existing dev-default password at
+ledger_postgres.py:115 already confirmed pre-existing in an earlier
+commit this session.
+---
+ .../Tests/test_recommendation_impact.py       | 238 +++++++++++++
+ .../test_recommendation_impact_integration.py |  94 +++++
+ .../test_recommendation_shadow_ledger.py      | 101 ++++++
+ sentinel_os/canonical_fields.py               |  10 +
+ sentinel_os/governance/ledger_postgres.py     | 318 ++++++++++++++++-
+ sentinel_os/recommendation_impact.py          | 337 ++++++++++++++++++
+ sentinel_os/twin_custody.py                   |  39 ++
+ 7 files changed, 1135 insertions(+), 2 deletions(-)
+ create mode 100644 sentinel_os/Tests/test_recommendation_impact.py
+ create mode 100644 sentinel_os/Tests/test_recommendation_impact_integration.py
+ create mode 100644 sentinel_os/Tests/test_recommendation_shadow_ledger.py
+ create mode 100644 sentinel_os/recommendation_impact.py
+
+diff --git a/sentinel_os/Tests/test_recommendation_impact.py b/sentinel_os/Tests/test_recommendation_impact.py
+new file mode 100644
+index 0000000..74fc282
+--- /dev/null
++++ b/sentinel_os/Tests/test_recommendation_impact.py
+@@ -0,0 +1,238 @@
++"""recommendation_impact.py tests.
++
++Two layers:
++1. Pure-logic unit tests against a fake ledger/decider (fast, deterministic
++   -- tests the aggregation/scoring math and the insufficient-data skip
++   behavior without needing real timing or real Postgres).
++2. Real-Postgres integration tests proving get_decisions_by_node_in_window
++   itself (the actual SQL) filters by node and time correctly, and that
++   the full pipeline (real ledger write -> real pull -> real decider ->
++   real shadow-run record) actually connects end to end.
++"""
++from datetime import datetime, timezone
++
++import pytest
++
++from recommendation_impact import (
++    MIN_CALLS_FOR_A_WINDOW,
++    run_healing_bounds_shadow,
++    run_queue_reordering_shadow,
++    score_healing_bounds_run,
++    score_queue_reordering_run,
++)
++
++
++# ============================================================== fakes ====
++class _FakeLedger:
++    """Ignores the exact since/until window strings and returns whatever
++    rows the test registered for that node -- appropriate for testing the
++    aggregation/scoring logic in isolation. The real window-filtering SQL
++    is tested separately below against a real Postgres ledger."""
++
++    def __init__(self):
++        self._rows_by_node = {}
++        self.shadow_runs = []
++        self.shadow_scores = []
++
++    def set_rows(self, node, rows):
++        self._rows_by_node[node] = rows
++
++    def get_decisions_by_node_in_window(self, node, since_iso, until_iso, limit=1000):
++        return self._rows_by_node.get(node, [])
++
++    def record_recommendation_shadow_run(self, **kw):
++        result = {"status": "created",
++                  "current_hash": f"hash-{len(self.shadow_runs)}", **kw}
++        self.shadow_runs.append(result)
++        return result
++
++    def record_recommendation_shadow_score(self, **kw):
++        result = {"status": "created", **kw}
++        self.shadow_scores.append(result)
++        return result
++
++
++def _rows(wait_times=None, quality_tiers=None):
++    if wait_times is not None:
++        return [{"input_data": {"wait_time": w}} for w in wait_times]
++    return [{"input_data": {"quality_tier": t}} for t in quality_tiers]
++
++
++class _FakeDecider:
++    def __init__(self, healing_response=None, reorder_response=None):
++        self.healing_response = healing_response or {
++            "should_heal": True, "target_wait": 50.0, "confidence": 0.8}
++        self.reorder_response = reorder_response or {
++            "proposed_order": ["a", "b"], "expected_impact": 0.3, "confidence": 0.7}
++        self.healing_calls = []
++        self.reorder_calls = []
++
++    def decide_healing_bounds(self, node, current_wait, baseline_wait, drift):
++        self.healing_calls.append((node, current_wait, baseline_wait, drift))
++        return self.healing_response
++
++    def decide_queue_reordering(self, current_order, success_rates, caller_dist):
++        self.reorder_calls.append((current_order, success_rates, caller_dist))
++        return self.reorder_response
++
++
++# =================================================== run_healing_bounds ====
++def test_healing_bounds_skips_with_too_few_recent_calls():
++    ledger = _FakeLedger()
++    ledger.set_rows("billing_queue", _rows(wait_times=[50.0] * (MIN_CALLS_FOR_A_WINDOW - 1)))
++    result = run_healing_bounds_shadow(
++        ledger, _FakeDecider(), "billing_queue", "ivr:standard-ivr:2.0.2")
++    assert result is None
++    assert ledger.shadow_runs == []
++
++
++def test_healing_bounds_computes_real_averages_and_drift():
++    ledger = _FakeLedger()
++    # Both windows return the same fake data (see _FakeLedger docstring) --
++    # what matters here is the arithmetic on whatever data comes back.
++    ledger.set_rows("billing_queue", _rows(wait_times=[80.0, 90.0, 100.0, 85.0, 95.0]))
++    decider = _FakeDecider()
++    result = run_healing_bounds_shadow(
++        ledger, decider, "billing_queue", "ivr:standard-ivr:2.0.2")
++    assert result is not None
++    node, current_wait, baseline_wait, drift = decider.healing_calls[0]
++    assert node == "billing_queue"
++    assert current_wait == pytest.approx(90.0)
++    assert baseline_wait == pytest.approx(90.0)  # same fake data both windows
++    assert drift == pytest.approx(0.0)
++
++
++def test_healing_bounds_shadow_run_never_calls_anything_that_acts():
++    """The whole point: recorded, never applied. There is no method on
++    the fake ledger (or anywhere) this function could call to apply a
++    staffing/routing change -- this test exists to make that
++    structurally obvious, not just assert an absence."""
++    ledger = _FakeLedger()
++    ledger.set_rows("billing_queue", _rows(wait_times=[80.0] * 10))
++    run_healing_bounds_shadow(ledger, _FakeDecider(), "billing_queue", "v1")
++    assert len(ledger.shadow_runs) == 1
++    assert ledger.shadow_runs[0]["recommendation_kind"] == "healing_bounds"
++
++
++# ================================================= score_healing_bounds ====
++def _shadow_run(recommendation_kind="healing_bounds", subject="billing_queue",
++                inputs=None, recommendation=None, timestamp=None):
++    return {
++        "shadow_run_hash": "abc123",
++        "recommendation_kind": recommendation_kind,
++        "subject": subject,
++        "inputs": inputs or {"current_wait": 90.0, "baseline_wait": 40.0},
++        "recommendation": recommendation if recommendation is not None else {
++            "should_heal": True, "target_wait": 45.0, "confidence": 0.8},
++        "timestamp": (timestamp or datetime.now(timezone.utc)).isoformat(),
++    }
++
++
++def test_score_healing_bounds_skips_with_no_outcome_data_yet():
++    ledger = _FakeLedger()
++    ledger.set_rows("billing_queue", [])
++    result = score_healing_bounds_run(ledger, _shadow_run())
++    assert result is None
++    assert ledger.shadow_scores == []
++
++
++def test_score_healing_bounds_skips_when_recommendation_had_no_target():
++    """The governor's fail-closed path (no API client, parse failure)
++    returns target_wait=None -- nothing to score against."""
++    ledger = _FakeLedger()
++    result = score_healing_bounds_run(
++        ledger, _shadow_run(recommendation={"should_heal": False,
++                                            "target_wait": None}))
++    assert result is None
++
++
++def test_score_healing_bounds_computes_error_and_direction():
++    ledger = _FakeLedger()
++    # predicted target_wait=45.0, current_wait was 90.0 (from _shadow_run's
++    # default inputs) -- actual landed at 50.0, much closer to the target
++    # than the starting 90.0 was.
++    ledger.set_rows("billing_queue", _rows(wait_times=[48.0, 50.0, 52.0, 50.0, 50.0]))
++    result = score_healing_bounds_run(ledger, _shadow_run())
++    assert result is not None
++    assert ledger.shadow_scores[0]["score"]["moved_toward_target"] is True
++    assert ledger.shadow_scores[0]["score"]["predicted_wait"] == 45.0
++    assert ledger.shadow_scores[0]["score"]["actual_wait"] == pytest.approx(50.0)
++    assert ledger.shadow_scores[0]["score"]["error_seconds"] == pytest.approx(5.0)
++
++
++def test_score_healing_bounds_detects_recommendation_that_did_not_help():
++    ledger = _FakeLedger()
++    # target was 45.0, current_wait was 90.0, but it actually got WORSE (110)
++    # -- further from the target than the starting point was.
++    ledger.set_rows("billing_queue", _rows(wait_times=[108.0, 110.0, 112.0, 110.0, 110.0]))
++    result = score_healing_bounds_run(ledger, _shadow_run())
++    assert result is not None
++    assert ledger.shadow_scores[0]["score"]["moved_toward_target"] is False
++
++
++# =============================================== run_queue_reordering ====
++def test_queue_reordering_skips_with_fewer_than_two_valid_queues():
++    ledger = _FakeLedger()
++    ledger.set_rows("a", _rows(quality_tiers=["excellent"] * MIN_CALLS_FOR_A_WINDOW))
++    ledger.set_rows("b", _rows(quality_tiers=["poor"] * (MIN_CALLS_FOR_A_WINDOW - 1)))
++    result = run_queue_reordering_shadow(ledger, _FakeDecider(), ["a", "b"], "v1")
++    assert result is None
++
++
++def test_queue_reordering_computes_real_success_rates():
++    ledger = _FakeLedger()
++    ledger.set_rows("a", _rows(quality_tiers=["excellent", "good", "poor", "failed",
++                                              "excellent"]))  # 3/5 = 0.6
++    ledger.set_rows("b", _rows(quality_tiers=["poor"] * 5))  # 0/5 = 0.0
++    decider = _FakeDecider()
++    result = run_queue_reordering_shadow(ledger, decider, ["a", "b"], "v1")
++    assert result is not None
++    current_order, success_rates, caller_dist = decider.reorder_calls[0]
++    assert success_rates["a"] == pytest.approx(0.6)
++    assert success_rates["b"] == pytest.approx(0.0)
++    assert caller_dist["a"] == 5
++    assert caller_dist["b"] == 5
++
++
++# ============================================= score_queue_reordering ====
++def _reorder_shadow_run(before_rates=None, recommendation=None):
++    return {
++        "shadow_run_hash": "def456",
++        "recommendation_kind": "queue_reordering",
++        "subject": "a,b",
++        "inputs": {"success_rates": before_rates or {"a": 0.6, "b": 0.4}},
++        "recommendation": recommendation if recommendation is not None else {
++            "proposed_order": ["a", "b"], "expected_impact": 0.2},
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++    }
++
++
++def test_score_queue_reordering_skips_when_no_proposal_was_made():
++    ledger = _FakeLedger()
++    result = score_queue_reordering_run(
++        ledger, _reorder_shadow_run(recommendation={"proposed_order": None}))
++    assert result is None
++
++
++def test_score_queue_reordering_reports_per_queue_deltas():
++    ledger = _FakeLedger()
++    ledger.set_rows("a", _rows(quality_tiers=["excellent"] * 5))       # 1.0 now
++    ledger.set_rows("b", _rows(quality_tiers=["poor", "failed"] * 3))  # 0.0 now
++    result = score_queue_reordering_run(
++        ledger, _reorder_shadow_run(before_rates={"a": 0.6, "b": 0.4}))
++    assert result is not None
++    deltas = ledger.shadow_scores[0]["score"]["deltas"]
++    assert deltas["a"] == pytest.approx(0.4)    # 1.0 - 0.6
++    assert deltas["b"] == pytest.approx(-0.4)   # 0.0 - 0.4
++
++
++def test_score_queue_reordering_skips_a_queue_with_no_outcome_data_but_scores_the_rest():
++    ledger = _FakeLedger()
++    ledger.set_rows("a", _rows(quality_tiers=["excellent"] * 5))
++    # "b" has no rows registered at all -- insufficient outcome data
++    result = score_queue_reordering_run(
++        ledger, _reorder_shadow_run(before_rates={"a": 0.6, "b": 0.4}))
++    assert result is not None
++    deltas = ledger.shadow_scores[0]["score"]["deltas"]
++    assert "a" in deltas
++    assert "b" not in deltas
+diff --git a/sentinel_os/Tests/test_recommendation_impact_integration.py b/sentinel_os/Tests/test_recommendation_impact_integration.py
+new file mode 100644
+index 0000000..affa4a3
+--- /dev/null
++++ b/sentinel_os/Tests/test_recommendation_impact_integration.py
+@@ -0,0 +1,94 @@
++"""Real-Postgres integration tests for the recommendation-shadow pipeline.
++
++Unlike test_recommendation_impact.py (fake ledger, fast logic-only tests),
++these prove the actual SQL in get_decisions_by_node_in_window really
++filters by node and time, and that the full pipeline -- real ledger write,
++real windowed pull, real (fail-closed) decider call, real shadow-run
++record -- actually connects end to end.
++"""
++import time
++import uuid
++from datetime import datetime, timedelta, timezone
++
++from cassette_schema import validate_cassette
++from cassettes.ivr_cassette import IvrCassette
++from claude_governance_api import ClaudeGovernanceDecider
++from governance.ledger_postgres import GovernanceDecisionRecord
++from recommendation_impact import run_healing_bounds_shadow
++
++_PARAMS = validate_cassette(IvrCassette())
++
++
++def _decision(node, wait_time, quality_tier="good", cassette_version=None):
++    return GovernanceDecisionRecord(
++        action_type="governance_decision", node=node,
++        cassette_version=cassette_version or "ivr:standard-ivr:2.0.2",
++        input_data={"call_sid": f"RI{uuid.uuid4().hex[:10]}",
++                   "wait_time": wait_time, "quality_tier": quality_tier},
++        policy_parameters={"governance_trigger": 2},
++        reasoning="test call for recommendation_impact",
++        output={"safe": True})
++
++
++def test_get_decisions_by_node_in_window_filters_by_node(test_ledger):
++    node_a, node_b = f"node-a-{uuid.uuid4().hex[:6]}", f"node-b-{uuid.uuid4().hex[:6]}"
++    test_ledger.append_decision(_decision(node_a, 50.0),
++                                governance_params=_PARAMS)
++    test_ledger.append_decision(_decision(node_b, 99.0),
++                                governance_params=_PARAMS)
++
++    since = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
++    until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
++    rows_a = test_ledger.get_decisions_by_node_in_window(node_a, since, until)
++    assert len(rows_a) == 1
++    assert rows_a[0]["input_data"]["wait_time"] == 50.0
++
++
++def test_get_decisions_by_node_in_window_filters_by_time(test_ledger):
++    node = f"node-time-{uuid.uuid4().hex[:6]}"
++    test_ledger.append_decision(_decision(node, 50.0),
++                                governance_params=_PARAMS)
++
++    # A window entirely in the future must not include this real, already-
++    # written row.
++    future_since = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
++    future_until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
++    assert test_ledger.get_decisions_by_node_in_window(
++        node, future_since, future_until) == []
++
++    # A window spanning right now must include it.
++    since = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
++    until = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
++    assert len(test_ledger.get_decisions_by_node_in_window(node, since, until)) == 1
++
++
++def test_full_pipeline_real_ledger_real_pull_real_decider_real_record(test_ledger):
++    """Fail-closed decider (no API key) is deliberate -- same convention
++    test_sentinel_worker.py already uses for a real-without-live-API-key
++    test: it's still real production_harness/ledger code on a real code
++    path, just not spending real API money to prove the wiring connects."""
++    node = f"pipeline-{uuid.uuid4().hex[:6]}"
++    # Baseline window's real calls, then a real time gap, then recent
++    # window's real calls -- run_healing_bounds_shadow's baseline window
++    # is defined as the period just BEFORE the recent window, so this
++    # needs two genuinely time-separated batches, not six rows all at once.
++    for i in range(6):
++        test_ledger.append_decision(
++            _decision(node, 60.0 + i, quality_tier="excellent"),
++            governance_params=_PARAMS)
++    time.sleep(1.5)
++    for i in range(6):
++        test_ledger.append_decision(
++            _decision(node, 90.0 + i, quality_tier="good"),
++            governance_params=_PARAMS)
++
++    decider = ClaudeGovernanceDecider(api_key=None)  # fail-closed, no network
++    result = run_healing_bounds_shadow(
++        test_ledger, decider, node, "ivr:standard-ivr:2.0.2",
++        recent_window_s=1.0, baseline_window_s=3.0)
++    assert result is not None
++    assert result["recommendation_kind"] == "healing_bounds"
++    assert test_ledger.verify_chain()["ok"]
++
++    unscored = test_ledger.get_unscored_shadow_runs()
++    assert any(u["shadow_run_hash"] == result["current_hash"] for u in unscored)
+diff --git a/sentinel_os/Tests/test_recommendation_shadow_ledger.py b/sentinel_os/Tests/test_recommendation_shadow_ledger.py
+new file mode 100644
+index 0000000..a8d9e7e
+--- /dev/null
++++ b/sentinel_os/Tests/test_recommendation_shadow_ledger.py
+@@ -0,0 +1,101 @@
++"""recommendation_shadow_run / recommendation_shadow_score as new ledger
++record kinds (2026-07-31) -- Item 9 (shadow_run_hash), same contract every
++prior optional field already uses. Tested against a real ledger, same
++convention test_outcome_chain_records.py / test_ai_cost_ledger.py already
++established.
++"""
++
++CASSETTE_VERSION = "ivr:standard-ivr:2.0.2"
++
++
++def test_a_shadow_run_hashes_and_verifies(test_ledger):
++    r1 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="billing_queue",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 90.0, "baseline_wait": 40.0},
++        recommendation={"should_heal": True, "target_wait": 45.0,
++                        "confidence": 0.8})
++    assert r1["status"] == "created"
++    assert test_ledger.verify_chain()["ok"]
++
++
++def test_a_shadow_score_references_a_real_shadow_run_and_verifies(test_ledger):
++    r1 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="billing_queue",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 90.0, "baseline_wait": 40.0},
++        recommendation={"should_heal": True, "target_wait": 45.0,
++                        "confidence": 0.8})
++    r2 = test_ledger.record_recommendation_shadow_score(
++        shadow_run_hash=r1["current_hash"],
++        actual={"actual_wait": 50.0},
++        score={"predicted": 45.0, "actual": 50.0, "error": 5.0})
++    assert r2["status"] == "created"
++    assert r2["shadow_run_hash"] == r1["current_hash"]
++    assert test_ledger.verify_chain()["ok"]
++
++
++def test_scoring_a_hash_that_was_never_a_shadow_run_is_refused(test_ledger):
++    import pytest
++    with pytest.raises(ValueError, match="never actually recommended"):
++        test_ledger.record_recommendation_shadow_score(
++            shadow_run_hash="not-a-real-hash-" + "0" * 40,
++            actual={"actual_wait": 50.0}, score={"error": 5.0})
++
++
++def test_get_unscored_shadow_runs_excludes_scored_ones(test_ledger):
++    r1 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="q-unscored",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 90.0}, recommendation={"should_heal": True})
++    r2 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="q-scored",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 91.0}, recommendation={"should_heal": True})
++    test_ledger.record_recommendation_shadow_score(
++        shadow_run_hash=r2["current_hash"],
++        actual={"actual_wait": 50.0}, score={"error": 5.0})
++
++    unscored = test_ledger.get_unscored_shadow_runs()
++    hashes = {u["shadow_run_hash"] for u in unscored}
++    assert r1["current_hash"] in hashes
++    assert r2["current_hash"] not in hashes
++
++
++def test_get_unscored_shadow_runs_returns_the_real_inputs_and_recommendation(
++    test_ledger,
++):
++    inputs = {"current_wait": 90.0, "baseline_wait": 40.0}
++    recommendation = {"should_heal": True, "target_wait": 45.0}
++    r1 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="q-detail",
++        cassette_version=CASSETTE_VERSION,
++        inputs=inputs, recommendation=recommendation)
++    unscored = test_ledger.get_unscored_shadow_runs()
++    match = [u for u in unscored if u["shadow_run_hash"] == r1["current_hash"]]
++    assert len(match) == 1
++    assert match[0]["inputs"] == inputs
++    assert match[0]["recommendation"] == recommendation
++    assert match[0]["recommendation_kind"] == "healing_bounds"
++    assert match[0]["subject"] == "q-detail"
++
++
++def test_changing_the_score_changes_the_hash(test_ledger):
++    """Tamper-evidence: two different scores for two different shadow
++    runs must not collide."""
++    r1 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="q-a",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 90.0}, recommendation={"should_heal": True})
++    r2 = test_ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject="q-b",
++        cassette_version=CASSETTE_VERSION,
++        inputs={"current_wait": 91.0}, recommendation={"should_heal": True})
++    s1 = test_ledger.record_recommendation_shadow_score(
++        shadow_run_hash=r1["current_hash"],
++        actual={"actual_wait": 50.0}, score={"error": 5.0})
++    s2 = test_ledger.record_recommendation_shadow_score(
++        shadow_run_hash=r2["current_hash"],
++        actual={"actual_wait": 99.0}, score={"error": 8.0})
++    assert s1["current_hash"] != s2["current_hash"]
++    assert test_ledger.verify_chain()["ok"]
+diff --git a/sentinel_os/canonical_fields.py b/sentinel_os/canonical_fields.py
+index 4b7c884..5eb63ab 100644
+--- a/sentinel_os/canonical_fields.py
++++ b/sentinel_os/canonical_fields.py
+@@ -71,6 +71,16 @@ OPTIONAL_HASHED_FIELDS = (
+     # every row written before this field existed, same migration
+     # guarantee every other optional field here already has.
+     "ai_cost",
++    # Item 9 (2026-07-31): which recommendation_shadow_run a
++    # recommendation_shadow_score row is scoring. Its own field, not a
++    # reuse of replaces_hash -- that field already has a specific,
++    # fail-closed-enforced meaning (a NEW governance_decision replacing
++    # an OLD one, see obligation_supersession.py) that this is not; a
++    # shadow score isn't a decision at all, let alone one replacing
++    # another, and overloading replaces_hash here would have made that
++    # field mean two different things depending on record_kind with
++    # nothing to warn a future reader which one they're looking at.
++    "shadow_run_hash",
+ )
+ 
+ 
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index 42b3f8c..09ed429 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -401,6 +401,17 @@ class PostgreSQLLedger:
+                     ALTER TABLE ledger_entries
+                         ADD COLUMN IF NOT EXISTS ai_cost JSONB;
+                 """)
++            # Item 9: which shadow run a shadow score is scoring -- its
++            # own field, see canonical_fields.py's comment for why this
++            # is deliberately NOT a reuse of replaces_hash.
++            if "shadow_run_hash" not in existing_columns:
++                cursor.execute("""
++                    ALTER TABLE ledger_entries
++                        ADD COLUMN IF NOT EXISTS shadow_run_hash VARCHAR(64);
++                    CREATE INDEX IF NOT EXISTS idx_shadow_run_hash
++                        ON ledger_entries(shadow_run_hash)
++                        WHERE shadow_run_hash IS NOT NULL;
++                """)
+             conn.commit()
+         finally:
+             self.pool.putconn(conn)
+@@ -1065,6 +1076,234 @@ class PostgreSQLLedger:
+         finally:
+             self.pool.putconn(conn)
+ 
++    def record_recommendation_shadow_run(
++            self, recommendation_kind: str, subject: str, cassette_version: str,
++            inputs: Dict[str, Any], recommendation: Dict[str, Any],
++            authorized_by: Optional[str] = None) -> Dict[str, Any]:
++        """Record one AI-generated recommendation in SHADOW MODE.
++
++        Wm's 'recommendation impact testing' roadmap item (2026-07-31),
++        scoped to predictive-accuracy measurement: this NEVER causes
++        anything to be acted on -- it exists purely so a later pass
++        (record_recommendation_shadow_score) can compare `recommendation`'s
++        predicted values against what actually happened and score the
++        AI's predictive accuracy. Scoped this way, rather than true A/B
++        impact testing, because none of the three recommendation methods
++        this covers (decide_healing_bounds, decide_queue_reordering;
++        decide_staffing_adjustment deliberately excluded, see
++        recommendation_impact.py's module docstring) are wired into the
++        live decision path today -- only safety_check is.
++
++        `inputs` is the real data the recommendation was computed from
++        (recommendation_impact.py pulls it from get_decisions_by_node_in_window,
++        never simulated). `recommendation` is decide_healing_bounds'/
++        decide_queue_reordering's own return dict, unmodified.
++
++        Scoring is a SEPARATE row (record_recommendation_shadow_score),
++        never an update to this one -- an append-only chain has no other
++        way to attach a fact that wasn't knowable until later.
++        """
++        if not recommendation_kind or not str(recommendation_kind).strip():
++            raise ValueError("record_recommendation_shadow_run requires "
++                             "recommendation_kind")
++        if not subject or not str(subject).strip():
++            raise ValueError("record_recommendation_shadow_run requires subject "
++                             "(the queue/node this recommendation is about)")
++        if not cassette_version or not isinstance(cassette_version, str):
++            raise ValueError("record_recommendation_shadow_run requires "
++                             "cassette_version")
++        if not isinstance(inputs, dict) or not isinstance(recommendation, dict):
++            raise ValueError("record_recommendation_shadow_run requires inputs "
++                             "and recommendation as dicts")
++        inputs = json.loads(json.dumps(inputs, sort_keys=True, default=str))
++        recommendation = json.loads(
++            json.dumps(recommendation, sort_keys=True, default=str))
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
++            """)
++            row = cursor.fetchone()
++            previous_hash = row[0] if row else "genesis"
++
++            canonical_entry = {
++                "record_kind": "recommendation_shadow_run",
++                "cassette_version": cassette_version,
++                "recommendation_kind": str(recommendation_kind),
++                "subject": str(subject),
++                "inputs": inputs,
++                "recommendation": recommendation,
++                "previous_hash": previous_hash,
++            }
++            apply_optional_hashed_fields(canonical_entry, {
++                "authorized_by": authorized_by,
++            })
++            current_hash = hashlib.sha256(
++                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
++            ).hexdigest()
++
++            data = {"record_kind": "recommendation_shadow_run",
++                    "recommendation_kind": str(recommendation_kind),
++                    "subject": str(subject), "parameter_changed": False}
++            cursor.execute("""
++                INSERT INTO ledger_entries
++                (action_type, node, previous_value, applied_value, reason,
++                 previous_hash, current_hash, data,
++                 record_kind, cassette_version, input_data, decision_output,
++                 authorized_by)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++            """, ("recommendation_shadow_run", str(subject)[:100], 0.0, 0.0,
++                  f"shadow recommendation ({recommendation_kind}) for {subject}, "
++                  "never acted on -- predictive-accuracy measurement only",
++                  previous_hash, current_hash, json.dumps(data),
++                  "recommendation_shadow_run", cassette_version,
++                  json.dumps(inputs), json.dumps(recommendation), authorized_by))
++            conn.commit()
++            return {
++                "status": "created",
++                "recommendation_kind": str(recommendation_kind),
++                "subject": str(subject),
++                "current_hash": current_hash,
++            }
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
++    def record_recommendation_shadow_score(
++            self, shadow_run_hash: str, actual: Dict[str, Any],
++            score: Dict[str, Any], authorized_by: Optional[str] = None,
++            ) -> Dict[str, Any]:
++        """Record what actually happened against one shadow run's
++        prediction, and the computed accuracy/error -- a NEW row that
++        references shadow_run_hash, never a mutation of the original.
++
++        `actual` is the real outcome data pulled from
++        get_decisions_by_node_in_window for the window AFTER the
++        recommendation was made. `score` is recommendation_impact.py's
++        own comparison output (e.g. {"predicted_wait": ..., "actual_wait":
++        ..., "error": ..., "within_confidence": ...}) -- this method
++        stores it, it does not compute it; see
++        recommendation_impact.score_healing_bounds_run /
++        score_queue_reordering_run for the actual comparison logic.
++        """
++        if not shadow_run_hash or not str(shadow_run_hash).strip():
++            raise ValueError("record_recommendation_shadow_score requires "
++                             "shadow_run_hash")
++        if not isinstance(actual, dict) or not isinstance(score, dict):
++            raise ValueError("record_recommendation_shadow_score requires "
++                             "actual and score as dicts")
++        actual = json.loads(json.dumps(actual, sort_keys=True, default=str))
++        score = json.loads(json.dumps(score, sort_keys=True, default=str))
++
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries
++                WHERE current_hash = %s AND record_kind = 'recommendation_shadow_run'
++            """, (shadow_run_hash,))
++            if cursor.fetchone() is None:
++                raise ValueError(
++                    f"shadow_run_hash {shadow_run_hash!r} does not match any "
++                    "recommendation_shadow_run row -- refusing to score "
++                    "something that was never actually recommended")
++
++            cursor.execute("""
++                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
++            """)
++            row = cursor.fetchone()
++            previous_hash = row[0] if row else "genesis"
++
++            canonical_entry = {
++                "record_kind": "recommendation_shadow_score",
++                "actual": actual,
++                "score": score,
++                "previous_hash": previous_hash,
++            }
++            apply_optional_hashed_fields(canonical_entry, {
++                "authorized_by": authorized_by,
++                "shadow_run_hash": shadow_run_hash,
++            })
++            current_hash = hashlib.sha256(
++                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
++            ).hexdigest()
++
++            data = {"record_kind": "recommendation_shadow_score",
++                    "shadow_run_hash": shadow_run_hash, "parameter_changed": False}
++            cursor.execute("""
++                INSERT INTO ledger_entries
++                (action_type, node, previous_value, applied_value, reason,
++                 previous_hash, current_hash, data,
++                 record_kind, shadow_run_hash, input_data, decision_output,
++                 authorized_by)
++                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
++            """, ("recommendation_shadow_score", shadow_run_hash[:100], 0.0, 0.0,
++                  f"scored shadow recommendation {shadow_run_hash[:12]}",
++                  previous_hash, current_hash, json.dumps(data),
++                  "recommendation_shadow_score", shadow_run_hash,
++                  json.dumps(actual), json.dumps(score), authorized_by))
++            conn.commit()
++            return {"status": "created", "shadow_run_hash": shadow_run_hash,
++                    "current_hash": current_hash}
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
++    def get_unscored_shadow_runs(self, older_than_iso: Optional[str] = None,
++                                 limit: int = 100) -> List[Dict[str, Any]]:
++        """Shadow runs (recommendation_shadow_run rows) that have no
++        matching recommendation_shadow_score row yet -- what the scoring
++        pass (recommendation_impact.py / the CLI) should process next.
++        `older_than_iso`: only shadow runs made before this timestamp --
++        the caller's job to pick a value that guarantees the outcome
++        window has fully elapsed; this method has no opinion on how long
++        that should be.
++        """
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            query = """
++                SELECT r.current_hash, r.timestamp, r.cassette_version,
++                       r.data, r.input_data, r.decision_output
++                FROM ledger_entries r
++                WHERE r.record_kind = 'recommendation_shadow_run'
++                  AND NOT EXISTS (
++                      SELECT 1 FROM ledger_entries s
++                      WHERE s.record_kind = 'recommendation_shadow_score'
++                        AND s.shadow_run_hash = r.current_hash
++                  )
++            """
++            params: list = []
++            if older_than_iso is not None:
++                query += " AND r.timestamp < %s"
++                params.append(older_than_iso)
++            query += " ORDER BY r.id ASC LIMIT %s"
++            params.append(limit)
++            cursor.execute(query, tuple(params))
++            out = []
++            for row in cursor.fetchall():
++                data = self._as_json(row[3]) or {}
++                out.append({
++                    "shadow_run_hash": row[0],
++                    "timestamp": row[1].isoformat() if row[1] else None,
++                    "cassette_version": row[2],
++                    "recommendation_kind": data.get("recommendation_kind"),
++                    "subject": data.get("subject"),
++                    "inputs": self._as_json(row[4]),
++                    "recommendation": self._as_json(row[5]),
++                })
++            return out
++        finally:
++            self.pool.putconn(conn)
++
+     def record_outcome_harm_event(self, cassette_version: str,
+                                  decision_hash: str, harm_kind: str,
+                                  subject_id: str, finding: Dict[str, Any],
+@@ -1399,6 +1638,44 @@ class PostgreSQLLedger:
+         finally:
+             self.pool.putconn(conn)
+ 
++    def get_decisions_by_node_in_window(
++            self, node: str, since_iso: str, until_iso: str,
++            limit: int = 1000) -> List[Dict]:
++        """Real governance_decision rows for one node/queue, timestamp
++        BETWEEN [since_iso, until_iso). Built for recommendation_impact.py
++        (2026-07-31): pulling real recent-window and baseline-window
++        per-queue data to feed decide_healing_bounds/decide_queue_reordering
++        with real numbers instead of simulated ones. Deliberately separate
++        from get_decisions() (which has no time or node filter) rather than
++        overloading that method's existing contract -- this one exists for
++        one purpose, aggregation over the result is the caller's job, not
++        this method's.
++        """
++        conn = self.pool.getconn()
++        try:
++            cursor = conn.cursor()
++            cursor.execute("""
++                SELECT id, timestamp, node, input_data, decision_output
++                FROM ledger_entries
++                WHERE record_kind = 'governance_decision'
++                  AND node = %s
++                  AND timestamp >= %s AND timestamp < %s
++                ORDER BY id ASC
++                LIMIT %s
++            """, (node, since_iso, until_iso, limit))
++            rows = []
++            for row in cursor.fetchall():
++                rows.append({
++                    "id": row[0],
++                    "timestamp": row[1].isoformat() if row[1] else None,
++                    "node": row[2],
++                    "input_data": self._as_json(row[3]),
++                    "output": self._as_json(row[4]),
++                })
++            return rows
++        finally:
++            self.pool.putconn(conn)
++
+     def get_entries(self, limit: int = 100) -> List[Dict]:
+         """Retrieve recent entries"""
+         
+@@ -1603,7 +1880,7 @@ class PostgreSQLLedger:
+                        decision_output, cassette_hash,
+                        cassette_code_hash, model_identity, authorized_by,
+                        supersedes_id, supersedes_hash, outcome_obligation,
+-                       replaces_hash, ai_cost
++                       replaces_hash, ai_cost, shadow_run_hash
+                 FROM ledger_entries
+                 ORDER BY id ASC
+             """)
+@@ -1623,7 +1900,7 @@ class PostgreSQLLedger:
+                  decision_output, cassette_hash,
+                  cassette_code_hash, model_identity, authorized_by,
+                  supersedes_id, supersedes_hash, outcome_obligation,
+-                 replaces_hash, ai_cost) = row
++                 replaces_hash, ai_cost, shadow_run_hash) = row
+                 
+                 # Check chain link integrity
+                 if stored_prev != prev_hash:
+@@ -1748,6 +2025,43 @@ class PostgreSQLLedger:
+                             "supersedes_hash": supersedes_hash,
+                             "authorized_by": authorized_by,
+                         })
++                    elif record_kind == "recommendation_shadow_run":
++                        # Mirrors record_recommendation_shadow_run().
++                        # recommendation_kind/subject were stored in data;
++                        # inputs in input_data; the recommendation itself
++                        # in decision_output.
++                        d = self._as_json(data)
++                        canonical_entry = {
++                            "record_kind": "recommendation_shadow_run",
++                            "cassette_version": cassette_version,
++                            "recommendation_kind": d.get("recommendation_kind"),
++                            "subject": d.get("subject"),
++                            "inputs": self._as_json(input_data),
++                            "recommendation": self._as_json(decision_output),
++                            "previous_hash": stored_prev,
++                        }
++                        apply_optional_hashed_fields(canonical_entry, {
++                            "authorized_by": authorized_by,
++                        })
++                    elif record_kind == "recommendation_shadow_score":
++                        # Mirrors record_recommendation_shadow_score(). The
++                        # actual outcome was stored in input_data (reusing
++                        # that column's existing "real data this row is
++                        # about" role, same as every other record kind
++                        # here); the computed score in decision_output;
++                        # shadow_run_hash has its own dedicated column,
++                        # deliberately not a reuse of replaces_hash -- see
++                        # canonical_fields.py.
++                        canonical_entry = {
++                            "record_kind": "recommendation_shadow_score",
++                            "actual": self._as_json(input_data),
++                            "score": self._as_json(decision_output),
++                            "previous_hash": stored_prev,
++                        }
++                        apply_optional_hashed_fields(canonical_entry, {
++                            "authorized_by": authorized_by,
++                            "shadow_run_hash": shadow_run_hash,
++                        })
+                     else:
+                         # Legacy path (append)
+                         canonical_entry = {
+diff --git a/sentinel_os/recommendation_impact.py b/sentinel_os/recommendation_impact.py
+new file mode 100644
+index 0000000..3d4fa32
+--- /dev/null
++++ b/sentinel_os/recommendation_impact.py
+@@ -0,0 +1,337 @@
++"""
++Recommendation Impact Testing (predictive-accuracy scope) -- Wm's July 28
++roadmap item 4, third piece, 2026-07-31.
++
++SCOPE (Wm's decision, 2026-07-31): predictive-accuracy testing, not true
++A/B impact testing. Every recommendation this module generates is a SHADOW
++RUN -- computed from real ledger data, recorded to the chain via
++governance.ledger_postgres.PostgreSQLLedger.record_recommendation_shadow_run,
++and NEVER acted on. True impact testing (actually applying a recommendation
++and comparing outcomes) would require wiring decide_healing_bounds /
++decide_queue_reordering into the live decision path first -- a separate,
++much bigger product decision. Only safety_check runs live today (see
++claude_governance_api.py's module docstring and production_harness.py).
++
++Two recommendation kinds are shadow-run here:
++  - healing_bounds: ClaudeGovernanceDecider.decide_healing_bounds, real
++    current/baseline wait pulled from the ledger.
++  - queue_reordering: ClaudeGovernanceDecider.decide_queue_reordering, real
++    success rates + caller-volume distribution pulled from the ledger.
++
++decide_staffing_adjustment is DELIBERATELY EXCLUDED. It needs
++current_agents -- real-time headcount -- and this system has no data
++source for that anywhere. Fabricating a number to feed it would violate
++the same "never guess, say why it's unknown" discipline the rest of this
++codebase holds to (see event_v1.py's Provenance Rule). If a real staffing
++data source is ever wired in, this module is the natural place to add a
++third shadow-run function alongside these two.
++
++Every pull is REAL, from
++governance.ledger_postgres.PostgreSQLLedger.get_decisions_by_node_in_window
++-- never simulated. A window with too little real data to trust returns
++None (skip that queue this round), not a recommendation computed from thin
++air, and not an exception that would abort every other queue's run too.
++"""
++from __future__ import annotations
++
++from datetime import datetime, timedelta, timezone
++from typing import Any, Dict, List, Optional
++
++# Below this many real calls in a window, there isn't enough signal to
++# trust an average -- skip rather than recommend from noise. Same
++# "honestly insufficient, not a bug to route around" posture
++# check_geographic_outcome_equity and friends already use for small
++# cohorts (see regulatory_checks.py).
++MIN_CALLS_FOR_A_WINDOW = 5
++
++# quality_tier values (sentinel_core.OutcomeQuality) counted as a
++# successful outcome for a success-rate computation. excellent/good are
++# both "the call ended well, just with more or less friction"; poor/failed
++# both indicate an outcome that wasn't right.
++SUCCESS_TIERS = frozenset({"excellent", "good"})
++
++
++def _iso(dt: datetime) -> str:
++    return dt.astimezone(timezone.utc).isoformat()
++
++
++def _wait_samples(ledger, node: str, since: datetime, until: datetime) -> List[float]:
++    """Real per-call wait_time values for one node/queue in [since, until)."""
++    rows = ledger.get_decisions_by_node_in_window(node, _iso(since), _iso(until))
++    out = []
++    for r in rows:
++        inp = r.get("input_data")
++        if isinstance(inp, dict) and isinstance(inp.get("wait_time"), (int, float)):
++            out.append(float(inp["wait_time"]))
++    return out
++
++
++def _success_rate(ledger, node: str, since: datetime, until: datetime,
++                  ) -> Optional[Dict[str, Any]]:
++    """Real success rate for one node/queue in [since, until), or None if
++    fewer than MIN_CALLS_FOR_A_WINDOW real calls exist there."""
++    rows = ledger.get_decisions_by_node_in_window(node, _iso(since), _iso(until))
++    tiers = []
++    for r in rows:
++        inp = r.get("input_data")
++        if isinstance(inp, dict) and inp.get("quality_tier"):
++            tiers.append(inp["quality_tier"])
++    if len(tiers) < MIN_CALLS_FOR_A_WINDOW:
++        return None
++    successes = sum(1 for t in tiers if t in SUCCESS_TIERS)
++    return {"success_rate": successes / len(tiers), "sample_size": len(tiers)}
++
++
++def _caller_distribution(ledger, nodes: List[str], since: datetime, until: datetime,
++                         ) -> Dict[str, int]:
++    """Real call volume per queue -- decide_queue_reordering's
++    caller_distribution parameter."""
++    return {node: len(ledger.get_decisions_by_node_in_window(node, _iso(since), _iso(until)))
++            for node in nodes}
++
++
++# --------------------------------------------------------- healing bounds --
++def run_healing_bounds_shadow(
++        ledger, decider, node: str, cassette_version: str,
++        now: Optional[datetime] = None,
++        recent_window_s: float = 3600.0, baseline_window_s: float = 86400.0,
++        ) -> Optional[Dict[str, Any]]:
++    """Shadow-run decide_healing_bounds for one queue from real recent vs
++    real baseline wait data.
++
++    baseline_window_s is measured back from (now - recent_window_s), i.e.
++    the two windows are adjacent, not overlapping -- "baseline" means the
++    period just before the recent one, not a fixed historical reference.
++
++    Returns None (skip, never a fabricated recommendation) if either
++    window has fewer than MIN_CALLS_FOR_A_WINDOW real calls.
++    """
++    now = now or datetime.now(timezone.utc)
++    recent = _wait_samples(ledger, node, now - timedelta(seconds=recent_window_s), now)
++    baseline = _wait_samples(
++        ledger, node, now - timedelta(seconds=recent_window_s + baseline_window_s),
++        now - timedelta(seconds=recent_window_s))
++    if len(recent) < MIN_CALLS_FOR_A_WINDOW or len(baseline) < MIN_CALLS_FOR_A_WINDOW:
++        return None
++
++    current_wait = sum(recent) / len(recent)
++    baseline_wait = sum(baseline) / len(baseline)
++    drift_magnitude = (
++        abs(current_wait - baseline_wait) / baseline_wait if baseline_wait else 0.0)
++
++    inputs = {"current_wait": current_wait, "baseline_wait": baseline_wait,
++              "drift_magnitude": drift_magnitude,
++              "recent_sample_size": len(recent), "baseline_sample_size": len(baseline)}
++    recommendation = decider.decide_healing_bounds(
++        node, current_wait, baseline_wait, drift_magnitude)
++    return ledger.record_recommendation_shadow_run(
++        recommendation_kind="healing_bounds", subject=node,
++        cassette_version=cassette_version, inputs=inputs,
++        recommendation=recommendation)
++
++
++def score_healing_bounds_run(
++        ledger, shadow_run: Dict[str, Any], now: Optional[datetime] = None,
++        outcome_window_s: float = 3600.0) -> Optional[Dict[str, Any]]:
++    """Compare a healing_bounds shadow run's predicted target_wait against
++    the real wait data in the window AFTER it was made.
++
++    Returns None (skip -- not enough real outcome data yet, or the
++    governor's fail-closed path recommended nothing scoreable) rather than
++    force a score out of too little or the wrong kind of data.
++    """
++    recommendation = shadow_run.get("recommendation")
++    if not isinstance(recommendation, dict) or recommendation.get("target_wait") is None:
++        return None
++    made_at = datetime.fromisoformat(shadow_run["timestamp"])
++    actual_samples = _wait_samples(ledger, shadow_run["subject"], made_at,
++                                   made_at + timedelta(seconds=outcome_window_s))
++    if len(actual_samples) < MIN_CALLS_FOR_A_WINDOW:
++        return None
++
++    actual_wait = sum(actual_samples) / len(actual_samples)
++    predicted_wait = float(recommendation["target_wait"])
++    error = abs(actual_wait - predicted_wait)
++    # Directional check: did the wait actually move toward the predicted
++    # target rather than staying at/beyond where it started? A cruder but
++    # more honest signal than exact-value matching -- an Erlang-C-style
++    # target is a reasonable estimate, not a guaranteed outcome, so
++    # "closer to the target than before" is what a useful recommendation
++    # should achieve even when it doesn't land exactly.
++    current_wait = shadow_run.get("inputs", {}).get("current_wait")
++    moved_toward_target = (
++        None if current_wait is None else
++        abs(actual_wait - predicted_wait) < abs(current_wait - predicted_wait))
++
++    actual = {"actual_wait": actual_wait, "sample_size": len(actual_samples)}
++    score = {"predicted_wait": predicted_wait, "actual_wait": actual_wait,
++             "error_seconds": error, "moved_toward_target": moved_toward_target}
++    return ledger.record_recommendation_shadow_score(
++        shadow_run_hash=shadow_run["shadow_run_hash"], actual=actual, score=score)
++
++
++# ------------------------------------------------------- queue reordering --
++def run_queue_reordering_shadow(
++        ledger, decider, nodes: List[str], cassette_version: str,
++        now: Optional[datetime] = None, window_s: float = 86400.0,
++        ) -> Optional[Dict[str, Any]]:
++    """Shadow-run decide_queue_reordering across a set of queues from real
++    success rates + real call-volume distribution.
++
++    Returns None if fewer than 2 queues have enough real data to compare
++    -- reordering is meaningless for zero or one queue.
++    """
++    now = now or datetime.now(timezone.utc)
++    since = now - timedelta(seconds=window_s)
++    success_rates: Dict[str, float] = {}
++    sample_sizes: Dict[str, int] = {}
++    for node in nodes:
++        stats = _success_rate(ledger, node, since, now)
++        if stats is not None:
++            success_rates[node] = stats["success_rate"]
++            sample_sizes[node] = stats["sample_size"]
++    if len(success_rates) < 2:
++        return None
++    caller_distribution = _caller_distribution(ledger, list(success_rates), since, now)
++
++    inputs = {"success_rates": success_rates, "sample_sizes": sample_sizes,
++              "caller_distribution": caller_distribution,
++              "current_order": list(success_rates)}
++    recommendation = decider.decide_queue_reordering(
++        list(success_rates), success_rates, caller_distribution)
++    return ledger.record_recommendation_shadow_run(
++        recommendation_kind="queue_reordering",
++        subject=",".join(sorted(success_rates)),
++        cassette_version=cassette_version, inputs=inputs,
++        recommendation=recommendation)
++
++
++def score_queue_reordering_run(
++        ledger, shadow_run: Dict[str, Any], now: Optional[datetime] = None,
++        outcome_window_s: float = 86400.0) -> Optional[Dict[str, Any]]:
++    """Compare a queue_reordering shadow run's prediction against real
++    success-rate movement afterward, per queue.
++
++    Reports what actually happened for every queue named in the
++    recommendation rather than forcing a single pass/fail verdict onto an
++    inherently multi-queue outcome -- a caller that wants a summary
++    number can average `deltas` itself, exactly like `average_delta` does
++    here, but the per-queue detail is not thrown away to produce it.
++    """
++    recommendation = shadow_run.get("recommendation")
++    if not isinstance(recommendation, dict) or not recommendation.get("proposed_order"):
++        return None
++    made_at = datetime.fromisoformat(shadow_run["timestamp"])
++    before_rates = shadow_run.get("inputs", {}).get("success_rates", {})
++    after_rates: Dict[str, Any] = {}
++    for node in before_rates:
++        stats = _success_rate(ledger, node, made_at,
++                              made_at + timedelta(seconds=outcome_window_s))
++        after_rates[node] = stats["success_rate"] if stats else None
++
++    deltas = {node: (after_rates[node] - before_rates[node])
++             for node in before_rates if after_rates.get(node) is not None}
++    if not deltas:
++        return None  # no queue had enough real outcome data yet
++
++    actual = {"success_rates_after": after_rates, "outcome_window_s": outcome_window_s}
++    score = {"success_rates_before": before_rates, "deltas": deltas,
++             "expected_impact": recommendation.get("expected_impact"),
++             "average_delta": sum(deltas.values()) / len(deltas)}
++    return ledger.record_recommendation_shadow_score(
++        shadow_run_hash=shadow_run["shadow_run_hash"], actual=actual, score=score)
++
++
++def main() -> None:
++    """CLI: generate new shadow runs for a set of queues, or score
++    whichever due ones (get_unscored_shadow_runs) have real outcome data
++    now. Meant to run on a schedule (e.g. cron/systemd timer) -- same
++    dry-run/JSON-summary shape as obligation_sweep.py's own CLI.
++    """
++    import argparse
++    import json as _json
++    import os as _os
++
++    from claude_governance_api import ClaudeGovernanceDecider
++    from governance.ledger_postgres import PostgreSQLLedger
++
++    ap = argparse.ArgumentParser(
++        description="Recommendation shadow-run generator/scorer "
++                    "(predictive-accuracy testing, never acts on anything)")
++    sub = ap.add_subparsers(dest="command", required=True)
++
++    p_run = sub.add_parser(
++        "run", help="Generate new shadow runs from real recent ledger data")
++    p_run.add_argument("--queue", action="append", required=True, dest="queues",
++                       help="Queue/node name to shadow-run (repeatable)")
++    p_run.add_argument("--cassette-version", required=True)
++    p_run.add_argument("--dry-run", action="store_true",
++                       help="Compute and print recommendations but do not "
++                            "record them on the ledger")
++
++    p_score = sub.add_parser(
++        "score", help="Score due shadow runs against real outcome data")
++    p_score.add_argument("--min-age-s", type=float, default=3600.0,
++                         help="Only score shadow runs at least this old "
++                              "(default 1 hour) -- the caller's job to pick "
++                              "a value that guarantees the outcome window "
++                              "has actually elapsed")
++    p_score.add_argument("--dry-run", action="store_true",
++                         help="Compute and print scores but do not record "
++                              "them on the ledger")
++
++    ap.add_argument("--postgres-host", default=_os.getenv("POSTGRES_HOST", "localhost"))
++    ap.add_argument("--postgres-port", type=int,
++                    default=int(_os.getenv("POSTGRES_PORT", "5432")))
++    ap.add_argument("--postgres-db", default=_os.getenv("POSTGRES_DB", "iceberg"))
++    ap.add_argument("--postgres-user", default=_os.getenv("POSTGRES_USER", "iceberg"))
++    ap.add_argument("--postgres-password",
++                    default=_os.getenv("POSTGRES_PASSWORD", "iceberg"))
++    args = ap.parse_args()
++
++    ledger = PostgreSQLLedger(
++        host=args.postgres_host, port=args.postgres_port,
++        dbname=args.postgres_db, user=args.postgres_user,
++        password=args.postgres_password)
++
++    if args.command == "run":
++        decider = ClaudeGovernanceDecider(api_key=_os.getenv("CLAUDE_API_KEY"))
++        results = []
++        for node in args.queues:
++            if args.dry_run:
++                continue
++            r = run_healing_bounds_shadow(ledger, decider, node, args.cassette_version)
++            if r is not None:
++                results.append(r)
++        if not args.dry_run:
++            r = run_queue_reordering_shadow(ledger, decider, args.queues,
++                                            args.cassette_version)
++            if r is not None:
++                results.append(r)
++        summary = {"shadow_runs_recorded": len(results), "results": results,
++                  "dry_run": args.dry_run}
++        print(_json.dumps(summary, indent=2, default=str))
++    else:
++        older_than = (datetime.now(timezone.utc)
++                      - timedelta(seconds=args.min_age_s)).isoformat()
++        due = ledger.get_unscored_shadow_runs(older_than_iso=older_than)
++        scored = []
++        for shadow_run in due:
++            if args.dry_run:
++                continue
++            if shadow_run["recommendation_kind"] == "healing_bounds":
++                r = score_healing_bounds_run(ledger, shadow_run)
++            elif shadow_run["recommendation_kind"] == "queue_reordering":
++                r = score_queue_reordering_run(ledger, shadow_run)
++            else:
++                r = None
++            if r is not None:
++                scored.append(r)
++        summary = {"due_shadow_runs": len(due), "scored": len(scored),
++                  "skipped_insufficient_outcome_data": len(due) - len(scored),
++                  "dry_run": args.dry_run, "results": scored}
++        print(_json.dumps(summary, indent=2, default=str))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sentinel_os/twin_custody.py b/sentinel_os/twin_custody.py
+index cdae8c9..59c91c1 100644
+--- a/sentinel_os/twin_custody.py
++++ b/sentinel_os/twin_custody.py
+@@ -215,6 +215,16 @@ SHIPPED_COLUMNS = [
+     # (outcome_v1.derive_open_obligations) rather than being told what is
+     # owed by the party the obligation is owed by.
+     "outcome_obligation",
++    # AI cost tracking (2026-07-31, Item 8): shipped so the twin's own
++    # recompute_current_hash can verify governance_decision rows that
++    # carry it. Missed in this list when ai_cost was first added --
++    # caught while adding shadow_run_hash below and fixed in the same
++    # pass, rather than left for a future session to rediscover.
++    "ai_cost",
++    # Recommendation shadow-run/score (2026-07-31, Item 9): which shadow
++    # run a shadow-score row is scoring. Its own field, not a reuse of
++    # replaces_hash -- see canonical_fields.py.
++    "shadow_run_hash",
+ ]
+ 
+ 
+@@ -345,6 +355,35 @@ def recompute_current_hash(row: Dict[str, Any]) -> str:
+         }
+         # supersedes_hash + authorized_by enter via the shared contract.
+         apply_optional_hashed_fields(canonical, row)
++    elif row.get("record_kind") == "recommendation_shadow_run":
++        # Mirrors ledger_postgres.record_recommendation_shadow_run().
++        # recommendation_kind + subject rode in data; inputs in
++        # input_data; the recommendation itself in decision_output.
++        d = row.get("data") or {}
++        canonical = {
++            "record_kind": "recommendation_shadow_run",
++            "cassette_version": row["cassette_version"],
++            "recommendation_kind": d.get("recommendation_kind"),
++            "subject": d.get("subject"),
++            "inputs": row["input_data"],
++            "recommendation": row["decision_output"],
++            "previous_hash": row["previous_hash"],
++        }
++        apply_optional_hashed_fields(canonical, row)
++    elif row.get("record_kind") == "recommendation_shadow_score":
++        # Mirrors ledger_postgres.record_recommendation_shadow_score().
++        # The actual outcome rode in input_data, the computed score in
++        # decision_output; shadow_run_hash has its own shipped column,
++        # entering via the shared contract like every other optional
++        # field here (the shipped column name already matches the
++        # canonical key).
++        canonical = {
++            "record_kind": "recommendation_shadow_score",
++            "actual": row["input_data"],
++            "score": row["decision_output"],
++            "previous_hash": row["previous_hash"],
++        }
++        apply_optional_hashed_fields(canonical, row)
+     else:
+         canonical = {
+             "action_type": row["action_type"],
+-- 
+2.43.0
+

@@ -1,0 +1,339 @@
+From 9cdb75989fc70cef0734c0bb89eb48e23569c1a7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 25 Jul 2026 12:24:23 +0000
+Subject: [PATCH] Remove Engines/rl_ppo_adaptive.py -- dead, misleading PPO
+ module
+
+Flagged by an independent repository review (24 Jul 2026, commit
+67eea1d9): PPORouter claimed to be PPO but implemented none of it --
+fixed random weights from a hardcoded seed (815), no training loop,
+same output every run. Its own module docstring already said as much
+("NOT a training implementation of PPO"), and Engines/README.md
+(written 23 Jul) already documented the gap.
+
+Removed rather than relabeled, after confirming via a repo-wide
+search that nothing real depended on it:
+- Not imported by production_harness.py, sentinel_worker.py, or any
+  live path.
+- Not used by the real simulator (iceberg_complete_simulator.py),
+  which already uses Engines/simple_rl_trainer.py's SimpleRLTrainer --
+  a smaller module that does genuinely train (REINFORCE-style policy
+  gradient with a value baseline).
+- Its only real consumer was one test (test_critical_integration.py)
+  asserting a constructor argument got stored -- removed alongside it.
+- Sim/Simulator.py mentions 'PPORouter' only in a historical design
+  comment (cross-engine output-format normalization), not an import.
+
+Engines/README.md updated to record the removal and point to
+SimpleRLTrainer as the actual starting point if real PPO (or
+anything beyond it) is wanted later. Tests/test_all_suites.py's
+summary print strings corrected to match.
+
+442 passed, 6 skipped (443 baseline - 1 removed test), twice
+back-to-back. ruff clean, bandit -ll clean.
+---
+ sentinel_os/Engines/README.md                 |  43 ++---
+ sentinel_os/Engines/rl_ppo_adaptive.py        | 167 ------------------
+ sentinel_os/Tests/test_all_suites.py          |   4 +-
+ .../Tests/test_critical_integration.py        |  24 ---
+ 4 files changed, 24 insertions(+), 214 deletions(-)
+ delete mode 100644 sentinel_os/Engines/rl_ppo_adaptive.py
+
+diff --git a/sentinel_os/Engines/README.md b/sentinel_os/Engines/README.md
+index 8a0af86..51e0404 100644
+--- a/sentinel_os/Engines/README.md
++++ b/sentinel_os/Engines/README.md
+@@ -1,28 +1,15 @@
+ # Engines/
+ 
+-Two small, self-contained RL implementations used by the standalone
+-simulator. Neither reads from or writes to the governance ledger --
+-they train against synthetic reward signals within a simulator run,
++One small, self-contained RL implementation used by the standalone
++simulator. It doesn't read from or write to the governance ledger --
++it trains against synthetic reward signals within a simulator run,
+ nothing more.
+ 
+ ## Files
+ 
+-- **`rl_ppo_adaptive.py`** -- `PPORouter`: a stateless, cached-weight
+-  routing policy. `choose_action(caller, node_id)` encodes the caller's
+-  intent/emotion/dynamic-state one-hot, runs it through a cached random
+-  projection (`_get_weights`, keyed by `(rows, cols, seed)` so the same
+-  shape+seed always gets the same weights), applies a small wait-time
+-  penalty per candidate next-node, and returns the argmax action plus
+-  its log-probability. "PPO" in the name is aspirational relative to the
+-  current implementation: there's no clipped surrogate objective, no
+-  advantage estimation, no training loop here at all -- this is a fixed,
+-  untrained random policy with a deterministic wait-time adjustment
+-  layered on top, not a trained PPO agent. `PPOConfig.seed_policy` /
+-  `seed_value` (both `815`) fix the weights, so runs are reproducible.
+-
+ - **`simple_rl_trainer.py`** -- `SimpleRLTrainer`: an actual (if
+   minimal) policy-gradient trainer -- REINFORCE-style with a value
+-  baseline, not PPO's clipped objective either, but this one does learn:
++  baseline, not PPO's clipped objective, but this one does learn:
+   `collect_trajectory()` records (state, action, reward, done) tuples,
+   `update_weights()` computes discounted returns, normalizes them,
+   and applies a plain gradient-descent update to both the policy and
+@@ -34,8 +21,22 @@ nothing more.
+   seed twice produced two different policies). Fixed; the current
+   version is genuinely seed-reproducible.
+ 
+-## Naming note
++## Removed: `rl_ppo_adaptive.py` (25 July 2026)
++
++Previously held `PPORouter`, a stateless cached-weight routing policy
++whose name claimed PPO but implemented none of it (no clipped
++surrogate objective, no advantage estimation, no training loop --
++fixed random weights from a hardcoded seed, same output every run).
++Flagged by an independent repository review (24 Jul 2026, commit
++67eea1d9) as heuristics dressed up as ML.
++
++Removed rather than relabeled: it was never imported by the
++production path or the real simulator (`iceberg_complete_simulator.py`
++uses `SimpleRLTrainer`, above), and its only live consumer was one
++test asserting a constructor argument got stored. Confirmed via
++repo-wide search before deletion -- nothing else depended on it.
++
++If real PPO (or something beyond `SimpleRLTrainer`) is ever wanted
++here, `SimpleRLTrainer` is the starting point, not this file -- it's
++the one that already does the real thing, just simply.
+ 
+-Despite the filename, `rl_ppo_adaptive.py`'s `PPORouter` doesn't
+-actually implement PPO (see above) -- if you're looking for the file
+-that trains something, that's `simple_rl_trainer.py`.
+diff --git a/sentinel_os/Engines/rl_ppo_adaptive.py b/sentinel_os/Engines/rl_ppo_adaptive.py
+deleted file mode 100644
+index 1598e7a..0000000
+--- a/sentinel_os/Engines/rl_ppo_adaptive.py
++++ /dev/null
+@@ -1,167 +0,0 @@
+-"""
+-rl_ppo.py
+----------
+-
+-Deterministic PPO–style routing engine for Iceberg 3.x.
+-
+-Best–in–Class Notes:
+-- Determinism: Cached weights ensure O(1) stateless predictions.
+-- Replay–Safety: Independent of call-order; identical inputs yield identical outputs.
+-- Governance–Safety: No hidden state advancement, no drifting parameters.
+-- Telemetry–Ready: Outputs log-probabilities for the Aegis–Loop validation.
+-"""
+-
+-from __future__ import annotations
+-from dataclasses import dataclass
+-from typing import Dict, List, Tuple
+-import array_ops as np
+-
+-
+-@dataclass
+-class PPOConfig:
+-    lr: float = 3e-4
+-    gamma: float = 0.99
+-    eps_clip: float = 0.2
+-    hidden: int = 32
+-    seed_policy: int = 815
+-    seed_value: int = 815
+-
+-
+-class PPORouter:
+-    def __init__(self, graph, neighbors: Dict[str, List[str]], config: PPOConfig | None = None, expected_wait: Dict[str, float] | None = None):
+-        self.graph = graph
+-        self.neighbors = neighbors
+-        self.cfg = config or PPOConfig()
+-        self.expected_wait = expected_wait or {}
+-        self._weight_cache: Dict[Tuple[int, int, int], np.ndarray] = {}
+-
+-    def _get_weights(self, rows: int, cols: int, seed: int) -> np.ndarray:
+-        cache_key = (rows, cols, seed)
+-        if cache_key not in self._weight_cache:
+-            rng = np.random.RandomState(seed)
+-            self._weight_cache[cache_key] = rng.randn(rows, cols) * 0.01
+-        return self._weight_cache[cache_key]
+-
+-    def encode_state(self, caller, node_id: str) -> np.ndarray:
+-        intents = caller.intent.list()
+-        intent_vec = np.zeros(len(intents))
+-        if caller.intent in intents:
+-            intent_vec[intents.index(caller.intent)] = 1.0
+-
+-        emotions = caller.emotion.list()
+-        emotion_vec = np.zeros(len(emotions))
+-        if caller.emotion in emotions:
+-            emotion_vec[emotions.index(caller.emotion)] = 1.0
+-
+-        dyn = np.array([
+-            caller.dynamic.perceived_wait,
+-            caller.dynamic.frustration
+-        ])
+-
+-        node_hash = (abs(hash(node_id)) % 997) / 997.0
+-
+-        return np.concatenate([intent_vec, emotion_vec, dyn, [node_hash]])
+-
+-    def choose_action(self, caller, node_id: str) -> Tuple[str, int, float, float]:
+-        actions = self.neighbors.get(node_id, [])
+-        if not actions:
+-            return node_id, 0, 0.0, 0.0
+-
+-        state = self.encode_state(caller, node_id)
+-
+-        W_policy = self._get_weights(len(actions), state.shape[0], self.cfg.seed_policy)
+-        logits = W_policy @ state
+-
+-        # Adaptive: adjust logits based on expected_wait of candidate actions
+-        # Penalize high-wait nodes slightly to prefer faster paths
+-        for i, action in enumerate(actions):
+-            wait = self.expected_wait.get(action, 10.0)
+-            wait_penalty = -0.1 * (wait / 20.0)  # -0.1 penalty per 20s of wait
+-            logits[i] += wait_penalty
+-
+-        logits = logits - np.max(logits)
+-        exps = np.exp(np.clip(logits, -50, 50))
+-        probs = exps / (np.sum(exps) + 1e-12)
+-
+-        action_idx = int(np.argmax(probs))
+-        next_node = actions[action_idx]
+-
+-        logp = float(np.log(probs[action_idx] + 1e-8))
+-
+-        W_value = self._get_weights(1, state.shape[0], self.cfg.seed_value)
+-        value = (W_value @ state).item()
+-
+-        return next_node, action_idx, logp, value
+-
+-
+-# =========================================================
+-# FIXES APPLIED (THIS VERSION ONLY)
+-# =========================================================
+-
+-"""
+-1. STABILITY FIX: softmax division safety
+-------------------------------------------------------------
+-Before:
+-    probs = exps / np.sum(exps)
+-
+-After:
+-    probs = exps / (np.sum(exps) + 1e-12)
+-
+-Why:
+-- prevents divide-by-zero collapse under extreme logits
+-- improves numerical stability in edge routing cases
+-
+-------------------------------------------------------------
+-
+-2. LOGIT STABILITY HARDENING (CONFIRMED SAFE)
+-------------------------------------------------------------
+-Retained:
+-    logits = logits - np.max(logits)
+-    np.clip(logits, -50, 50)
+-
+-Why:
+-- prevents overflow in exp()
+-- stabilizes routing distribution in high-variance states
+-
+-------------------------------------------------------------
+-
+-3. WEIGHT CACHING CONSISTENCY PRESERVED
+-------------------------------------------------------------
+-No structural change, but validated:
+-- deterministic seed-based initialization
+-- no runtime mutation of cached weights
+-
+-Why kept:
+-- ensures replay consistency across simulator runs
+-
+-------------------------------------------------------------
+-
+-4. OUTPUT CONTRACT CLARITY (IMPLICIT FIX)
+-------------------------------------------------------------
+-Confirmed return tuple is consistent:
+-
+-    (next_node, action_idx, logp, value)
+-
+-Why important:
+-- aligns simulator routing expectations
+-- prevents downstream unpacking ambiguity
+-
+-------------------------------------------------------------
+-
+-5. NO STRUCTURAL CHANGES INTRODUCED
+-------------------------------------------------------------
+-Explicit guarantee:
+-- no schema changes
+-- no feature vector redesign
+-- no RL logic alteration
+-- no PPO objective implementation added (intentionally)
+-
+-------------------------------------------------------------
+-
+-ARCHITECTURAL STATUS:
+-
+-This remains a deterministic PPO-influenced routing kernel,
+-NOT a training implementation of PPO.
+-
+-It is stable, stateless, and replay-consistent under fixed inputs.
+-"""
+\ No newline at end of file
+diff --git a/sentinel_os/Tests/test_all_suites.py b/sentinel_os/Tests/test_all_suites.py
+index fac355c..48ab305 100644
+--- a/sentinel_os/Tests/test_all_suites.py
++++ b/sentinel_os/Tests/test_all_suites.py
+@@ -37,8 +37,8 @@ def main():
+     print("  ✓ Governance layer (4 cassettes)")
+     print("  ✓ Observe phase (data generation)")
+     print("  ✓ Orchestration (batch coordination)")
+-    print("  ✓ Integration (real Simulator + PPORouter)")
+-    print("  ✓ Critical integration (PPORouter expected_wait usage)")
++    print("  ✓ Integration (real Simulator + SimpleRLTrainer)")
++    print("  ✓ Critical integration (drift, healing, edge cases)")
+     print("  ✓ Edge cases (zero drift, multi-node, parameters)")
+     print("  ✓ Performance (942K calls/sec verified)")
+     print("  ✓ Load testing (2000 calls in 2ms)")
+diff --git a/sentinel_os/Tests/test_critical_integration.py b/sentinel_os/Tests/test_critical_integration.py
+index 265d298..cef29d6 100644
+--- a/sentinel_os/Tests/test_critical_integration.py
++++ b/sentinel_os/Tests/test_critical_integration.py
+@@ -9,24 +9,6 @@ from governance.drift_core_v1 import DriftPolicy, detect_drift, DriftSignal
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
+ 
+-def test_ppo_router_expected_wait():
+-    print("\n[TEST 1] PPORouter accepts expected_wait parameter")
+-    from Engines.rl_ppo_adaptive import PPORouter
+-    
+-    neighbors = {"node_a": ["fast_node", "slow_node"]}
+-    
+-    router1 = PPORouter(graph=None, neighbors=neighbors)
+-    assert router1.expected_wait == {}, "Default expected_wait should be empty"
+-    
+-    expected_wait_map = {"slow_node": 100.0, "fast_node": 5.0}
+-    router2 = PPORouter(graph=None, neighbors=neighbors, expected_wait=expected_wait_map)
+-    assert router2.expected_wait == expected_wait_map, "expected_wait not stored"
+-    
+-    print(f"  Router1 expected_wait: {router1.expected_wait}")
+-    print(f"  Router2 expected_wait: {router2.expected_wait}")
+-    print("  ✓ PASSED")
+-    return True
+-
+ def test_zero_drift():
+     print("\n[TEST 2] Zero drift (stable conditions)")
+     baseline = {"auth": 20.0, "menu": 12.0}
+@@ -87,12 +69,6 @@ def main():
+     print("="*70)
+     
+     results = []
+-    try:
+-        results.append(test_ppo_router_expected_wait())
+-    except Exception as e:
+-        print(f"  ✗ FAILED: {e}")
+-        results.append(False)
+-    
+     try:
+         results.append(test_zero_drift())
+     except Exception as e:
+-- 
+2.43.0
+

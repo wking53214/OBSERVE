@@ -1,0 +1,436 @@
+diff --git a/sentinel_os/Tests/test_governor_failclosed.py b/sentinel_os/Tests/test_governor_failclosed.py
+index 5c2db3f..7353fd1 100644
+--- a/sentinel_os/Tests/test_governor_failclosed.py
++++ b/sentinel_os/Tests/test_governor_failclosed.py
+@@ -62,14 +62,24 @@ def _decider_with(create_fn):
+ 
+ 
+ def _high_friction_journey():
++    # wait_times keys must match this journey's own node names --
++    # "billing_queue"/"agent_a", not the generic "queue"/"agent" this
++    # fixture used before. With the mismatched keys, per-node lookup
++    # found nothing for either real node and measured friction was 0;
++    # these tests only governed because production_harness.py used to
++    # take max(measured, journey.friction_count) and fall back to the
++    # friction_count field below. That max() is gone (see R-6) -- it
++    # produced a ledger row that couldn't reproduce its own decision
++    # whenever the two disagreed. Governance now runs on measured
++    # friction alone, so the fixture has to genuinely earn it.
+     return IcebergJourney(
+         caller_id="twilio_TEST",
+         timestamp=0,
+         journey=["root", "intent_menu", "billing_queue", "agent_a", "exit"],
+-        wait_times={"intent_menu": 10.0, "queue": 60.0, "agent": 40.0},
++        wait_times={"intent_menu": 40.0, "billing_queue": 90.0, "agent_a": 70.0},
+         total_duration=350.0,
+         resolved=True,
+-        friction_count=5,          # > 2 -> governance REQUIRED
++        friction_count=5,          # ingest-side estimate only; not used for gating (R-6)
+         abandonment_reason=None,
+     )
+ 
+@@ -79,7 +89,7 @@ def _low_friction_journey():
+         caller_id="twilio_LOW",
+         timestamp=0,
+         journey=["root", "intent_menu", "billing_queue", "agent_a", "exit"],
+-        wait_times={"intent_menu": 5.0, "queue": 10.0, "agent": 5.0},
++        wait_times={"intent_menu": 5.0, "billing_queue": 10.0, "agent_a": 5.0},
+         total_duration=60.0,
+         resolved=True,
+         friction_count=0,          # <= 2 -> governance NOT required
+diff --git a/sentinel_os/api_key_auth.py b/sentinel_os/api_key_auth.py
+index 515e98f..79daf30 100644
+--- a/sentinel_os/api_key_auth.py
++++ b/sentinel_os/api_key_auth.py
+@@ -146,14 +146,25 @@ rate_limiter = RateLimiter(
+ api_key_manager = APIKeyManager()
+ 
+ def require_api_key(request: Request, x_api_key: str = Header(None)) -> Dict:
+-    """FastAPI dependency: require a valid API key AND enforce a per-key
+-    (or per-IP, if the key is missing/invalid) rate limit.
++    """FastAPI dependency: require a valid API key AND enforce a per-IP
++    rate limit on the *attempt*, before that key is known to be valid.
+ 
+-    Rate-limiting on the identity used for the *attempt* -- not only on
+-    successfully-authenticated keys -- so an attacker hammering invalid
+-    keys (which is exactly the brute-force scenario the timing-safe
+-    comparison above is hardening against) is throttled too.
++    Previously the identity rate-limited was the caller-supplied key
++    itself when one was present, falling back to IP only when the
++    header was missing. Since a caller can supply a different string
++    on every request at zero cost, that gave a brute-force attacker a
++    fresh quota on every guess -- confirmed live: 500 distinct guessed
++    keys, 0 throttled, plus one unbounded in-memory bucket per guess
++    (nothing evicts a bucket that's never checked again). Identity is
++    now always the connecting IP for this pre-auth check, which is the
++    actual limiting resource an attacker can't mint for free.
++
++    This limits ATTEMPTS, not validated keys -- callers behind a
++    shared NAT/proxy share one bucket here, which is a deliberate
++    trade for closing the brute-force bypass. A separate per-key quota
++    for legitimate authenticated traffic is a reasonable addition, but
++    is a distinct feature, not part of this fix.
+     """
+-    identity = x_api_key if x_api_key else (request.client.host if request.client else "unknown")
++    identity = request.client.host if request.client else "unknown"
+     rate_limiter.check(identity)
+     return api_key_manager.validate_key(x_api_key)
+diff --git a/sentinel_os/cassette_schema.py b/sentinel_os/cassette_schema.py
+index 0865847..0c767b3 100644
+--- a/sentinel_os/cassette_schema.py
++++ b/sentinel_os/cassette_schema.py
+@@ -36,6 +36,14 @@ ALLOWED_TYPES = ("float", "int", "range")
+ 
+ # Parameters the governance path cannot run without. A cassette may
+ # declare more; it may not declare fewer.
++#
++# The twilio_* thresholds were added after finding a cassette (banking)
++# that passed this contract and validate_cassette(), loaded, and swapped
++# in cleanly -- then raised ValueError on every single process_call,
++# because twilio_log_ingestion._count_friction reads these three
++# fail-loud and they were never part of the declared contract. A
++# cassette that satisfies REQUIRED_GOVERNANCE_PARAMETERS must now be
++# able to actually run a call, not just pass schema validation.
+ REQUIRED_GOVERNANCE_PARAMETERS: Dict[str, str] = {
+     # A wait longer than this, at any node, is one friction event.
+     "long_wait_threshold": "float",
+@@ -45,6 +53,12 @@ REQUIRED_GOVERNANCE_PARAMETERS: Dict[str, str] = {
+     "governance_trigger": "int",
+     # Self-healing clamp band for the expected_wait parameter.
+     "expected_wait_bounds": "range",
++    # Twilio ingest: calls longer than this contribute 2 friction points.
++    "twilio_long_duration_threshold": "int",
++    # Twilio ingest: calls longer than this contribute 1 friction point.
++    "twilio_medium_duration_threshold": "int",
++    # Twilio ingest: non-completed calls shorter than this are dropped-call friction.
++    "twilio_short_duration_threshold": "int",
+ }
+ 
+ 
+diff --git a/sentinel_os/cassettes/banking_cassette.py b/sentinel_os/cassettes/banking_cassette.py
+index c75f06a..32611f1 100644
+--- a/sentinel_os/cassettes/banking_cassette.py
++++ b/sentinel_os/cassettes/banking_cassette.py
+@@ -56,6 +56,55 @@ class BankingCassette(Cassette):
+                 "last_reviewed": None,
+             },
+         },
++        # PLACEHOLDER VALUES -- scaled from the IVR cassette's 300/120/10
++        # by the same ~1.5x long-wait-tolerance ratio banking already
++        # uses above (45.0 vs ivr's 30.0), NOT derived from real banking
++        # call data. Added because these three are now required
++        # (cassette_schema.REQUIRED_GOVERNANCE_PARAMETERS) and, before
++        # that, their absence made every banking call raise ValueError
++        # at the Twilio ingest step -- this cassette validated and
++        # loaded cleanly but could not process a single call. Needs
++        # review against real banking-IVR call data before deploying
++        # this domain.
++        "twilio_long_duration_threshold": {
++            "value": 450,
++            "type": "int",
++            "min": 1,
++            "max": 3600,
++            "unit": "seconds",
++            "description": "Twilio ingest: calls longer than this duration contribute 2 friction points.",
++            "metadata": {
++                "approval_date": None,
++                "justification": "PLACEHOLDER: 300s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
++                "last_reviewed": None,
++            },
++        },
++        "twilio_medium_duration_threshold": {
++            "value": 180,
++            "type": "int",
++            "min": 1,
++            "max": 3600,
++            "unit": "seconds",
++            "description": "Twilio ingest: calls longer than this duration contribute 1 friction point.",
++            "metadata": {
++                "approval_date": None,
++                "justification": "PLACEHOLDER: 120s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
++                "last_reviewed": None,
++            },
++        },
++        "twilio_short_duration_threshold": {
++            "value": 15,
++            "type": "int",
++            "min": 1,
++            "max": 60,
++            "unit": "seconds",
++            "description": "Twilio ingest: calls shorter than this duration with non-completed status indicate dropped calls (1 friction point).",
++            "metadata": {
++                "approval_date": None,
++                "justification": "PLACEHOLDER: 10s (ivr) scaled by banking's ~1.5x wait tolerance. Not yet reviewed against banking call data.",
++                "last_reviewed": None,
++            },
++        },
+     }
+ 
+     def get_config(self) -> CassetteConfig:
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index a57f5bb..83627a4 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -8,6 +8,7 @@ import json
+ import hashlib
+ import os
+ from dataclasses import dataclass
++from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ from psycopg2.pool import SimpleConnectionPool
+ 
+@@ -57,7 +58,16 @@ class GovernanceDecisionRecord:
+ 
+ class PostgreSQLLedger:
+     """Production ledger backed by PostgreSQL"""
+-    
++
++    # Trigger names ledger_immutability.sql installs. Verified present
++    # after applying the file so a missing or failed apply halts
++    # construction instead of silently leaving the ledger mutable.
++    _REQUIRED_IMMUTABILITY_TRIGGERS = (
++        "prevent_ledger_update",
++        "prevent_ledger_delete",
++        "prevent_ledger_truncate",
++    )
++
+     def __init__(self, host: str = "localhost", port: int = 5432, 
+                  dbname: str = "iceberg", user: str = "iceberg", 
+                  password: str = "iceberg", min_connections: int = 1, max_connections: int = 10,
+@@ -85,6 +95,7 @@ class PostgreSQLLedger:
+             user=user, password=password
+         )
+         self._initialize_schema()
++        self._apply_immutability_and_verify()
+         self.pool.closeall()
+ 
+         runtime_user = runtime_user or os.getenv("ICEBERG_LEDGER_RUNTIME_USER")
+@@ -172,7 +183,54 @@ class PostgreSQLLedger:
+             conn.commit()
+         finally:
+             self.pool.putconn(conn)
+-    
++
++    def _apply_immutability_and_verify(self):
++        """Apply ledger_immutability.sql and verify it actually took effect.
++
++        Previously this file was applied ONLY by the test fixture
++        (Tests/conftest.py) -- nothing in the application startup path
++        ever ran it. A real deployment got a ledger_entries table with
++        zero immutability triggers: UPDATE/DELETE/TRUNCATE all succeed
++        against a production-constructed ledger (confirmed live). This
++        runs on the same privileged connection that creates the schema,
++        applies the same file the test fixture used, then queries
++        pg_trigger to confirm the three protective triggers exist --
++        refusing to construct the ledger otherwise. No fallback: a
++        ledger that cannot prove its own immutability does not start.
++        """
++        sql_path = Path(__file__).resolve().parent.parent / "ledger_immutability.sql"
++        if not sql_path.exists():
++            raise RuntimeError(
++                f"Cannot apply ledger immutability: {sql_path} not found. "
++                "Refusing to start an unprotected ledger."
++            )
++
++        conn = self.pool.getconn()
++        try:
++            conn.autocommit = False
++            cursor = conn.cursor()
++            cursor.execute(sql_path.read_text())
++            conn.commit()
++
++            cursor.execute("""
++                SELECT tgname FROM pg_trigger t
++                JOIN pg_class r ON t.tgrelid = r.oid
++                WHERE r.relname = 'ledger_entries' AND NOT t.tgisinternal;
++            """)
++            installed = {row[0] for row in cursor.fetchall()}
++            missing = [t for t in self._REQUIRED_IMMUTABILITY_TRIGGERS if t not in installed]
++            if missing:
++                raise RuntimeError(
++                    f"Ledger immutability triggers missing after applying "
++                    f"{sql_path.name}: {missing}. The ledger would be mutable "
++                    f"(UPDATE/DELETE/TRUNCATE unprotected). Refusing to start."
++                )
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            self.pool.putconn(conn)
++
+     def append(self, action_type: str, node: str, previous_value: float,
+                applied_value: float, reason: str, data: Dict) -> bool:
+         """Append entry to ledger (transaction).
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 981e6a6..af1b47c 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -16,12 +16,15 @@ from observe_perceive_core import ObserveCore, FrictionEvent
+ from sentinel_core import SentinelCore
+ from cassette_loader import CassetteLoader
+ from cassette_schema import validate_cassette
+-from tracing import tracer
++from tracing import tracer, mark_error
+ from governance.ledger_postgres import GovernanceDecisionRecord
+ from governance.friction_core import compute_friction
+ from queue_staffing_bayes_integration import (
+     StaffingCoordinator, BayesianIntentEngine
+ )
++from operational_resilience import setup_logging
++
++logger = setup_logging("IcebergProductionHarness")
+ 
+ class IcebergProductionHarness:
+     """Complete production system: all components wired together"""
+@@ -208,12 +211,23 @@ class IcebergProductionHarness:
+             # 7. Governance gate
+             claude_decision = None
+ 
+-            governance_friction_count = max(
+-                friction_count,
+-                getattr(journey, "friction_count", 0) or 0
+-            )
+-
+-            governed = governance_friction_count >= governance_trigger
++            # Gate on friction_count alone -- the measured value from
++            # step 2, which is also what's handed to the governor
++            # (below) and written to the ledger. This used to gate on
++            # max(friction_count, journey.friction_count), mixing the
++            # measured value with twilio_log_ingestion's separate
++            # ingest-side ESTIMATE (different heuristic, different
++            # thresholds -- see _count_friction's own docstring, which
++            # already states "the production harness does NOT use this
++            # estimate on the governance path"; the max() contradicted
++            # that). Confirmed live with an in-bounds retuned cassette:
++            # the gate could govern and approve a call while the
++            # governor and the ledger both saw friction_count=0 against
++            # governance_trigger=2 -- a row that couldn't reproduce its
++            # own decision. On the shipped default cassette this never
++            # changed the outcome (measured >= ingest in every governed
++            # case), so behavior here is unchanged for existing traffic.
++            governed = friction_count >= governance_trigger
+             root_span.set_attribute("call.governed", governed)
+             root_span.set_attribute("call.queue", first_queue)
+             root_span.set_attribute("call.friction_count", friction_count)
+@@ -233,6 +247,7 @@ class IcebergProductionHarness:
+                     except Exception as e:
+                         print(f"Claude decision failed: {e}")
+                         gov_span.record_exception(e)
++                        mark_error(gov_span, f"Governor exception: {e}")
+                         claude_decision = {
+                             "safe": False,
+                             "governed": False,
+@@ -251,8 +266,9 @@ class IcebergProductionHarness:
+                 }
+         
+             # 8. Ledger: record the governance DECISION
++            ledger_write_failed = False
+             if self.ledger and claude_decision is not None:
+-                with tracer.start_as_current_span("ledger_write"):
++                with tracer.start_as_current_span("ledger_write") as ledger_span:
+                     try:
+                         approved = bool(claude_decision.get("safe"))
+                         root_span.set_attribute("call.approved", approved)
+@@ -283,8 +299,53 @@ class IcebergProductionHarness:
+                             parameter_changed=False,
+                         ), governance_params=params)
+                     except Exception as e:
+-                        print(f"Ledger append failed: {e}")
+-        
++                        # A decision that isn't durably recorded is not an
++                        # audited decision. This used to be a print() with
++                        # the function falling through to report
++                        # governance_approved straight from claude_decision
++                        # -- a caller could be told "approved" with no row
++                        # to show for it. Confirmed live under concurrent
++                        # duplicate-sid submissions at realistic governor
++                        # latency: 3 of 4 approvals went unrecorded and
++                        # were still reported as approved.
++                        #
++                        # This is returned in the response below, not
++                        # raised: process_call runs under
++                        # ResilientHarness's retry_with_backoff, which
++                        # retries ANY exception up to 3x and opens the
++                        # circuit breaker after 5 failures -- raising here
++                        # would re-invoke the governor on every retry for
++                        # what is often a transient write failure, and
++                        # could trip the breaker on a brief blip.
++                        ledger_write_failed = True
++                        logger.error(
++                            "Ledger write failed for a governed decision -- "
++                            "decision was NOT durably recorded",
++                            extra={"extra_data": {
++                                "call_sid": call_sid,
++                                "node": first_queue,
++                                "claude_safe": claude_decision.get("safe"),
++                                "error": str(e),
++                            }},
++                        )
++                        ledger_span.record_exception(e)
++                        ledger_span.set_attribute("ledger_write.failed", True)
++                        mark_error(ledger_span, f"Ledger write failed: {e}")
++
++            # A call only counts as approved if the approval is both
++            # granted AND durably recorded; either half missing means the
++            # call was not successfully governed end-to-end.
++            governance_approved = (
++                bool(claude_decision.get("safe", False))
++                if claude_decision is not None and not ledger_write_failed
++                else False
++            )
++            governance_blocked = governed and (
++                claude_decision is None or
++                not claude_decision.get("safe", False) or
++                ledger_write_failed
++            )
++
+             return {
+                 "caller_id": journey.caller_id,
+                 "resolved": journey.resolved,
+@@ -294,17 +355,9 @@ class IcebergProductionHarness:
+                 "emotion_frustration": emotion.frustration,
+                 "claude_safe": claude_decision.get("safe") if claude_decision else None,
+                 "governance_required": governed,
+-                "governance_approved": (
+-                    claude_decision.get("safe", False)
+-                    if claude_decision is not None
+-                    else False
+-                ),
+-                "governance_blocked": (
+-                    governed and (
+-                        claude_decision is None or
+-                        not claude_decision.get("safe", False)
+-                    )
+-                ),
++                "governance_approved": governance_approved,
++                "governance_blocked": governance_blocked,
++                "ledger_write_failed": ledger_write_failed,
+                 "metrics_recorded": True,
+                 "friction_count": friction_count,
+                 "governed": governed,
+diff --git a/sentinel_os/tracing.py b/sentinel_os/tracing.py
+index 7a08b25..163f494 100644
+--- a/sentinel_os/tracing.py
++++ b/sentinel_os/tracing.py
+@@ -38,6 +38,14 @@ try:
+ 
+     tracer = trace.get_tracer("sentinel_os")
+ 
++    def mark_error(span, description: str = "") -> None:
++        """Mark a span ERROR, so it surfaces in an error-filtered trace
++        query even in a collector that doesn't infer status from
++        record_exception() alone. Callers don't need to know whether
++        real OpenTelemetry is installed -- see the no-op version below.
++        """
++        span.set_status(trace.Status(trace.StatusCode.ERROR, description))
++
+ except ImportError:
+     # opentelemetry packages not installed at all — provide a stub
+     # tracer whose start_as_current_span is a trivial context manager
+@@ -55,3 +63,6 @@ except ImportError:
+         def record_exception(self, exc): pass
+ 
+     tracer = _NoOpTracer()
++
++    def mark_error(span, description: str = "") -> None:
++        pass

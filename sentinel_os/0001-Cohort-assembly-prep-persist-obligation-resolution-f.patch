@@ -1,0 +1,521 @@
+From 822b85664a67fceb42e1d32b906ae633e5e95597 Mon Sep 17 00:00:00 2001
+From: "Claude (sandbox)" <claude@sandbox.local>
+Date: Wed, 29 Jul 2026 10:11:30 +0000
+Subject: [PATCH 1/3] Cohort assembly prep: persist obligation resolution
+ fields, ship domain in the clear
+
+Two prerequisite fixes for cohort assembly (C2 dimensions 4+5), found by
+reading the real repo rather than assuming the handoff doc's scope:
+
+1. The twin's obligation_ledger computed favorable/resolved_value/
+   resolved_at/resolution_provenance/resolution_method on every RESOLVED
+   transition but never wrote them to the database or the hash chain --
+   the twin could say an obligation was RESOLVED but not how. Now
+   persisted and hashed in (resolution fields only enter the hash when
+   present, so an OPEN row's hash is unaffected).
+
+2. domain is now shipped in the clear from primary to twin, alongside
+   the existing outcome_obligation/decided_at fields, parsed from
+   cassette_version's fixed domain:name:version format via the new
+   domain_from_cassette_version() helper. Previously the twin only knew
+   obligation_kind, and silently conflated it with domain -- two
+   unrelated cassettes choosing the same obligation_kind string would
+   have merged cohorts that have no business being compared. domain is
+   a required field on every obligation from this point forward (not an
+   optional backward-compat addition like the resolution fields), with a
+   safe fallback to obligation_kind for entries shipped before this fix.
+
+18 new tests. Full suite 557 passed / 6 skipped (544 baseline + 13 net
+new -- some new tests replace/rename a prior test). ruff and bandit
+clean.
+---
+ .../test_domain_from_cassette_version.py      |  31 ++++
+ .../Tests/test_twin_outcome_obligations.py    | 167 +++++++++++++++++-
+ sentinel_os/twin_custody.py                   |  15 ++
+ sentinel_os/twin_receiver.py                  |  79 +++++++--
+ sentinel_os/twin_shipper.py                   |   6 +-
+ sentinel_os/twin_sync_worker.py               |   1 +
+ 6 files changed, 282 insertions(+), 17 deletions(-)
+ create mode 100644 sentinel_os/Tests/test_domain_from_cassette_version.py
+
+diff --git a/sentinel_os/Tests/test_domain_from_cassette_version.py b/sentinel_os/Tests/test_domain_from_cassette_version.py
+new file mode 100644
+index 0000000..f7f02b8
+--- /dev/null
++++ b/sentinel_os/Tests/test_domain_from_cassette_version.py
+@@ -0,0 +1,31 @@
++"""domain_from_cassette_version is the one place the shipping path turns
++a cassette_version string into the domain cohort assembly groups by.
++cassette_version is always "domain:name:version"
++(cassette_schema.cassette_version_of) -- a fixed, code-generated format,
++never something a caller free-types -- so this is a structural parse, not
++a heuristic, and it is worth pinning down exactly.
++"""
++
++from twin_custody import domain_from_cassette_version
++
++
++def test_extracts_the_domain_segment():
++    assert domain_from_cassette_version("lending:underwriting_cassette:1.0.0") == "lending"
++
++
++def test_a_domain_can_itself_be_unambiguous_even_with_dots_or_dashes_in_name():
++    assert domain_from_cassette_version("insurance:auto-claims_v2:3.1.4") == "insurance"
++
++
++def test_missing_cassette_version_returns_none_not_a_fabricated_label():
++    assert domain_from_cassette_version(None) is None
++    assert domain_from_cassette_version("") is None
++
++
++def test_a_malformed_string_with_no_colon_is_not_silently_treated_as_a_domain():
++    """A string that doesn't match the domain:name:version shape at all
++    still returns something (everything up to the first, absent, colon is
++    the whole string) -- this is a deliberate, honest parse of what's
++    there, not a validity check. bind_cassette_version is what enforces
++    the real shape; this helper only extracts."""
++    assert domain_from_cassette_version("not_a_real_cassette_version") == "not_a_real_cassette_version"
+diff --git a/sentinel_os/Tests/test_twin_outcome_obligations.py b/sentinel_os/Tests/test_twin_outcome_obligations.py
+index 04c6aea..ef05045 100644
+--- a/sentinel_os/Tests/test_twin_outcome_obligations.py
++++ b/sentinel_os/Tests/test_twin_outcome_obligations.py
+@@ -66,7 +66,8 @@ def twin():
+     return client
+ 
+ 
+-def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None):
++def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None,
++         domain=None):
+     body = {
+         "primary_id": primary_id,
+         "previous_hash": "genesis" if primary_id == 1 else f"h{primary_id - 1}",
+@@ -74,6 +75,7 @@ def _ship(twin, primary_id, declaration=None, decided_at=NOW, current_hash=None)
+         "envelope": _ENVELOPE,
+         "outcome_obligation": declaration,
+         "decided_at": decided_at,
++        "domain": domain,
+     }
+     resp = twin.post(f"/replica/{twin.replica_id}/entries", json=body,
+                      headers=twin.ship)
+@@ -159,6 +161,57 @@ def test_the_obligation_chain_links(twin):
+     assert rows[1][1] == rows[0][2]
+ 
+ 
++# ---------------------------------------------------------------------------
++# Domain: shipped in the clear alongside outcome_obligation/decided_at,
++# so cohort assembly can group obligations by business line rather than by
++# obligation_kind alone -- two unrelated cassettes could legitimately pick
++# the same obligation_kind string.
++# ---------------------------------------------------------------------------
++
++def test_a_shipped_domain_is_derived_onto_the_obligation(twin):
++    _ship(twin, 1, "loan_performance@24mo", domain="lending")
++    _derive(twin)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["domain"] == "lending"
++
++
++def test_domain_falls_back_to_obligation_kind_when_not_shipped(twin):
++    """A row shipped before this fix existed (or by an older shipper)
++    carries no domain. Rather than deriving nothing, or fabricating a
++    domain, the obligation still opens -- with obligation_kind standing in,
++    the same value it would have had if domain never existed as a concept.
++    Nothing regresses for a shipper that hasn't been upgraded yet."""
++    _ship(twin, 1, "loan_performance@24mo", domain=None)
++    _derive(twin)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["domain"] == "loan_performance"
++
++
++def test_two_domains_sharing_an_obligation_kind_stay_distinguishable(twin):
++    """The whole point of shipping domain separately: two cassettes in
++    different business lines that happen to declare the same
++    obligation_kind string produce obligations that are still
++    distinguishable by domain, not silently merged."""
++    _ship(twin, 1, "loan_performance@24mo", domain="lending", current_hash="h1")
++    _ship(twin, 2, "loan_performance@24mo", domain="insurance", current_hash="h2")
++    _derive(twin)
++    domains = {o["domain"] for o in _list(twin)["obligations"]}
++    assert domains == {"lending", "insurance"}
++
++
++def test_changing_domain_on_redelivery_is_refused(twin):
++    """Same immutability rule as outcome_obligation: a redelivery that
++    would change the domain a prior entry declared is a rewrite of
++    history already in the customer's custody, and is refused outright."""
++    _ship(twin, 1, "loan_performance@24mo", domain="lending")
++    resp = twin.post(f"/replica/{twin.replica_id}/entries", json={
++        "primary_id": 1, "previous_hash": "genesis", "current_hash": "h1",
++        "envelope": _ENVELOPE, "outcome_obligation": "loan_performance@24mo",
++        "decided_at": NOW, "domain": "insurance",
++    }, headers=twin.ship)
++    assert resp.status_code == 409
++
++
+ # ---------------------------------------------------------------------------
+ # Overdue is computed here too, never stored.
+ # ---------------------------------------------------------------------------
+@@ -207,6 +260,118 @@ def test_a_resolution_is_recorded_with_its_provenance(twin):
+     assert _list(twin)["summary"]["RESOLVED"] == 1
+ 
+ 
++# ---------------------------------------------------------------------------
++# Regression: a resolution's own content (favorable, resolved_value, etc.)
++# used to be computed and validated but never actually written to the
++# ledger row or the hash chain -- the twin could say RESOLVED but not say
++# how. Cohort assembly needs exactly these fields, so they must round-trip.
++# ---------------------------------------------------------------------------
++
++def test_a_resolution_favorable_call_round_trips_through_the_twin(twin):
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "paid_in_full"},
++               provenance="verified", favorable=True, method=None)
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["favorable"] is True
++    assert obligation["resolved_value"] == {"status": "paid_in_full"}
++    assert obligation["resolved_at"] == NOW + 730 * DAY
++    assert obligation["resolution_provenance"] == "verified"
++
++
++def test_a_genuinely_ambiguous_resolution_keeps_favorable_none(twin):
++    """A resolution can legitimately resolve to neither true nor false --
++    to_cohort_decision refuses to coerce that into a bool, so the twin has
++    to preserve the None, not silently drop the whole field."""
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "loan_sold_to_third_party"},
++               provenance="attested", favorable=None,
++               method="unresolvable_after_sale")
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["favorable"] is None
++    assert obligation["resolution_method"] == "unresolvable_after_sale"
++
++
++def test_an_estimated_resolution_persists_its_method(twin):
++    oid = _one(twin)
++    _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "charged_off"},
++               provenance="estimated", favorable=False,
++               method="servicer_bulk_file_reconciliation")
++    obligation = _list(twin)["obligations"][0]
++    assert obligation["resolution_method"] == "servicer_bulk_file_reconciliation"
++
++
++def test_the_resolution_fields_are_covered_by_the_hash_chain(twin):
++    """Not just stored -- tamper-evident. Two otherwise-identical
++    resolutions that disagree on favorable must produce different
++    curr_hash values, or an operator could edit favorable in place
++    without the chain noticing."""
++    oid_a = _one(twin)
++    _transition(twin, oid_a, state="RESOLVED",
++               resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "x"},
++               provenance="verified", favorable=True)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT curr_hash FROM obligation_ledger
++                           WHERE replica_id=%s AND obligation_id=%s
++                           ORDER BY seq DESC LIMIT 1""",
++                       (twin.replica_id, oid_a))
++            hash_favorable_true = cur.fetchone()[0]
++    # A second, independent obligation resolved the same way except for
++    # the favorable call -- same replica, same declared facts otherwise.
++    _ship(twin, 2, "loan_performance@24mo", current_hash="h2")
++    _derive(twin)
++    oid_b = [o["obligation_id"] for o in _list(twin)["obligations"]
++            if o["obligation_id"] != oid_a][0]
++    _transition(twin, oid_b, state="RESOLVED", resolved_at=NOW + 730 * DAY,
++               resolved_value={"status": "x"}, provenance="verified",
++               favorable=False)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT curr_hash FROM obligation_ledger
++                           WHERE replica_id=%s AND obligation_id=%s
++                           ORDER BY seq DESC LIMIT 1""",
++                       (twin.replica_id, oid_b))
++            hash_favorable_false = cur.fetchone()[0]
++    assert hash_favorable_true != hash_favorable_false
++
++
++def test_resolution_fields_absent_from_the_hash_when_not_present(twin):
++    """Backward compatibility, scoped correctly: the FIVE RESOLUTION fields
++    (favorable, resolved_value, resolved_at, resolution_provenance,
++    resolution_method) enter the hashed payload only when present, so an
++    OPEN-state row -- where all five are still None -- hashes with none of
++    them. domain is NOT part of that backward-compat set: it's a required
++    field on every obligation from this fix forward, so it's always in the
++    payload, including on this OPEN row (falling back to rule.kind, since
++    this ship didn't declare a domain)."""
++    _ship(twin, 1, "loan_performance@24mo")
++    _derive(twin)
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT obligation_id, prev_hash, curr_hash
++                           FROM obligation_ledger WHERE replica_id=%s""",
++                       (twin.replica_id,))
++            obligation_id, prev_hash, curr_hash = cur.fetchone()
++    import hashlib
++    from twin_custody import canonical_json
++    expected_payload = {
++        "replica_id": twin.replica_id, "seq": 1,
++        "obligation_id": obligation_id,
++        "decision_hash": "h1",
++        "declaration": "loan_performance@24mo",
++        "domain": "loan_performance",  # no domain shipped -> falls back to rule.kind
++        "obligation_kind": "loan_performance",
++        "opened_at": NOW, "expected_by": NOW + 720 * DAY,
++        "state": "OPEN", "reason_code": "not_yet_due",
++        "prev_hash": prev_hash,
++    }
++    assert curr_hash == hashlib.sha256(canonical_json(expected_payload)).hexdigest()
++
++
+ def test_an_estimated_resolution_without_a_method_is_refused(twin):
+     oid = _one(twin)
+     resp = _transition(twin, oid, state="RESOLVED", resolved_at=NOW + 730 * DAY,
+diff --git a/sentinel_os/twin_custody.py b/sentinel_os/twin_custody.py
+index e653722..13a34d5 100644
+--- a/sentinel_os/twin_custody.py
++++ b/sentinel_os/twin_custody.py
+@@ -218,6 +218,21 @@ SHIPPED_COLUMNS = [
+ ]
+ 
+ 
++def domain_from_cassette_version(cassette_version: Optional[str]) -> Optional[str]:
++    """Extract the domain segment from a cassette_version string.
++
++    cassette_version is always "domain:name:version"
++    (cassette_schema.cassette_version_of) -- a fixed, code-generated
++    format, never free text -- so the domain is reliably everything
++    before the first colon. Returns None when there is nothing to parse,
++    same "not yet known" posture as outcome_obligation/decided_at when
++    a row predates this field.
++    """
++    if not cassette_version:
++        return None
++    return cassette_version.split(":", 1)[0] or None
++
++
+ def _ledger_dumps(obj: Any) -> bytes:
+     # Byte-for-byte the serialization ledger_postgres.py uses at append time:
+     # json.dumps(canonical_entry, sort_keys=True, default=str).encode()
+diff --git a/sentinel_os/twin_receiver.py b/sentinel_os/twin_receiver.py
+index b312c53..5e82a79 100644
+--- a/sentinel_os/twin_receiver.py
++++ b/sentinel_os/twin_receiver.py
+@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS replica_entries (
+ CREATE INDEX IF NOT EXISTS idx_replica_entries_sid ON replica_entries (replica_id, call_sid);
+ ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS outcome_obligation TEXT;
+ ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS decided_at DOUBLE PRECISION;
++-- Cohort assembly needs to group obligations by domain, not just by
++-- obligation_kind (two unrelated cassettes could legitimately pick the same
++-- obligation_kind string). Shipped in the clear, same posture as
++-- outcome_obligation/decided_at above: it says which business line a
++-- decision belongs to, nothing about the subject, and the twin needs it
++-- without decryption authority.
++ALTER TABLE replica_entries ADD COLUMN IF NOT EXISTS domain TEXT;
+ CREATE INDEX IF NOT EXISTS idx_replica_entries_obligation
+     ON replica_entries (replica_id, outcome_obligation)
+     WHERE outcome_obligation IS NOT NULL;
+@@ -84,11 +91,17 @@ CREATE TABLE IF NOT EXISTS obligation_ledger (
+     primary_id    BIGINT,
+     decision_hash TEXT NOT NULL,
+     declaration   TEXT NOT NULL,
++    domain        TEXT NOT NULL DEFAULT 'unknown',
+     obligation_kind TEXT NOT NULL,
+     opened_at     DOUBLE PRECISION NOT NULL,
+     expected_by   DOUBLE PRECISION NOT NULL,
+     state         TEXT NOT NULL,
+     reason_code   TEXT,
++    resolved_at   DOUBLE PRECISION,
++    resolved_value JSONB,
++    resolution_provenance TEXT,
++    resolution_method TEXT,
++    favorable     BOOLEAN,
+     detail        JSONB NOT NULL DEFAULT '{}'::jsonb,
+     prev_hash     TEXT NOT NULL,
+     curr_hash     TEXT NOT NULL,
+@@ -99,6 +112,14 @@ CREATE TABLE IF NOT EXISTS obligation_ledger (
+ );
+ CREATE INDEX IF NOT EXISTS idx_obligation_ledger_oid
+     ON obligation_ledger (replica_id, obligation_id, seq DESC);
++-- Backfill for a table created before these columns existed (dev/CI reruns
++-- against a persistent volume); a fresh CREATE TABLE above already has them.
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolved_at DOUBLE PRECISION;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolved_value JSONB;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_provenance TEXT;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_method TEXT;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS favorable BOOLEAN;
++ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS domain TEXT NOT NULL DEFAULT 'unknown';
+ CREATE TABLE IF NOT EXISTS custody_log (
+     id          BIGSERIAL PRIMARY KEY,
+     replica_id  TEXT NOT NULL REFERENCES replica_meta(replica_id),
+@@ -220,7 +241,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                 cur.execute(
+                     """SELECT primary_id, call_sid, previous_hash, current_hash,
+-                              envelope, outcome_obligation, decided_at
++                              envelope, outcome_obligation, decided_at, domain
+                        FROM replica_entries WHERE replica_id=%s AND primary_id=%s""",
+                     (replica_id, int(body["primary_id"])))
+                 existing = cur.fetchone()
+@@ -230,6 +251,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                         and existing["current_hash"] == body["current_hash"]
+                         and existing["call_sid"] == body.get("call_sid")
+                         and existing["outcome_obligation"] == body.get("outcome_obligation")
++                        and existing["domain"] == body.get("domain")
+                         and canonical_json(existing["envelope"]) == canonical_json(body["envelope"])
+                     )
+                     if same:
+@@ -243,12 +265,14 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 cur.execute(
+                     """INSERT INTO replica_entries
+                          (replica_id, primary_id, call_sid, previous_hash,
+-                          current_hash, envelope, outcome_obligation, decided_at)
+-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
++                          current_hash, envelope, outcome_obligation, decided_at,
++                          domain)
++                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                     (replica_id, int(body["primary_id"]), body.get("call_sid"),
+                      body["previous_hash"], body["current_hash"],
+                      json.dumps(body["envelope"]),
+-                     body.get("outcome_obligation"), body.get("decided_at")))
++                     body.get("outcome_obligation"), body.get("decided_at"),
++                     body.get("domain")))
+         return {"status": "stored", "primary_id": int(body["primary_id"])}
+ 
+     @app.get("/replica/{replica_id}/head")
+@@ -376,24 +400,47 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                        "obligation_id": obligation.obligation_id,
+                        "decision_hash": obligation.decision_hash,
+                        "declaration": declaration,
++                       "domain": obligation.domain,
+                        "obligation_kind": obligation.obligation_kind,
+                        "opened_at": obligation.opened_at,
+                        "expected_by": obligation.expected_by,
+                        "state": obligation.state,
+                        "reason_code": obligation.reason_code,
+                        "prev_hash": prev_hash}
++            # Resolution fields enter the hashed payload ONLY when present --
++            # same "optional hashed field" discipline used for cassette_hash
++            # etc. in ledger_postgres.py. An OPEN-state row (all five None)
++            # hashes exactly as it did before this fix; only a RESOLVED row
++            # picks up the new fields, so nothing already on a chain is
++            # invalidated by adding the capability to record them.
++            resolution_fields = {
++                "resolved_at": obligation.resolved_at,
++                "resolved_value": obligation.resolved_value,
++                "resolution_provenance": obligation.resolution_provenance,
++                "resolution_method": obligation.resolution_method,
++                "favorable": obligation.favorable,
++            }
++            for key, value in resolution_fields.items():
++                if value is not None:
++                    payload[key] = value
+             curr_hash = hashlib.sha256(canonical_json(payload)).hexdigest()
+             cur.execute(
+                 """INSERT INTO obligation_ledger
+                      (replica_id, seq, obligation_id, primary_id, decision_hash,
+-                      declaration, obligation_kind, opened_at, expected_by,
+-                      state, reason_code, detail, prev_hash, curr_hash,
+-                      signature, signer_pub)
+-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
++                      declaration, domain, obligation_kind, opened_at, expected_by,
++                      state, reason_code, resolved_at, resolved_value,
++                      resolution_provenance, resolution_method, favorable,
++                      detail, prev_hash, curr_hash, signature, signer_pub)
++                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                 (replica_id, seq, obligation.obligation_id, primary_id,
+-                 obligation.decision_hash, declaration, obligation.obligation_kind,
++                 obligation.decision_hash, declaration, obligation.domain,
++                 obligation.obligation_kind,
+                  obligation.opened_at, obligation.expected_by, obligation.state,
+-                 obligation.reason_code, json.dumps(obligation.detail),
++                 obligation.reason_code, obligation.resolved_at,
++                 None if obligation.resolved_value is None
++                 else json.dumps(obligation.resolved_value),
++                 obligation.resolution_provenance, obligation.resolution_method,
++                 obligation.favorable, json.dumps(obligation.detail),
+                  prev_hash, curr_hash, signature, signer_pub))
+         return seq, curr_hash
+ 
+@@ -404,8 +451,10 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             cur.execute("""
+                 SELECT DISTINCT ON (obligation_id)
+                        obligation_id, primary_id, decision_hash, declaration,
+-                       obligation_kind, opened_at, expected_by, state,
+-                       reason_code, detail, seq, curr_hash
++                       domain, obligation_kind, opened_at, expected_by, state,
++                       reason_code, resolved_at, resolved_value,
++                       resolution_provenance, resolution_method, favorable,
++                       detail, seq, curr_hash
+                 FROM obligation_ledger WHERE replica_id=%s
+                 ORDER BY obligation_id, seq DESC""", (replica_id,))
+             return {row["obligation_id"]: dict(row) for row in cur.fetchall()}
+@@ -425,7 +474,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             _meta(conn, replica_id)
+             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                 cur.execute("""
+-                    SELECT primary_id, current_hash, outcome_obligation, decided_at
++                    SELECT primary_id, current_hash, outcome_obligation, decided_at, domain
+                     FROM replica_entries
+                     WHERE replica_id=%s AND outcome_obligation IS NOT NULL
+                     ORDER BY primary_id ASC""", (replica_id,))
+@@ -456,7 +505,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                 obligation = open_obligation(
+                     obligation_id=obligation_id,
+                     decision_hash=row["current_hash"],
+-                    domain=rule.kind,
++                    domain=row.get("domain") or rule.kind,
+                     rule=rule,
+                     opened_at=float(row["decided_at"]),
+                 )
+@@ -501,7 +550,7 @@ def build_app(dsn: str, site: str) -> FastAPI:
+             existing = OutcomeObligation(
+                 obligation_id=current["obligation_id"],
+                 decision_hash=current["decision_hash"],
+-                domain=current["obligation_kind"],
++                domain=current["domain"],
+                 obligation_kind=current["obligation_kind"],
+                 opened_at=float(current["opened_at"]),
+                 expected_by=float(current["expected_by"]),
+diff --git a/sentinel_os/twin_shipper.py b/sentinel_os/twin_shipper.py
+index bf26ca9..b637e8c 100644
+--- a/sentinel_os/twin_shipper.py
++++ b/sentinel_os/twin_shipper.py
+@@ -38,7 +38,7 @@ import psycopg2.extras
+ import redis
+ 
+ from queue_schema import TransmissionQueue
+-from twin_custody import SHIPPED_COLUMNS, canonical_json, seal
++from twin_custody import SHIPPED_COLUMNS, canonical_json, domain_from_cassette_version, seal
+ 
+ SYNC_QUEUE_NAME = "twin_sync"
+ CURSOR_KEY = "twin:cursor:{replica_id}"
+@@ -139,6 +139,10 @@ def ship_available(queue: TransmissionQueue, r: redis.Redis,
+                     "outcome_obligation": row.get("outcome_obligation"),
+                     "decided_at": (row["timestamp"].timestamp()
+                                    if row.get("timestamp") is not None else None),
++                    # Cohort assembly groups obligations by domain, not just
++                    # by obligation_kind -- two unrelated cassettes could
++                    # legitimately pick the same obligation_kind string.
++                    "domain": domain_from_cassette_version(row.get("cassette_version")),
+                 }
+                 queue.enqueue(payload, job_id=f"{rid}|{row['id']}")
+                 count += 1
+diff --git a/sentinel_os/twin_sync_worker.py b/sentinel_os/twin_sync_worker.py
+index a74866e..edc2b58 100644
+--- a/sentinel_os/twin_sync_worker.py
++++ b/sentinel_os/twin_sync_worker.py
+@@ -54,6 +54,7 @@ class TwinSyncWorker:
+             "call_sid": p.get("call_sid"),
+             "outcome_obligation": p.get("outcome_obligation"),
+             "decided_at": p.get("decided_at"),
++            "domain": p.get("domain"),
+             "previous_hash": p["previous_hash"],
+             "current_hash": p["current_hash"],
+             "envelope": p["envelope"],
+-- 
+2.43.0
+

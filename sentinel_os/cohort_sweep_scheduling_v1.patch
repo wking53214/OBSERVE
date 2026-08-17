@@ -1,0 +1,195 @@
+diff --git a/sentinel_os/Tests/test_obligation_sweep.py b/sentinel_os/Tests/test_obligation_sweep.py
+index a971ae7..5d747ca 100644
+--- a/sentinel_os/Tests/test_obligation_sweep.py
++++ b/sentinel_os/Tests/test_obligation_sweep.py
+@@ -30,7 +30,9 @@ from obligation_sweep import (
+     cohort_key,
+     fetch_decision_materials,
+     fetch_group_distributions,
++    fetch_latest_cohort_review,
+     fetch_resolved_obligations,
++    record_reviews,
+     review_cohort,
+     subject_of,
+     sweep,
+@@ -400,3 +402,74 @@ def test_sweep_geocodes_property_address_into_dimension_6(twin, channel, test_le
+     review = reviews[0]
+     assert review.dimension_6_cohort_size == 1
+     assert review.skipped == []
++
++
++# ---------------------------------------------------------------------------
++# fetch_latest_cohort_review -- read-side lookup for a future per-decision
++# consumer (not wired into the live judgment path yet -- see the function's
++# own docstring for why).
++# ---------------------------------------------------------------------------
++
++def test_fetch_latest_cohort_review_returns_none_when_nothing_swept_yet(twin):
++    result = fetch_latest_cohort_review(twin, twin.replica_id, "lending",
++                                        "loan_performance")
++    assert result is None
++
++
++def test_fetch_latest_cohort_review_returns_the_most_recent_recorded_review(
++        twin, channel, test_ledger):
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="lending:test_cassette:1.0.0",
++        input_data={"income": 60000}, policy_parameters={"min_income": 40000},
++        reasoning="qualifies", output={"approved": True},
++        outcome_obligation="loan_performance@24mo",
++    ))
++    lending_hash = test_ledger.get_entries(limit=1)[0]["current_hash"]
++    _ship_and_resolve(twin, 1, "lending", lending_hash, favorable=True)
++    channel.record_estimate(lending_hash, SOURCE_BISG_ESTIMATED, {"white": 0.7, "black": 0.3})
++
++    conn = test_ledger.pool.getconn()
++    try:
++        reviews = sweep(twin, twin.replica_id, conn, channel, CFPB_REG_B_PROFILE)
++    finally:
++        test_ledger.pool.putconn(conn)
++    record_reviews(twin, twin.replica_id, reviews, swept_at=1_700_000_000.0)
++
++    latest = fetch_latest_cohort_review(twin, twin.replica_id, "lending",
++                                        "loan_performance")
++    assert latest is not None
++    assert latest["domain"] == "lending"
++    assert latest["total_resolved"] == 1
++
++
++def test_fetch_latest_cohort_review_returns_the_newest_of_several_sweeps(
++        twin, channel, test_ledger):
++    """Two sweeps of the SAME cohort, one after another -- confirms the
++    lookup returns the newer one, not the first."""
++    test_ledger.append_decision(GovernanceDecisionRecord(
++        action_type="decision", node="test", cassette_version="lending:test_cassette:1.0.0",
++        input_data={"income": 60000}, policy_parameters={"min_income": 40000},
++        reasoning="qualifies", output={"approved": True},
++        outcome_obligation="loan_performance@24mo",
++    ))
++    lending_hash = test_ledger.get_entries(limit=1)[0]["current_hash"]
++    _ship_and_resolve(twin, 1, "lending", lending_hash, favorable=True)
++    channel.record_estimate(lending_hash, SOURCE_BISG_ESTIMATED, {"white": 0.7, "black": 0.3})
++
++    conn = test_ledger.pool.getconn()
++    try:
++        first = sweep(twin, twin.replica_id, conn, channel, CFPB_REG_B_PROFILE)
++    finally:
++        test_ledger.pool.putconn(conn)
++    record_reviews(twin, twin.replica_id, first, swept_at=1_700_000_000.0)
++
++    conn = test_ledger.pool.getconn()
++    try:
++        second = sweep(twin, twin.replica_id, conn, channel, CFPB_REG_B_PROFILE)
++    finally:
++        test_ledger.pool.putconn(conn)
++    record_reviews(twin, twin.replica_id, second, swept_at=1_700_999_999.0)
++
++    latest = fetch_latest_cohort_review(twin, twin.replica_id, "lending",
++                                        "loan_performance")
++    assert latest["swept_at"] == 1_700_999_999.0
+diff --git a/sentinel_os/obligation_sweep.py b/sentinel_os/obligation_sweep.py
+index 8ad1e92..121de17 100644
+--- a/sentinel_os/obligation_sweep.py
++++ b/sentinel_os/obligation_sweep.py
+@@ -464,3 +464,101 @@ def record_reviews(twin_client, replica_id: str,
+         resp.raise_for_status()
+         results.append(resp.json())
+     return results
++
++
++def fetch_latest_cohort_review(twin_client, replica_id: str, domain: str,
++                               obligation_kind: str) -> Optional[Dict[str, Any]]:
++    """The most recently recorded cohort_equity_review for one (domain,
++    obligation_kind) cohort, or None if the sweep has never run for it
++    yet. Reads the twin's existing GET /cohort-reviews (already ordered
++    oldest-first) and takes the last entry -- no new twin-side
++    mechanism, just a convenience read over what's already there.
++
++    NOT called anywhere in the live judgment path today (Wm, 2026-07-29:
++    deliberately deferred -- regulatory_deck.judge()/explain() make NO
++    external network call today, and reaching out to the twin on every
++    live decision would be the first; that's a real latency/reliability
++    trade worth its own decision once real sweep data exists, not
++    something to wire in as a side effect of building the sweep
++    itself). This function exists so that FUTURE wiring has something
++    ready to call -- it is the fetch, not the wiring.
++    """
++    resp = twin_client.get(f"/replica/{replica_id}/cohort-reviews",
++                           params={"domain": domain, "obligation_kind": obligation_kind})
++    resp.raise_for_status()
++    reviews = resp.json()["reviews"]
++    return reviews[-1] if reviews else None
++
++
++# ---------------------------------------------------------------------------
++# CLI entry point -- triggers one sweep run. Deliberately a standalone
++# script, not an HTTP endpoint: this runs on the PRIMARY (see module
++# docstring) and needs both a real ledger connection and a real twin
++# client, and the codebase's own precedent for exactly this shape of job
++# (primary-side, needs the twin, periodic/on-demand) is a script --
++# twin_sync_worker.py and twin_migrate.py both work this way, not as
++# endpoints. Whatever actually calls this on a schedule (cron, a k8s
++# CronJob, or a human running it by hand) is a deployment decision this
++# script deliberately doesn't make for you.
++# ---------------------------------------------------------------------------
++
++def main() -> None:
++    import argparse
++    import json as _json
++
++    import httpx
++    import psycopg2 as _psycopg2
++
++    from regulatory_cassettes.cfpb_reg_b import CFPB_REG_B_PROFILE
++    from sealed_demographic_channel import SealedDemographicChannel
++
++    ap = argparse.ArgumentParser(
++        description="Run one C2 cohort-fairness sweep (dimensions 4/5/6) "
++                    "and record the results on the twin.")
++    ap.add_argument("--ledger-dsn", required=True,
++                    help="psycopg2 DSN for the primary's own ledger")
++    ap.add_argument("--receiver-url", required=True,
++                    help="Base URL of the twin's receiver API")
++    ap.add_argument("--replica-id", required=True)
++    ap.add_argument("--sealed-channel-host", default="localhost")
++    ap.add_argument("--sealed-channel-port", type=int, default=5432)
++    ap.add_argument("--sealed-channel-dbname", default="iceberg")
++    ap.add_argument("--sealed-channel-user", default="iceberg")
++    ap.add_argument("--sealed-channel-password", default="iceberg")
++    ap.add_argument("--domain", default=None,
++                    help="Restrict the sweep to one domain's cohorts "
++                         "(default: every domain with resolved obligations)")
++    ap.add_argument("--dry-run", action="store_true",
++                    help="Compute and print reviews but do not record "
++                         "them on the twin")
++    args = ap.parse_args()
++
++    ledger_conn = _psycopg2.connect(args.ledger_dsn)
++    twin_client = httpx.Client(base_url=args.receiver_url, timeout=30.0)
++    channel = SealedDemographicChannel(
++        host=args.sealed_channel_host, port=args.sealed_channel_port,
++        dbname=args.sealed_channel_dbname, user=args.sealed_channel_user,
++        password=args.sealed_channel_password)
++
++    try:
++        reviews = sweep(twin_client, args.replica_id, ledger_conn, channel,
++                        CFPB_REG_B_PROFILE)
++        if args.domain is not None:
++            reviews = [r for r in reviews if r.domain == args.domain]
++        summary = {
++            "cohorts_swept": len(reviews),
++            "reviews": [r.as_dict() for r in reviews],
++        }
++        if not args.dry_run:
++            import time as _time
++            recorded = record_reviews(twin_client, args.replica_id, reviews,
++                                      swept_at=_time.time())
++            summary["recorded"] = recorded
++        print(_json.dumps(summary, indent=2, default=str))
++    finally:
++        ledger_conn.close()
++        twin_client.close()
++
++
++if __name__ == "__main__":
++    main()

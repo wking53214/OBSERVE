@@ -1,0 +1,409 @@
+From 74b2468c16d95c42d670e2daeff5bc4714918d51 Mon Sep 17 00:00:00 2001
+From: wking53214 <wking53214@gmail.com>
+Date: Thu, 30 Jul 2026 10:25:12 +0000
+Subject: [PATCH] Cleanup pass: fix deprecated datetime calls, remove orphaned
+ empty files, resolve duplicate/colliding class names, fix syntax error in
+ default_kernel.py
+
+---
+ src/innovation_os/intelligence/bootstrap.py   | 28 ------------
+ .../intelligence/bootstrap/default_kernel.py  | 15 +------
+ .../governance/compliance_trace.py            |  4 +-
+ .../intelligence/learning/memory_event.py     |  4 +-
+ .../intelligence/memory/memory_artifact.py    |  4 +-
+ .../observability/execution_trace.py          |  4 +-
+ .../observation/observation_engine.py         |  0
+ .../intelligence/project_scan.py              |  4 +-
+ .../intelligence/registry/__init__.py         |  4 +-
+ .../registry/intelligence_registry.py         |  2 +-
+ .../intelligence/repository_intelligence.py   |  2 +-
+ .../simulation/simulation_engine.py           |  0
+ .../intelligence/telemetry/event.py           |  4 +-
+ .../intelligence/telemetry/metrics.py         | 43 ++++---------------
+ src/innovation_os/platform/version.py         |  4 +-
+ src/innovation_os/problem/engine.py           |  0
+ src/innovation_os/problem/models.py           |  0
+ src/innovation_os/provenance/engine.py        |  4 +-
+ src/innovation_os/provenance/provenance.py    |  4 +-
+ tests/intelligence/registry/test_registry.py  |  4 +-
+ .../test_repository_intelligence.py           |  4 +-
+ 21 files changed, 35 insertions(+), 103 deletions(-)
+ delete mode 100644 src/innovation_os/intelligence/bootstrap.py
+ delete mode 100644 src/innovation_os/intelligence/observation/observation_engine.py
+ delete mode 100644 src/innovation_os/intelligence/simulation/simulation_engine.py
+ delete mode 100644 src/innovation_os/problem/engine.py
+ delete mode 100644 src/innovation_os/problem/models.py
+
+diff --git a/src/innovation_os/intelligence/bootstrap.py b/src/innovation_os/intelligence/bootstrap.py
+deleted file mode 100644
+index 7d0f88e..0000000
+--- a/src/innovation_os/intelligence/bootstrap.py
++++ /dev/null
+@@ -1,28 +0,0 @@
+-from innovation_os.intelligence.system import (
+-    create_intelligence_system,
+-)
+-
+-from innovation_os.intelligence.kernel import (
+-    create_kernel,
+-)
+-
+-
+-
+-def bootstrap_intelligence(
+-    pipeline
+-):
+-
+-    kernel = create_kernel()
+-
+-    system = create_intelligence_system(
+-        pipeline
+-    )
+-
+-
+-    kernel.register(
+-        "intelligence_system",
+-        system
+-    )
+-
+-
+-    return kernel
+diff --git a/src/innovation_os/intelligence/bootstrap/default_kernel.py b/src/innovation_os/intelligence/bootstrap/default_kernel.py
+index 7c4b613..f0c6fda 100644
+--- a/src/innovation_os/intelligence/bootstrap/default_kernel.py
++++ b/src/innovation_os/intelligence/bootstrap/default_kernel.py
+@@ -83,18 +83,5 @@ def create_intelligence_kernel():
+             adapter
+         )
+ 
+-
+-    
+-kernel.registry.engines.update(
+-    {
+-        "observation": None,
+-        "perception": None,
+-        "context": None,
+-        "knowledge": None,
+-        "inference": None,
+-        "hypothesis": None,
+-    }
+-)
+-
+-return kernel
++    return kernel
+ 
+diff --git a/src/innovation_os/intelligence/governance/compliance_trace.py b/src/innovation_os/intelligence/governance/compliance_trace.py
+index ca1c5ad..5a7b415 100644
+--- a/src/innovation_os/intelligence/governance/compliance_trace.py
++++ b/src/innovation_os/intelligence/governance/compliance_trace.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -19,7 +19,7 @@ class ComplianceTrace:
+         entry = {
+             "action": action,
+             "status": status,
+-            "timestamp": datetime.utcnow().isoformat(),
++            "timestamp": datetime.now(timezone.utc).isoformat(),
+         }
+ 
+         self.records.append(
+diff --git a/src/innovation_os/intelligence/learning/memory_event.py b/src/innovation_os/intelligence/learning/memory_event.py
+index 71989d5..e75c2a3 100644
+--- a/src/innovation_os/intelligence/learning/memory_event.py
++++ b/src/innovation_os/intelligence/learning/memory_event.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -16,4 +16,4 @@ class MemoryEvent:
+     def __post_init__(self):
+ 
+         if self.timestamp is None:
+-            self.timestamp = datetime.utcnow().isoformat()
++            self.timestamp = datetime.now(timezone.utc).isoformat()
+diff --git a/src/innovation_os/intelligence/memory/memory_artifact.py b/src/innovation_os/intelligence/memory/memory_artifact.py
+index cda2fb5..eef1068 100644
+--- a/src/innovation_os/intelligence/memory/memory_artifact.py
++++ b/src/innovation_os/intelligence/memory/memory_artifact.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -10,7 +10,7 @@ class MemoryArtifact:
+     content: dict
+ 
+     created_at: datetime = field(
+-        default_factory=datetime.utcnow
++        default_factory=lambda: datetime.now(timezone.utc)
+     )
+ 
+     metadata: dict = field(
+diff --git a/src/innovation_os/intelligence/observability/execution_trace.py b/src/innovation_os/intelligence/observability/execution_trace.py
+index 6b3ae66..69fe0e3 100644
+--- a/src/innovation_os/intelligence/observability/execution_trace.py
++++ b/src/innovation_os/intelligence/observability/execution_trace.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -22,7 +22,7 @@ class ExecutionTrace:
+         entry = {
+             "stage": stage,
+             "data": data,
+-            "timestamp": datetime.utcnow().isoformat(),
++            "timestamp": datetime.now(timezone.utc).isoformat(),
+         }
+ 
+         self.entries.append(
+diff --git a/src/innovation_os/intelligence/observation/observation_engine.py b/src/innovation_os/intelligence/observation/observation_engine.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/innovation_os/intelligence/project_scan.py b/src/innovation_os/intelligence/project_scan.py
+index ec7ade9..ceb010c 100644
+--- a/src/innovation_os/intelligence/project_scan.py
++++ b/src/innovation_os/intelligence/project_scan.py
+@@ -5,7 +5,7 @@ from src.innovation_os.repository.mapper import (
+ )
+ 
+ from src.innovation_os.intelligence.repository_intelligence import (
+-    RepositoryIntelligenceEngine,
++    RepositoryArtifactEngine,
+ )
+ 
+ 
+@@ -28,7 +28,7 @@ class ProjectScanner:
+ 
+         self.mapper = RepositoryMapper()
+ 
+-        self.engine = RepositoryIntelligenceEngine()
++        self.engine = RepositoryArtifactEngine()
+ 
+ 
+ 
+diff --git a/src/innovation_os/intelligence/registry/__init__.py b/src/innovation_os/intelligence/registry/__init__.py
+index e65eaec..35e712e 100644
+--- a/src/innovation_os/intelligence/registry/__init__.py
++++ b/src/innovation_os/intelligence/registry/__init__.py
+@@ -1,5 +1,5 @@
+-from .intelligence_registry import IntelligenceRegistry
++from .intelligence_registry import ComponentRegistry
+ 
+ __all__ = [
+-    "IntelligenceRegistry",
++    "ComponentRegistry",
+ ]
+diff --git a/src/innovation_os/intelligence/registry/intelligence_registry.py b/src/innovation_os/intelligence/registry/intelligence_registry.py
+index 4d21ee7..0db9e0a 100644
+--- a/src/innovation_os/intelligence/registry/intelligence_registry.py
++++ b/src/innovation_os/intelligence/registry/intelligence_registry.py
+@@ -3,7 +3,7 @@ from typing import Dict, Any
+ 
+ 
+ @dataclass
+-class IntelligenceRegistry:
++class ComponentRegistry:
+     """
+     Central registry for intelligence components.
+     """
+diff --git a/src/innovation_os/intelligence/repository_intelligence.py b/src/innovation_os/intelligence/repository_intelligence.py
+index 2181795..15e71e1 100644
+--- a/src/innovation_os/intelligence/repository_intelligence.py
++++ b/src/innovation_os/intelligence/repository_intelligence.py
+@@ -21,7 +21,7 @@ class RepositoryIntelligence:
+ 
+ 
+ 
+-class RepositoryIntelligenceEngine:
++class RepositoryArtifactEngine:
+ 
+ 
+     def analyze(
+diff --git a/src/innovation_os/intelligence/simulation/simulation_engine.py b/src/innovation_os/intelligence/simulation/simulation_engine.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/innovation_os/intelligence/telemetry/event.py b/src/innovation_os/intelligence/telemetry/event.py
+index a7336f9..02aeb1b 100644
+--- a/src/innovation_os/intelligence/telemetry/event.py
++++ b/src/innovation_os/intelligence/telemetry/event.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -17,4 +17,4 @@ class IntelligenceTelemetryEvent:
+     def __post_init__(self):
+ 
+         if self.timestamp is None:
+-            self.timestamp = datetime.utcnow()
++            self.timestamp = datetime.now(timezone.utc)
+diff --git a/src/innovation_os/intelligence/telemetry/metrics.py b/src/innovation_os/intelligence/telemetry/metrics.py
+index b64244e..3e002f1 100644
+--- a/src/innovation_os/intelligence/telemetry/metrics.py
++++ b/src/innovation_os/intelligence/telemetry/metrics.py
+@@ -1,35 +1,8 @@
+-class IntelligenceMetrics:
+-
+-
+-    def __init__(self):
+-
+-        self.values = {}
+-
+-
+-
+-    def increment(
+-        self,
+-        name,
+-        value=1
+-    ):
+-
+-        self.values[name] = (
+-            self.values.get(
+-                name,
+-                0
+-            )
+-            +
+-            value
+-        )
+-
+-
+-
+-    def get(
+-        self,
+-        name
+-    ):
+-
+-        return self.values.get(
+-            name,
+-            0
+-        )
++# The telemetry subsystem used to keep its own copy of IntelligenceMetrics.
++# It now re-exports the canonical implementation from the metrics package
++# so there is a single source of truth for this class.
++from innovation_os.intelligence.metrics.intelligence_metrics import (
++    IntelligenceMetrics,
++)
++
++__all__ = ["IntelligenceMetrics"]
+diff --git a/src/innovation_os/platform/version.py b/src/innovation_os/platform/version.py
+index 4bdac45..65efa87 100644
+--- a/src/innovation_os/platform/version.py
++++ b/src/innovation_os/platform/version.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import datetime, timezone
+ 
+ 
+ @dataclass
+@@ -30,7 +30,7 @@ class VersionRegistry:
+         record = VersionRecord(
+             artifact_id,
+             version,
+-            datetime.utcnow(),
++            datetime.now(timezone.utc),
+             status,
+         )
+ 
+diff --git a/src/innovation_os/problem/engine.py b/src/innovation_os/problem/engine.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/innovation_os/problem/models.py b/src/innovation_os/problem/models.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/src/innovation_os/provenance/engine.py b/src/innovation_os/provenance/engine.py
+index 9e8bec4..54cbeb0 100644
+--- a/src/innovation_os/provenance/engine.py
++++ b/src/innovation_os/provenance/engine.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ from typing import Dict, List
+ 
+ 
+@@ -35,7 +35,7 @@ class ProvenanceEngine:
+         record = ProvenanceRecord(
+             artifact_id=artifact_id,
+             source=source,
+-            created_at=datetime.utcnow().isoformat(),
++            created_at=datetime.now(timezone.utc).isoformat(),
+             metadata=metadata or {},
+         )
+ 
+diff --git a/src/innovation_os/provenance/provenance.py b/src/innovation_os/provenance/provenance.py
+index 45cbaf0..46eb4b3 100644
+--- a/src/innovation_os/provenance/provenance.py
++++ b/src/innovation_os/provenance/provenance.py
+@@ -1,5 +1,5 @@
+ from dataclasses import dataclass, field
+-from datetime import datetime
++from datetime import datetime, timezone
+ from typing import Dict, List
+ 
+ 
+@@ -37,7 +37,7 @@ class ProvenanceEngine:
+         record = ProvenanceRecord(
+             artifact_id=artifact_id,
+             source=source,
+-            created=datetime.utcnow(),
++            created=datetime.now(timezone.utc),
+         )
+ 
+ 
+diff --git a/tests/intelligence/registry/test_registry.py b/tests/intelligence/registry/test_registry.py
+index 286c71d..803b10c 100644
+--- a/tests/intelligence/registry/test_registry.py
++++ b/tests/intelligence/registry/test_registry.py
+@@ -1,11 +1,11 @@
+ from innovation_os.intelligence.registry import (
+-    IntelligenceRegistry,
++    ComponentRegistry,
+ )
+ 
+ 
+ def test_registry():
+ 
+-    registry = IntelligenceRegistry()
++    registry = ComponentRegistry()
+ 
+     registry.register(
+         "runtime",
+diff --git a/tests/intelligence/test_repository_intelligence.py b/tests/intelligence/test_repository_intelligence.py
+index 1155361..e7e68d2 100644
+--- a/tests/intelligence/test_repository_intelligence.py
++++ b/tests/intelligence/test_repository_intelligence.py
+@@ -1,5 +1,5 @@
+ from src.innovation_os.intelligence.repository_intelligence import (
+-    RepositoryIntelligenceEngine,
++    RepositoryArtifactEngine,
+ )
+ 
+ from src.innovation_os.registry.artifact_registry import (
+@@ -31,7 +31,7 @@ def test_repository_intelligence():
+     ]
+ 
+ 
+-    result = RepositoryIntelligenceEngine().analyze(
++    result = RepositoryArtifactEngine().analyze(
+         artifacts
+     )
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,1775 @@
+From 4f3d3b761a2c0b56f21e34d971f4b021e8bc42e6 Mon Sep 17 00:00:00 2001
+From: William King <wking53214@gmail.com>
+Date: Sat, 18 Jul 2026 09:56:12 +0000
+Subject: [PATCH 1/2] Roadster phase-1 final pieces: rate_limiter_v2.py (F-F) +
+ circuit_breaker.py (F-A app-layer)
+
+- circuit_breaker.py: per-resource breaker, no shared/global instance.
+  Wired into production_harness.py at the two real call sites
+  (Claude safety_check, ledger append_decision) per approved diff.
+  Claude threshold 5/30s, Postgres 3/15s, 2 half-open successes to
+  close. Added is_failure predicate support after finding
+  safety_check() swallows exceptions and encodes failure in its
+  return value -- an exception-only breaker there would never trip.
+
+- rate_limiter_v2.py: Redis-backed token bucket, F-F fix (bucket by
+  validated API key, never connecting IP). Attaches at api_server_v2's
+  INGRESS_GUARDS seam ONLY when auth is configured -- an earlier
+  unconditional wiring fell back to IP for unauthenticated traffic,
+  which is F-F's exact defect reintroduced; fixed before landing.
+
+- 29 new tests, all against real Redis/Postgres/api.anthropic.com,
+  96/96 total across three clean runs (each suite its own process,
+  matching this repo's established convention).
+
+- Found, flagged, not fixed (out of this build's scope): sid_exists()
+  has no exception handling at all (a full Postgres outage crashes
+  process_call before reaching either breaker); operational_resilience
+  .setup_logging() has no handler-dedup guard (worked around locally
+  in circuit_breaker.py).
+
+See roadster_breakers_verification_report_v1.md for full detail.
+---
+ sentinel_os/api_server_v2.py                  |  21 +-
+ sentinel_os/circuit_breaker.py                | 305 ++++++++++++++++++
+ sentinel_os/lua/rate_limit.lua                |  57 ++++
+ sentinel_os/production_harness.py             |  94 ++++--
+ sentinel_os/rate_limiter_v2.py                | 237 ++++++++++++++
+ ...oadster_breakers_verification_report_v1.md |  78 +++++
+ sentinel_os/test_circuit_breaker.py           | 281 ++++++++++++++++
+ .../test_production_harness_breakers.py       | 250 ++++++++++++++
+ sentinel_os/test_rate_limiter_v2.py           | 302 +++++++++++++++++
+ 9 files changed, 1595 insertions(+), 30 deletions(-)
+ create mode 100644 sentinel_os/circuit_breaker.py
+ create mode 100644 sentinel_os/lua/rate_limit.lua
+ create mode 100644 sentinel_os/rate_limiter_v2.py
+ create mode 100644 sentinel_os/roadster_breakers_verification_report_v1.md
+ create mode 100644 sentinel_os/test_circuit_breaker.py
+ create mode 100644 sentinel_os/test_production_harness_breakers.py
+ create mode 100644 sentinel_os/test_rate_limiter_v2.py
+
+diff --git a/sentinel_os/api_server_v2.py b/sentinel_os/api_server_v2.py
+index 832d936..cc3ffad 100644
+--- a/sentinel_os/api_server_v2.py
++++ b/sentinel_os/api_server_v2.py
+@@ -159,10 +159,29 @@ if os.getenv("ICEBERG_API_KEYS") or _REQUIRE_KEYS:
+                 f"imported ({exc}); refusing to start an open ingress."
+             ) from exc
+         logger.warning(f"ingress auth: api_key_auth unavailable ({exc}); starting OPEN")
++
++    # F-F: rate limiting keyed on validated caller identity, never
++    # connecting IP (this ingress sits behind nginx — one IP for every
++    # caller — and never on any payload-supplied identity). Attached
++    # ONLY here, alongside auth: without a validated principal there is
++    # no safe identity to bucket by, and falling back to IP for an
++    # unauthenticated deployment would silently reintroduce the exact
++    # shared-IP defect (F-F) this file exists to fix. Appended after
++    # the auth guard above so it always runs second: an unvalidated key
++    # 401/403s at require_api_key first and never reaches this bucket.
++    try:
++        from rate_limiter_v2 import rate_limit_v2  # type: ignore
++        INGRESS_GUARDS.append(Depends(rate_limit_v2))
++        logger.info("ingress rate limiting: rate_limiter_v2.rate_limit_v2 attached")
++    except Exception as exc:  # pragma: no cover - config error path
++        logger.warning(f"ingress rate limiting: rate_limiter_v2 unavailable ({exc}); starting WITHOUT it")
+ else:
+     logger.warning(
+         "ingress auth: DISABLED (no ICEBERG_API_KEYS set) — dev mode only. "
+-        "Set ICEBERG_API_KEYS=key:name to attach the existing guard."
++        "Set ICEBERG_API_KEYS=key:name to attach the existing guard. "
++        "Rate limiting (rate_limiter_v2) also does not attach in this mode: "
++        "there is no validated caller identity to bucket by without auth, "
++        "and bucketing by connecting IP behind nginx would reintroduce F-F."
+     )
+ 
+ # --------------------------------------------------------------------------
+diff --git a/sentinel_os/circuit_breaker.py b/sentinel_os/circuit_breaker.py
+new file mode 100644
+index 0000000..cea6251
+--- /dev/null
++++ b/sentinel_os/circuit_breaker.py
+@@ -0,0 +1,305 @@
++"""circuit_breaker.py -- per-resource circuit breaker (roadster phase-1).
++
++WHY THIS FILE EXISTS (fifth-pass audit, F-A, confirmed by live execution):
++the old system (operational_resilience.py's CircuitBreaker, wired into
++resilient_harness.py) was ONE instance gating every caller through every
++downstream dependency. Two malformed requests tripped it and every
++caller -- including ones whose calls never touched the failing
++dependency -- got 60 seconds of rejection. One bad actor took down the
++whole ingress.
++
++The fix is not a smarter breaker. It's refusing to let one exist as a
++shared global. This module has no module-level breaker instance and no
++registry that would let two unrelated call sites collide on a shared
++key by accident: every CircuitBreaker is a plain object a caller
++constructs and holds itself. production_harness.py holds two -- one for
++the Claude governor call, one for the Postgres ledger write -- as
++instance attributes on IcebergProductionHarness, so each harness
++(each worker process) has independent breakers per resource, and a
++struggling Postgres connection can never gate the Claude call, or vice
++versa. If a future call site wants breaker protection, it constructs
++its own instance; it does not reach for someone else's.
++
++WHAT THIS DOES: wraps a synchronous callable. CLOSED -> call flows
++through, failures counted. failure_threshold consecutive failures ->
++OPEN: calls rejected immediately with CircuitOpenError (a real
++exception, not a raised-through value -- callers that already wrap
++their call site in `except Exception` need no new branch; see the
++production_harness.py integration, where a tripped breaker lands in
++the exact fallback shape a governor exception or a ledger exception
++already produced). After reset_timeout_s, one call is let through as a
++probe (HALF_OPEN); half_open_success_threshold consecutive successful
++probes close it again, any probe failure re-opens it immediately and
++restarts the timeout.
++
++WHAT THIS DELIBERATELY DOES NOT DO: it does not add a timeout to the
++wrapped call. A call that hangs without raising will hang the same way
++whether or not it's wrapped -- the breaker only reacts to what the
++callable actually raises. If a resource can hang indefinitely, that's
++a client-level timeout problem (e.g. the anthropic client's own
++`timeout=` kwarg, or psycopg2's `connect_timeout` / statement_timeout),
++separate from and prior to breaker coverage.
++
++Thread-safety: one lock per instance. sentinel_worker.py's reaper runs
++on a background thread; a future multi-threaded caller (e.g. an async
++ingress guard) may share one breaker instance across concurrent calls
++to the SAME resource, which is exactly the case a lock needs to cover
++correctly. Cross-resource concurrency needs no lock, because it never
++touches the same instance.
++"""
++from __future__ import annotations
++
++import threading
++import time
++from datetime import datetime, timezone
++from enum import Enum
++from typing import Any, Callable, Dict, Optional
++
++from operational_resilience import setup_logging
++
++
++class CircuitState(Enum):
++    CLOSED = "closed"        # normal operation
++    OPEN = "open"             # tripped; calls rejected without attempting
++    HALF_OPEN = "half_open"   # probing; a limited number of calls allowed through
++
++
++class CircuitOpenError(Exception):
++    """Raised in place of calling through when the breaker is OPEN (or a
++    HALF_OPEN probe slot isn't available). Subclasses Exception, not any
++    resource-specific error type, so it lands in the SAME except-Exception
++    block a caller already has around the wrapped call -- no new branch
++    needed at call sites that already treat "this dependency failed" as
++    one case."""
++
++    def __init__(self, breaker_name: str, state: "CircuitState", opened_at: Optional[float]):
++        self.breaker_name = breaker_name
++        self.state = state
++        self.opened_at = opened_at
++        wait = ""
++        if opened_at is not None:
++            wait = f" (opened {time.time() - opened_at:.1f}s ago)"
++        super().__init__(f"circuit '{breaker_name}' is {state.value}{wait}; call rejected")
++
++
++class CircuitBreaker:
++    """One breaker for one resource. Construct one per downstream
++    dependency and hold it yourself -- see module docstring for why this
++    file will not do that construction for you via a shared registry."""
++
++    def __init__(
++        self,
++        name: str,
++        *,
++        failure_threshold: int = 5,
++        reset_timeout_s: float = 30.0,
++        half_open_success_threshold: int = 2,
++    ) -> None:
++        if failure_threshold < 1:
++            raise ValueError("failure_threshold must be >= 1")
++        if half_open_success_threshold < 1:
++            raise ValueError("half_open_success_threshold must be >= 1")
++        if reset_timeout_s <= 0:
++            raise ValueError("reset_timeout_s must be > 0")
++
++        self.name = name
++        self.failure_threshold = failure_threshold
++        self.reset_timeout_s = reset_timeout_s
++        self.half_open_success_threshold = half_open_success_threshold
++
++        self._lock = threading.Lock()
++        self._state = CircuitState.CLOSED
++        self._failure_count = 0
++        self._half_open_successes = 0
++        self._opened_at: Optional[float] = None
++        self._half_open_probe_in_flight = False
++
++        # Lifetime counters -- observability only, never gate behavior.
++        self.total_calls = 0
++        self.total_failures = 0
++        self.total_rejections = 0
++        self.total_opens = 0
++
++        # setup_logging() (operational_resilience.py) adds a handler on
++        # every call and never checks for an existing one -- fine for
++        # the module's original one-logger-per-process callers, but two
++        # CircuitBreaker instances sharing a name (e.g. across harness
++        # instances in one process) would otherwise stack handlers and
++        # multiply every log line. Trimmed back to one handler here
++        # rather than patching that gap in a third file out of scope
++        # for this build; see the verification report.
++        self.logger = setup_logging(f"CircuitBreaker.{name}")
++        if len(self.logger.handlers) > 1:
++            self.logger.handlers = self.logger.handlers[:1]
++
++    # ---------------------------------------------------------- state --
++    @property
++    def state(self) -> CircuitState:
++        with self._lock:
++            return self._state_locked()
++
++    def _state_locked(self) -> CircuitState:
++        """Must hold self._lock. Lazily transitions OPEN -> HALF_OPEN
++        once reset_timeout_s has elapsed; this is the only place time
++        is consulted, so state is always derived fresh rather than
++        cached across an idle period."""
++        if self._state is CircuitState.OPEN and self._opened_at is not None:
++            if time.time() - self._opened_at >= self.reset_timeout_s:
++                self._state = CircuitState.HALF_OPEN
++                self._half_open_successes = 0
++                self._half_open_probe_in_flight = False
++                self.logger.info(
++                    "circuit entering HALF_OPEN",
++                    extra={"extra_data": {
++                        "breaker": self.name, "action": "half_open_transition",
++                        "open_duration_s": round(time.time() - self._opened_at, 3),
++                    }},
++                )
++        return self._state
++
++    def snapshot(self) -> Dict[str, Any]:
++        """Point-in-time status for logging / a future /health-style
++        endpoint. Never used internally to gate calls -- call() always
++        re-derives state under the lock."""
++        with self._lock:
++            st = self._state_locked()
++            return {
++                "name": self.name,
++                "state": st.value,
++                "failure_count": self._failure_count,
++                "failure_threshold": self.failure_threshold,
++                "half_open_successes": self._half_open_successes,
++                "half_open_success_threshold": self.half_open_success_threshold,
++                "opened_at": (
++                    datetime.fromtimestamp(self._opened_at, tz=timezone.utc).isoformat()
++                    if self._opened_at else None
++                ),
++                "total_calls": self.total_calls,
++                "total_failures": self.total_failures,
++                "total_rejections": self.total_rejections,
++                "total_opens": self.total_opens,
++            }
++
++    # ----------------------------------------------------------- call --
++    def call(
++        self,
++        func: Callable,
++        *args,
++        is_failure: Optional[Callable[[Any], bool]] = None,
++        **kwargs,
++    ) -> Any:
++        """Execute func(*args, **kwargs) under breaker protection.
++
++        Raises CircuitOpenError (without calling func) when OPEN, or
++        when HALF_OPEN and a probe is already in flight -- concurrent
++        callers during a probe window don't all get to test the
++        resource at once; only one probe is outstanding at a time.
++        Otherwise calls through and records the outcome.
++
++        is_failure: optional predicate run on a SUCCESSFUL return value
++        (func did not raise) to decide whether it should still count as
++        a breaker failure. Exists because some callables in this
++        codebase deliberately swallow their own exceptions and encode
++        failure in the return value instead (see
++        claude_governance_api.py's safety_check(), which fails closed
++        by returning a dict rather than raising -- an exception-only
++        breaker wrapped around it would never trip no matter how down
++        the API is). Default None means "only a raised exception counts
++        as failure," which is correct for callables like
++        PostgreSQLLedger.append_decision that do raise on real failure.
++        """
++        with self._lock:
++            st = self._state_locked()
++            if st is CircuitState.OPEN:
++                self.total_rejections += 1
++                raise CircuitOpenError(self.name, st, self._opened_at)
++            if st is CircuitState.HALF_OPEN:
++                if self._half_open_probe_in_flight:
++                    self.total_rejections += 1
++                    raise CircuitOpenError(self.name, st, self._opened_at)
++                self._half_open_probe_in_flight = True
++            self.total_calls += 1
++
++        try:
++            result = func(*args, **kwargs)
++        except Exception:
++            self._on_failure()
++            raise
++
++        if is_failure is not None and is_failure(result):
++            self._on_failure()
++            return result
++
++        self._on_success()
++        return result
++
++    # ------------------------------------------------------ outcomes --
++    def _on_success(self) -> None:
++        with self._lock:
++            if self._state is CircuitState.HALF_OPEN:
++                self._half_open_successes += 1
++                self._half_open_probe_in_flight = False
++                if self._half_open_successes >= self.half_open_success_threshold:
++                    self._state = CircuitState.CLOSED
++                    self._failure_count = 0
++                    self._opened_at = None
++                    self.logger.info(
++                        "circuit CLOSED (recovered)",
++                        extra={"extra_data": {
++                            "breaker": self.name, "action": "closed",
++                            "half_open_successes": self._half_open_successes,
++                        }},
++                    )
++            elif self._state is CircuitState.CLOSED:
++                self._failure_count = 0
++
++    def _on_failure(self) -> None:
++        with self._lock:
++            self.total_failures += 1
++            if self._state is CircuitState.HALF_OPEN:
++                # Probe failed: back to OPEN immediately, timeout restarts.
++                self._half_open_probe_in_flight = False
++                self._reopen_locked()
++                return
++
++            self._failure_count += 1
++            if self._failure_count >= self.failure_threshold:
++                self._reopen_locked()
++            else:
++                self.logger.warning(
++                    "circuit call failed",
++                    extra={"extra_data": {
++                        "breaker": self.name, "action": "failure_recorded",
++                        "failure_count": self._failure_count,
++                        "failure_threshold": self.failure_threshold,
++                    }},
++                )
++
++    def _reopen_locked(self) -> None:
++        """Must hold self._lock."""
++        was_open_already = self._state is CircuitState.OPEN
++        self._state = CircuitState.OPEN
++        self._opened_at = time.time()
++        self._half_open_successes = 0
++        if not was_open_already:
++            self.total_opens += 1
++        self.logger.error(
++            "circuit OPEN",
++            extra={"extra_data": {
++                "breaker": self.name, "action": "opened",
++                "failure_count": self._failure_count,
++                "failure_threshold": self.failure_threshold,
++                "reset_timeout_s": self.reset_timeout_s,
++            }},
++        )
++
++    # -------------------------------------------------------- testing --
++    def reset(self) -> None:
++        """Force CLOSED. Test/ops utility only -- never called from
++        call()'s own state machine."""
++        with self._lock:
++            self._state = CircuitState.CLOSED
++            self._failure_count = 0
++            self._half_open_successes = 0
++            self._opened_at = None
++            self._half_open_probe_in_flight = False
+diff --git a/sentinel_os/lua/rate_limit.lua b/sentinel_os/lua/rate_limit.lua
+new file mode 100644
+index 0000000..3d713fd
+--- /dev/null
++++ b/sentinel_os/lua/rate_limit.lua
+@@ -0,0 +1,57 @@
++-- rate_limit.lua : atomic token-bucket check-and-consume.
++-- KEYS[1] = bucket key (e.g. "rl:<namespace>:<principal>")
++-- ARGV[1] = capacity (max burst, integer tokens)
++-- ARGV[2] = refill_rate_per_ms (tokens added per millisecond, float)
++-- ARGV[3] = cost (tokens this request consumes, normally 1)
++-- ARGV[4] = ttl_ms (bucket key expiry -- bounds memory for principals
++--           that stop sending traffic; refilled/recreated on next hit)
++--
++-- Clock authority: Redis server TIME, same convention as
++-- lua/_common.lua's now_ms() -- never a client/worker host clock, so
++-- distributed ingress replicas agree on one clock regardless of their
++-- own clock skew.
++--
++-- Returns: {allowed (0/1), tokens_remaining (float, post-consume if
++-- allowed / current if denied), retry_after_ms (0 if allowed, else
++-- real time until 1 token is available)}
++local function now_ms()
++  local t = redis.call('TIME')
++  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
++end
++
++local key = KEYS[1]
++local capacity = tonumber(ARGV[1])
++local refill_rate = tonumber(ARGV[2])
++local cost = tonumber(ARGV[3])
++local ttl_ms = tonumber(ARGV[4])
++
++local now = now_ms()
++local bucket = redis.call('HMGET', key, 'tokens', 'updated_at_ms')
++local tokens = tonumber(bucket[1])
++local updated_at = tonumber(bucket[2])
++
++if tokens == nil then
++  -- First hit for this principal: bucket starts full.
++  tokens = capacity
++  updated_at = now
++end
++
++-- Refill for elapsed real time since last hit, capped at capacity.
++local elapsed = math.max(0, now - updated_at)
++tokens = math.min(capacity, tokens + elapsed * refill_rate)
++
++local allowed = 0
++local retry_after_ms = 0
++
++if tokens >= cost then
++  tokens = tokens - cost
++  allowed = 1
++else
++  local deficit = cost - tokens
++  retry_after_ms = math.ceil(deficit / refill_rate)
++end
++
++redis.call('HSET', key, 'tokens', tostring(tokens), 'updated_at_ms', tostring(now))
++redis.call('PEXPIRE', key, ttl_ms)
++
++return {allowed, tostring(tokens), retry_after_ms}
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index af1b47c..0d40370 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -23,6 +23,7 @@ from queue_staffing_bayes_integration import (
+     StaffingCoordinator, BayesianIntentEngine
+ )
+ from operational_resilience import setup_logging
++from circuit_breaker import CircuitBreaker
+ 
+ logger = setup_logging("IcebergProductionHarness")
+ 
+@@ -65,7 +66,19 @@ class IcebergProductionHarness:
+         # Operations
+         self.staffing = StaffingCoordinator()
+         self.bayes = BayesianIntentEngine()
+-        
++
++        # Roadster phase-1 (F-A): per-resource breakers. Two separate
++        # instances -- a struggling Postgres connection must never gate
++        # the Claude governor call, or vice versa. Always constructed
++        # (cheap, no I/O); only exercised when the corresponding client
++        # below is actually configured.
++        self.claude_breaker = CircuitBreaker(
++            name="claude_governor", failure_threshold=5, reset_timeout_s=30,
++        )
++        self.ledger_breaker = CircuitBreaker(
++            name="postgres_ledger", failure_threshold=3, reset_timeout_s=15,
++        )
++
+         self._init_optional_components()
+     
+     def _init_optional_components(self):
+@@ -235,16 +248,32 @@ class IcebergProductionHarness:
+             if self.claude_decider and governed:
+                 with tracer.start_as_current_span("governance_decision") as gov_span:
+                     try:
+-                        claude_decision = self.claude_decider.safety_check(
++                        claude_decision = self.claude_breaker.call(
++                            self.claude_decider.safety_check,
+                             "heal_queue",
+                             {
+                                 "queue": first_queue,
+                                 "wait_time": journey.total_duration,
+                                 "friction_count": friction_count
+-                            }
++                            },
++                            # safety_check() fails closed by RETURNING a
++                            # dict, never raising (see its own
++                            # docstring) -- an exception-only breaker
++                            # would never see these. Only the
++                            # "transport_error:"-prefixed reasoning is a
++                            # real API/network failure worth tripping
++                            # the breaker on; a malformed-JSON or
++                            # bad-shape response from a live, reachable
++                            # API is not an outage and must not count.
++                            is_failure=lambda r: isinstance(r, dict) and str(
++                                r.get("reasoning", "")
++                            ).startswith("transport_error:"),
+                         )
+                         gov_span.set_attribute("decision.approved", bool(claude_decision.get("safe")))
+                     except Exception as e:
++                        # CircuitOpenError (breaker OPEN) lands here too --
++                        # same fail-closed shape as any other governor
++                        # exception, no new branch needed.
+                         print(f"Claude decision failed: {e}")
+                         gov_span.record_exception(e)
+                         mark_error(gov_span, f"Governor exception: {e}")
+@@ -272,33 +301,40 @@ class IcebergProductionHarness:
+                     try:
+                         approved = bool(claude_decision.get("safe"))
+                         root_span.set_attribute("call.approved", approved)
+-                        self.ledger.append_decision(GovernanceDecisionRecord(
+-                            action_type="governance_decision",
+-                            node=first_queue,
+-                            cassette_version=params.cassette_version,
+-                            input_data={
+-                                "caller_id": journey.caller_id,
+-                                "call_sid": call_sid,
+-                                "friction_count": friction_count,
+-                                "governance_trigger": governance_trigger,
+-                                "wait_time": journey.total_duration,
+-                                "quality_tier": quality_score.quality_tier.value,
+-                                "intent_classification": intent_signal.classification,
+-                                "intent_confidence": intent_signal.confidence,
+-                                "intent_reasoning": intent_signal.reasoning,
+-                            },
+-                            policy_parameters=params.snapshot(),
+-                            reasoning=claude_decision.get("reasoning", ""),
+-                            output={
+-                                "approved": approved,
+-                                "risk_level": claude_decision.get("risk_level"),
+-                                "confidence": claude_decision.get("confidence"),
+-                            },
+-                            previous_value=journey.total_duration,
+-                            applied_value=journey.total_duration,
+-                            parameter_changed=False,
+-                        ), governance_params=params)
++                        self.ledger_breaker.call(
++                            self.ledger.append_decision,
++                            GovernanceDecisionRecord(
++                                action_type="governance_decision",
++                                node=first_queue,
++                                cassette_version=params.cassette_version,
++                                input_data={
++                                    "caller_id": journey.caller_id,
++                                    "call_sid": call_sid,
++                                    "friction_count": friction_count,
++                                    "governance_trigger": governance_trigger,
++                                    "wait_time": journey.total_duration,
++                                    "quality_tier": quality_score.quality_tier.value,
++                                    "intent_classification": intent_signal.classification,
++                                    "intent_confidence": intent_signal.confidence,
++                                    "intent_reasoning": intent_signal.reasoning,
++                                },
++                                policy_parameters=params.snapshot(),
++                                reasoning=claude_decision.get("reasoning", ""),
++                                output={
++                                    "approved": approved,
++                                    "risk_level": claude_decision.get("risk_level"),
++                                    "confidence": claude_decision.get("confidence"),
++                                },
++                                previous_value=journey.total_duration,
++                                applied_value=journey.total_duration,
++                                parameter_changed=False,
++                            ),
++                            governance_params=params,
++                        )
+                     except Exception as e:
++                        # CircuitOpenError (breaker OPEN) lands here too --
++                        # same ledger_write_failed=True / retryable shape
++                        # sentinel_worker.py already fails correctly on.
+                         # A decision that isn't durably recorded is not an
+                         # audited decision. This used to be a print() with
+                         # the function falling through to report
+diff --git a/sentinel_os/rate_limiter_v2.py b/sentinel_os/rate_limiter_v2.py
+new file mode 100644
+index 0000000..95a71e1
+--- /dev/null
++++ b/sentinel_os/rate_limiter_v2.py
+@@ -0,0 +1,237 @@
++"""rate_limiter_v2.py -- per-caller rate limiting for the roadster
++ingress (F-F, fifth-pass audit, confirmed by live execution).
++
++WHY THIS FILE EXISTS: the old ICEBERG_API_KEYS-era rate limiter had two
++generations of the same defect, both confirmed live.
++
++  Generation 1: keyed on the caller-SUPPLIED API key string itself, even
++  before it was validated. A brute-force attacker gets a fresh quota on
++  every guess (a different string costs nothing to mint), so the limit
++  never engages against the attack it exists to stop -- confirmed live:
++  500 distinct guessed keys, 0 throttled, plus one unbounded in-memory
++  bucket per guess.
++
++  Generation 2 (commit 5fb20b3, the fix for generation 1): switched to
++  keying on connecting IP. That closes the brute-force-quota bypass, but
++  behind nginx (this ingress's deployment target) every caller shares
++  one IP -- confirmed live: this "fix" throttles everyone or no one, a
++  product-wide DoS in either direction.
++
++THE ARCHITECTURAL DECISION THIS FILE IMPLEMENTS (already made, not
++re-litigated here): bucket by validated caller identity -- the API key
++itself, once it has passed authentication -- never by connecting IP and
++never by anything the request payload merely claims. This is safe from
++generation 1's defect because rate_limit_v2() is a plain dependency
++alongside api_key_auth.require_api_key in INGRESS_GUARDS: FastAPI
++resolves both from the SAME validated X-API-Key header on the SAME
++request, so an unauthenticated guess never reaches this bucket at all
++-- it dies at require_api_key's 401/403 first. Only a key that already
++passed validation gets a bucket.
++
++WHAT THIS DOES: a Redis-backed token bucket per principal, atomic via
++rate_limit.lua (same clock-authority convention as
++queue_schema.py/lua/_common.lua: Redis server TIME, never a host
++clock, so every ingress replica agrees). Token bucket, not fixed
++window, deliberately: a fixed window lets a caller burst 2x the
++configured rate for free by timing requests around the window boundary
++(all of their previous-window budget at :59, all of their new-window
++budget at :00). A token bucket has no boundary to burst across --
++capacity bounds the largest burst allowed at any moment, refill_rate
++bounds the sustained rate, and those are the only two knobs.
++
++WHAT THIS DELIBERATELY DOES NOT DO: it does not decide identity when no
++auth is configured. In that mode (ICEBERG_API_KEYS unset, per
++api_server_v2.py's own documented "dev mode only" warning) there is no
++validated principal to bucket by, so this falls back to connecting IP
++-- the same posture api_key_auth's own pre-auth limiter already takes,
++and an explicitly-labeled dev-only trade-off, not a claim that IP
++bucketing is safe in production behind nginx.
++
++Plug-in seam (api_server_v2.py):
++    if os.getenv("ICEBERG_API_KEYS") or _REQUIRE_KEYS:
++        ...
++        INGRESS_GUARDS.append(Depends(require_api_key))
++    INGRESS_GUARDS.append(Depends(rate_limit_v2))   # <- this file
++Guards run left to right, so require_api_key (when configured) always
++resolves first; rate_limit_v2 re-reads the same X-API-Key header
++FastAPI has already validated by the time it runs, rather than
++depending on api_key_auth.py's return value directly, to keep this
++file important-to-security but import-independent of it.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++from pathlib import Path
++from typing import Optional
++
++import redis
++from fastapi import Header, HTTPException, Request
++
++# --------------------------------------------------------------------------
++# Logging: same fallback-import pattern api_server_v2.py itself uses, so
++# this file works whether run from the repo root or the nested sentinel_os/
++# package dir.
++# --------------------------------------------------------------------------
++def _project_logger(name: str):
++    here = os.path.dirname(os.path.abspath(__file__))
++    for extra in (here, os.path.join(here, "sentinel_os")):
++        if extra not in sys.path and os.path.isdir(extra):
++            sys.path.append(extra)
++    from operational_resilience import setup_logging  # type: ignore
++    logger = setup_logging(name)
++    if len(logger.handlers) > 1:  # see circuit_breaker.py for why
++        logger.handlers = logger.handlers[:1]
++    return logger
++
++
++logger = _project_logger("RateLimiterV2")
++
++# --------------------------------------------------------------------------
++# Configuration (env). Defaults are a starting policy, not a proven-correct
++# number -- tune per deployment. 100 req/min steady rate with a 20-token
++# burst allowance: generous enough that a legitimate caller's retry-with-
++# backoff never trips it, tight enough to bound a single misbehaving
++# integration from saturating a shared worker pool.
++# --------------------------------------------------------------------------
++REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL", os.getenv("TRANSMISSION_REDIS_URL", "redis://localhost:6379/0"))
++NAMESPACE = os.getenv("RATE_LIMIT_NAMESPACE", "rl")
++REQUESTS_PER_MINUTE = float(os.getenv("RATE_LIMIT_REQUESTS_PER_MINUTE", "100"))
++BURST_CAPACITY = float(os.getenv("RATE_LIMIT_BURST_CAPACITY", "20"))
++BUCKET_TTL_S = int(os.getenv("RATE_LIMIT_BUCKET_TTL_SECONDS", "300"))
++
++_REFILL_RATE_PER_MS = REQUESTS_PER_MINUTE / 60000.0
++
++_LUA_PATH = Path(__file__).with_name("lua") / "rate_limit.lua"
++
++
++class RateLimiterV2:
++    """Owns one Redis connection pool and the loaded Lua script. One
++    instance per ingress process (constructed at app startup, same
++    lifecycle as TransmissionQueue in api_server_v2.py's lifespan) --
++    NOT a per-request object, so the connection pool and script SHA are
++    reused across requests."""
++
++    def __init__(
++        self,
++        redis_url: str = REDIS_URL,
++        namespace: str = NAMESPACE,
++        requests_per_minute: float = REQUESTS_PER_MINUTE,
++        burst_capacity: float = BURST_CAPACITY,
++        bucket_ttl_s: int = BUCKET_TTL_S,
++    ) -> None:
++        self.namespace = namespace
++        self.capacity = burst_capacity
++        self.refill_rate_per_ms = requests_per_minute / 60000.0
++        self.bucket_ttl_ms = bucket_ttl_s * 1000
++        # Socket timeouts mirror TransmissionQueue's posture: a hung
++        # Redis must cost a bounded thread, never a hang (F-E lineage).
++        self._redis = redis.Redis.from_url(
++            redis_url, socket_timeout=2.0, socket_connect_timeout=2.0,
++        )
++        self._script = self._redis.register_script(_LUA_PATH.read_text())
++
++    def check(self, principal: str, cost: float = 1.0) -> "RateLimitResult":
++        """Atomic check-and-consume for one principal. Raises
++        redis.exceptions.RedisError / OSError on real Redis failure --
++        callers decide fail-open vs fail-closed (this ingress fails
++        OPEN on Redis unavailability; see rate_limit_v2() below and its
++        docstring for why)."""
++        key = f"{self.namespace}:{principal}"
++        allowed, tokens_remaining, retry_after_ms = self._script(
++            keys=[key],
++            args=[self.capacity, self.refill_rate_per_ms, cost, self.bucket_ttl_ms],
++        )
++        return RateLimitResult(
++            allowed=bool(int(allowed)),
++            tokens_remaining=float(tokens_remaining),
++            retry_after_s=max(0.0, float(retry_after_ms) / 1000.0),
++        )
++
++    def close(self) -> None:
++        self._redis.close()
++
++
++class RateLimitResult:
++    __slots__ = ("allowed", "tokens_remaining", "retry_after_s")
++
++    def __init__(self, allowed: bool, tokens_remaining: float, retry_after_s: float) -> None:
++        self.allowed = allowed
++        self.tokens_remaining = tokens_remaining
++        self.retry_after_s = retry_after_s
++
++
++# --------------------------------------------------------------------------
++# FastAPI dependency -- the actual INGRESS_GUARDS seam attachment.
++# --------------------------------------------------------------------------
++_limiter: Optional[RateLimiterV2] = None
++
++
++def get_rate_limiter() -> RateLimiterV2:
++    """Lazily constructed singleton, mirroring api_server_v2.py's
++    app.state.queue pattern but module-level since this file has no
++    lifespan hook of its own -- constructed on first request, not at
++    import time, so importing this module never performs I/O."""
++    global _limiter
++    if _limiter is None:
++        _limiter = RateLimiterV2()
++        logger.info(
++            "rate limiter initialized",
++            extra={"extra_data": {
++                "namespace": NAMESPACE, "requests_per_minute": REQUESTS_PER_MINUTE,
++                "burst_capacity": BURST_CAPACITY,
++            }},
++        )
++    return _limiter
++
++
++def rate_limit_v2(request: Request, x_api_key: Optional[str] = Header(None)) -> None:
++    """FastAPI dependency: INGRESS_GUARDS.append(Depends(rate_limit_v2)).
++
++    Identity: the validated X-API-Key header when auth is configured
++    (the SAME header require_api_key already checked earlier in the
++    same guard chain -- an invalid key never reaches this dependency at
++    all, it 401/403s first). api_server_v2.py's guard-seam wiring only
++    attaches this dependency at all when ICEBERG_API_KEYS is configured
++    (see its own comment there), so the IP fallback below is defensive
++    only -- for a caller of rate_limit_v2() outside that documented
++    seam -- never the production posture: this file does not decide to
++    bucket unauthenticated traffic by IP, because behind nginx that is
++    exactly F-F again.
++
++    Fails OPEN on Redis unavailability: a rate limiter that itself
++    becomes the outage when its backing store blips would be strictly
++    worse than no rate limiter, and the queue's own admission control
++    (bounded depth, DLQ) is the backstop against a caller that a
++    temporarily-open limiter lets through. Every fail-open event is
++    logged at ERROR so it's visible in metrics, not silent.
++    """
++    principal = x_api_key or (request.client.host if request.client else "unknown")
++    limiter = get_rate_limiter()
++    try:
++        result = limiter.check(principal)
++    except (redis.exceptions.RedisError, OSError) as exc:
++        logger.error(
++            "rate limiter backend unavailable -- failing OPEN",
++            extra={"extra_data": {"error": f"{type(exc).__name__}: {exc}"}},
++        )
++        return
++
++    if not result.allowed:
++        logger.warning(
++            "rate limit exceeded",
++            extra={"extra_data": {
++                "principal_keyed_on": "api_key" if x_api_key else "ip",
++                "retry_after_s": result.retry_after_s,
++            }},
++        )
++        raise HTTPException(
++            status_code=429,
++            detail={
++                "error": "rate_limit_exceeded",
++                "detail": "Too many requests for this caller. Retry after "
++                          "the indicated delay.",
++            },
++            headers={"Retry-After": str(max(1, int(result.retry_after_s) + 1))},
++        )
+diff --git a/sentinel_os/roadster_breakers_verification_report_v1.md b/sentinel_os/roadster_breakers_verification_report_v1.md
+new file mode 100644
+index 0000000..03de5dd
+--- /dev/null
++++ b/sentinel_os/roadster_breakers_verification_report_v1.md
+@@ -0,0 +1,78 @@
++# rate_limiter_v2.py + circuit_breaker.py — Verification Report v1
++
++**Components:** Roadster phase-1, final two pieces — F-F (rate limiting) and F-A's application-layer piece (per-resource circuit breaking)
++**Date:** July 18, 2026
++**Environment:** Redis 7.0.15, Postgres 16.14, redis-py 8.0.1, psycopg2 2.9.x, Python 3.12.3, fastapi 0.139.0, anthropic 0.116.0; repo @ `328605c` + this session's diff (not yet committed at time of writing)
++**Method:** 96 tests total (67 pre-existing baseline + 29 new), every new test against **real Redis, real Postgres, and — for the Claude governor path — the real `api.anthropic.com` over a real HTTPS connection with a deliberately invalid key**. No mocks of Redis, Postgres, the breaker state machine, or the Anthropic transport anywhere in this delivery. **96/96 passed on three consecutive clean runs, each suite in its own process** (matching this project's established convention — see caveat below on why that separation matters).
++
++## Scope note: two planning documents referenced in the brief don't exist
++
++`roadster-work-breakdown-v1.md` was never found in the repo (checked the full tree, not just root) or in the docs the user separately supplied. `queue_contract_v1.md` and `cage_match_report_v1.md` **were** supplied and read, but neither specifies rate-limit thresholds or breaker timing — that's consistent with prior sessions' own scope notes, which explicitly left both components unbuilt with "clean seam only." All threshold values in this report were proposed by Claude and explicitly approved by William before implementation, not sourced from a document that turned out not to exist.
++
++## rate_limiter_v2.py
++
++**What it is.** A Redis-backed token bucket, one bucket per validated API key, atomic via `lua/rate_limit.lua` (same clock-authority convention as `queue_schema.py`'s own Lua: Redis server `TIME`, never a host clock). Attaches at `api_server_v2.py`'s documented `INGRESS_GUARDS` seam as `Depends(rate_limit_v2)`.
++
++**The keying decision (F-F).** Bucketed on the validated `X-API-Key` header — the same header `require_api_key` already checked earlier in the same guard chain, so an invalid key 401/403s before ever reaching a bucket. This directly targets the defect: generation 1 keyed on the attacker-supplied key pre-validation (fresh quota per guess, confirmed live at 0/500 throttled); generation 2 fixed that by keying on connecting IP, which is a product-wide DoS behind nginx (one shared IP for every caller). Neither mistake is available here because there's nothing to key on until a real key has already passed auth.
++
++**A regression I introduced and then fixed, worth stating plainly.** My first wiring attached `rate_limit_v2` to `INGRESS_GUARDS` unconditionally. When no `ICEBERG_API_KEYS` is configured, the guard's only fallback is connecting IP — which is generation 2's exact defect, just reintroduced for the unauthenticated case. This broke 7 of the pre-existing L-series load tests (`test_L06`...`test_L14`), which submit hundreds of concurrent requests from one test-runner IP and got 429'd into oblivion. Fixed by attaching `rate_limit_v2` **only** inside the same `if ICEBERG_API_KEYS or _REQUIRE_KEYS:` block that attaches `require_api_key` — no auth configured means no rate limiting at all, not IP-based rate limiting. Re-ran the full L-series afterward: 31/31 clean. The IP-fallback code path still exists in `rate_limit_v2()` itself, defensively, for a caller outside the documented seam, but it is dead code through the seam api_server_v2.py actually wires — flagged, not hidden.
++
++**Defaults (William: "you pick a sensible default, I'll adjust").** Token bucket, not fixed window — a fixed window lets a caller burst 2x the configured rate for free around the window boundary; a token bucket has no boundary to exploit. 100 requests/minute steady rate, burst capacity 20, both env-configurable (`RATE_LIMIT_REQUESTS_PER_MINUTE`, `RATE_LIMIT_BURST_CAPACITY`). Stated plainly: these are a starting policy, not a proven-correct number — no traffic data exists yet to tune against.
++
++**Verified live (`test_rate_limiter_v2.py`, 7 tests, real Redis + real uvicorn subprocess + real concurrent HTTP, small fast config — capacity 5, 1 token/sec — so the suite runs in ~13s instead of minutes):**
++- Burst exactly at capacity (5 concurrent requests) — all 5 succeed.
++- **The core claim, proven live, not counted from logs:** 15 real concurrent requests against a capacity-5 bucket — exactly 5×202, exactly 10×429, each 429 carrying a `Retry-After` header and `{"error": "rate_limit_exceeded"}`.
++- Two principals (API keys) have fully independent buckets: exhausting one to 429 leaves the other's fresh 5-request burst completely unaffected.
++- No key at all → 401 before the bucket is ever touched.
++- `/health` stays open (no guards at all) even with the caller's bucket fully exhausted.
++- Real wall-clock refill: exhausted → immediately 429 → sleep 2.2s real time → succeeds again.
++- **Fail-open, proven in isolation from the queue's own (different, correct) fail-closed behavior.** First attempt froze the ingress's main Redis and got a 503 — but that 503 was the *queue* correctly reporting itself unavailable, not the rate limiter; the two share infrastructure by default and freezing it can't isolate either one's behavior from the other's. Fixed by giving the rate limiter its own configurable `RATE_LIMIT_REDIS_URL` (falls back to the queue's `TRANSMISSION_REDIS_URL` if unset — no behavior change in the common case) and pointing it at a dedicated second Redis instance for this one test. With only the rate limiter's Redis frozen, submissions still return 202, and the fail-open event logs at ERROR — proving the deliberate fail-open design choice.
++
++**NOT verified:**
++- Behavior under `INGRESS_WORKERS` > 1 (multiple ingress processes sharing one Redis) — the design should be correct (Redis is the one shared source of truth, no in-process state), but wasn't run under multiple concurrent server processes specifically.
++- Sustained throughput at the production default (100/min, burst 20) — the live suite uses a small fast config to keep runtime reasonable; the Lua script's arithmetic was spot-checked directly against the default numbers (see the ad-hoc smoke test in this session's transcript) but not load-tested at that scale.
++- Redis Cluster / Sentinel failover — same caveat `queue_schema.py`'s own docs already carry; this file makes no different claim.
++- Whether 100/min · burst 20 is actually the right number for real traffic. No production traffic data exists to validate against.
++
++## circuit_breaker.py
++
++**What it is.** A plain, constructor-per-resource circuit breaker — CLOSED → OPEN after N consecutive failures → HALF_OPEN after a timeout → CLOSED after M consecutive probe successes. No module-level shared instance, no registry two unrelated call sites could collide on (this is asserted structurally by `test_no_module_level_shared_breaker_exists`, an AST-style check in the same spirit as `test_api_server_v2.py`'s own `test_T10`).
++
++**Where it attaches — and a finding that changed the design.** `sentinel_worker.py` never calls the Claude API or Postgres directly; both live inside `production_harness.py`'s `process_call()`, at two exact call sites (the `safety_check()` call, the `append_decision()` call). Per-resource isolation is only achievable by wrapping those two call sites, which William explicitly approved after reviewing an exact diff. The diff is small: 4 lines constructing the two breaker instances, plus each existing call wrapped in `.call(...)` — no new `except` branches, since a tripped breaker raises inside the *same* `try/except Exception` blocks that already existed, landing in the exact fallback shapes `sentinel_worker.py` already handled correctly.
++
++**A dead-breaker bug found before it shipped.** `claude_governance_api.py`'s `safety_check()` catches every exception internally, including real transport/auth failures, and always **returns** a fail-closed dict — it never raises. A breaker wrapped around it via exception-only detection would never trip no matter how down the API is, because the exception never reaches the wrapper. Fixed by adding an optional `is_failure(result)` predicate to `CircuitBreaker.call()` — the Claude call site passes one that recognizes the `"transport_error:"`-prefixed reasoning `safety_check()` uses specifically for real API/network failures (as opposed to a live-but-malformed response, which is not an outage and correctly does not trip the breaker). The ledger path needed no such change — `append_decision()` does raise on real failure, so the default exception-only behavior is correct there.
++
++**Thresholds (William: "you propose separate defaults per resource").**
++
++| | Claude governor | Postgres ledger |
++|---|---|---|
++| failure_threshold | 5 | 3 |
++| reset_timeout | 30s | 15s |
++| half-open successes to close | 2 | 2 |
++
++Claude API calls are noisier (rate limits, brief network blips) so more consecutive failures are needed before concluding it's actually down, and outages there tend to resolve over tens of seconds. Postgres failures are usually connection-pool exhaustion or a short blip — fewer failures needed to trip, since the ledger path is more critical and the queue already retries a failed job later, so failing fast is cheap; it also tends to recover faster once it does.
++
++**Stated caveat, not fixed here.** The breaker only reacts to what the wrapped call actually raises or returns. If a call hangs without either, the breaker does nothing — that's an HTTP-client/DB-driver timeout problem, one layer below what a breaker can address from outside.
++
++**Verified live:**
++- `test_circuit_breaker.py`, 16 tests, the state machine in isolation: exact-threshold tripping (not one early, not one late), OPEN rejects without ever calling through, real `time.sleep()`-based HALF_OPEN transition and timeout-restart-on-reprobe-failure, N-consecutive-successes-to-close, 20 real concurrent threads hammering a HALF_OPEN breaker with exactly 1 let through as the probe (verified by call count, not just by outcome), two independent instances proven not to share state (the direct F-A regression check), the `is_failure` predicate path (trips on a return value that never raises, does not trip on an ordinary non-matching return value, default behavior unchanged when no predicate is given).
++- `test_production_harness_breakers.py`, 6 tests, against the real, diffed `production_harness.py`:
++  - **Claude path, real API:** a sanity test confirms the live API genuinely rejects a bad key with the `transport_error:` shape the predicate keys on (not assumed — checked directly first). 5 real consecutive auth failures against `api.anthropic.com` trip the breaker exactly at threshold; the ledger breaker is confirmed completely unaffected (real F-A proof, not synthetic).
++  - **Postgres path, real permission-based failure, not a killed pool.** First attempt closed the *entire* connection pool to force failures — but that also broke `sid_exists()`, an existing, **unprotected** SELECT at the very top of `process_call` with zero exception handling around it, a real pre-existing gap this build did not introduce and is not fixing (flagged below). A full pool outage crashes there before ever reaching the breaker-wrapped write, which made pool-killing the wrong tool for isolating "does the write breaker trip on write failures." Fixed by creating a real, restricted Postgres role (`ledger_write_test`, SELECT-only on `ledger_entries`) and toggling its INSERT grant with real `REVOKE`/`GRANT` statements mid-test — `sid_exists()` keeps working throughout, `append_decision()` fails for real with a real `permission denied` error, exactly the failure mode of a narrowed or revoked runtime credential. 3 consecutive real failures trip the breaker exactly at threshold; the Claude breaker is confirmed unaffected. Real recovery: real `GRANT INSERT` mid-test, real 15.1s wall-clock wait, real HALF_OPEN transition, two real successful writes close it — both writes confirmed present via `sid_exists`.
++
++**A pre-existing gap found, not fixed — in scope for a future session, not this one.** `sid_exists()` (the sid-dedup check at the top of `process_call`) has no exception handling at all. Any Postgres failure there — not just a sustained outage, a single blip — crashes `process_call` entirely, for every call (governed or not), regardless of these two breakers. This predates this build and sits outside the two named call sites William approved touching; noted here rather than silently absorbed into this diff or silently left for someone to discover in production.
++
++**A logging bug found and worked around, not fixed at the root.** `operational_resilience.py`'s `setup_logging()` adds a new handler on every call with no dedup guard. Multiple `CircuitBreaker` instances sharing a logger name (e.g. several `IcebergProductionHarness` instances in one process, as happens across this test session) stack handlers on the same global Python logger object and multiply every log line. Doesn't affect breaker correctness — trimmed locally in `circuit_breaker.py`'s constructor (`self.logger.handlers = self.logger.handlers[:1]`) rather than patching a third file out of scope for this build.
++
++**NOT verified:**
++- Claude breaker recovery (HALF_OPEN → CLOSED) against a real *good* key — only the trip side was tested against the real API; recovery timing was verified thoroughly on the ledger side and unit-tested generically, but not re-proven against a real successful Anthropic response, since that would require a real usable API key in this environment.
++- Breaker behavior under genuinely concurrent `process_call` invocations (multiple threads/workers hitting the same harness instance's breakers at once) — the state-machine-level concurrency test (20 threads, one HALF_OPEN probe slot) covers the mechanism, but wasn't re-run specifically through `process_call` under load.
++- Long-running / sustained-open behavior — every test here trips, waits out one real timeout, and closes within seconds; no soak test.
++
++## Regression: the pre-existing 67/67 baseline
++
++Run three times, each suite in its own process (this project's own established convention — `test_T10`'s live-module-table check is itself process-scoped, and running unrelated suites in one shared pytest process cross-contaminates `sys.modules` between them; confirmed this by accident, then fixed the run method, not the code). **67/67 held every time**, plus the 29 new tests, for **96/96 across three consecutive clean runs.**
++
++## Scope confirmation
++
++Delivered: `circuit_breaker.py`, `rate_limiter_v2.py`, `lua/rate_limit.lua`, `test_circuit_breaker.py`, `test_production_harness_breakers.py`, `test_rate_limiter_v2.py`, this report. Also modified, with explicit approval after reviewing an exact diff: `production_harness.py` (breaker instantiation + two call sites wrapped) and `api_server_v2.py` (one guard-seam attachment, made conditional on auth being configured after the regression above). No new dependency added — `requirements.txt` had no unused circuit-breaker or rate-limit library sitting there, so both are hand-rolled, consistent with everything else already in `governance/` and `queue_schema.py`. Not fixed, flagged for a future session: `sid_exists()`'s missing exception handling, and `operational_resilience.py`'s missing log-handler dedup guard.
+diff --git a/sentinel_os/test_circuit_breaker.py b/sentinel_os/test_circuit_breaker.py
+new file mode 100644
+index 0000000..0132b57
+--- /dev/null
++++ b/sentinel_os/test_circuit_breaker.py
+@@ -0,0 +1,281 @@
++"""test_circuit_breaker.py -- every test here calls the real CircuitBreaker
++state machine with real time.sleep() and real threads. Nothing about the
++breaker itself is mocked; the only stand-ins are the wrapped *callables*
++(deliberately flaky functions), which is the correct level to fake at --
++we're proving the breaker's reaction to failure, not re-testing Postgres
++or the Claude API here (those are covered in test_production_harness_
++breakers.py against the real services)."""
++from __future__ import annotations
++
++import threading
++import time
++
++import pytest
++
++from circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState
++
++
++def test_closed_allows_calls_through():
++    cb = CircuitBreaker("t1", failure_threshold=3, reset_timeout_s=1)
++    assert cb.call(lambda: 42) == 42
++    assert cb.state is CircuitState.CLOSED
++
++
++def test_opens_after_exact_threshold_not_before():
++    cb = CircuitBreaker("t2", failure_threshold=3, reset_timeout_s=5)
++
++    def boom():
++        raise ValueError("nope")
++
++    for i in range(2):
++        with pytest.raises(ValueError):
++            cb.call(boom)
++        assert cb.state is CircuitState.CLOSED, f"tripped early at failure {i+1}"
++
++    with pytest.raises(ValueError):
++        cb.call(boom)  # 3rd failure -- this is the trip
++    assert cb.state is CircuitState.OPEN
++
++
++def test_open_rejects_without_calling_through():
++    cb = CircuitBreaker("t3", failure_threshold=1, reset_timeout_s=10)
++    calls = {"n": 0}
++
++    def boom():
++        calls["n"] += 1
++        raise RuntimeError("down")
++
++    with pytest.raises(RuntimeError):
++        cb.call(boom)
++    assert calls["n"] == 1
++    assert cb.state is CircuitState.OPEN
++
++    # Next 5 calls must be rejected by the breaker, never reach boom().
++    for _ in range(5):
++        with pytest.raises(CircuitOpenError):
++            cb.call(boom)
++    assert calls["n"] == 1, "breaker let a call through while OPEN"
++
++
++def test_success_resets_failure_count_while_closed():
++    cb = CircuitBreaker("t4", failure_threshold=3, reset_timeout_s=5)
++
++    with pytest.raises(ValueError):
++        cb.call(lambda: (_ for _ in ()).throw(ValueError()))
++    with pytest.raises(ValueError):
++        cb.call(lambda: (_ for _ in ()).throw(ValueError()))
++    assert cb.state is CircuitState.CLOSED  # 2 of 3, not yet tripped
++
++    cb.call(lambda: "ok")  # success resets the counter
++
++    with pytest.raises(ValueError):
++        cb.call(lambda: (_ for _ in ()).throw(ValueError()))
++    with pytest.raises(ValueError):
++        cb.call(lambda: (_ for _ in ()).throw(ValueError()))
++    assert cb.state is CircuitState.CLOSED, "prior successes should have cleared the count"
++
++
++def test_half_open_after_real_timeout_elapses():
++    cb = CircuitBreaker("t5", failure_threshold=1, reset_timeout_s=1)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    assert cb.state is CircuitState.OPEN
++
++    # Still OPEN before the real timeout elapses.
++    time.sleep(0.3)
++    assert cb.state is CircuitState.OPEN
++
++    time.sleep(0.8)  # total >1.0s elapsed -- real wall-clock wait
++    assert cb.state is CircuitState.HALF_OPEN
++
++
++def test_half_open_probe_failure_reopens_and_restarts_timeout():
++    cb = CircuitBreaker("t6", failure_threshold=1, reset_timeout_s=1,
++                          half_open_success_threshold=2)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    time.sleep(1.1)
++    assert cb.state is CircuitState.HALF_OPEN
++
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))  # failed probe
++    assert cb.state is CircuitState.OPEN
++
++    # Immediately after re-opening, still OPEN (timeout restarted, not reused).
++    assert cb.state is CircuitState.OPEN
++    time.sleep(1.1)
++    assert cb.state is CircuitState.HALF_OPEN, "timeout should have restarted on re-open"
++
++
++def test_half_open_needs_n_consecutive_successes_to_close():
++    cb = CircuitBreaker("t7", failure_threshold=1, reset_timeout_s=1,
++                          half_open_success_threshold=2)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    time.sleep(1.1)
++    assert cb.state is CircuitState.HALF_OPEN
++
++    cb.call(lambda: "ok")  # 1st probe success
++    assert cb.state is CircuitState.HALF_OPEN, "should not close on a single probe success"
++
++    cb.call(lambda: "ok")  # 2nd probe success
++    assert cb.state is CircuitState.CLOSED
++
++
++def test_half_open_allows_only_one_probe_at_a_time_under_concurrency():
++    """Real threads, real concurrency -- not simulated. 20 threads all hit
++    a HALF_OPEN breaker at once; exactly one must be let through to call
++    the underlying function, the rest must be rejected as CircuitOpenError
++    without ever invoking it."""
++    cb = CircuitBreaker("t8", failure_threshold=1, reset_timeout_s=1)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    time.sleep(1.1)
++    assert cb.state is CircuitState.HALF_OPEN
++
++    probe_started = threading.Event()
++    release_probe = threading.Event()
++    call_count = {"n": 0}
++    lock = threading.Lock()
++
++    def slow_probe():
++        with lock:
++            call_count["n"] += 1
++        probe_started.set()
++        release_probe.wait(timeout=5)
++        return "ok"
++
++    results = {"through": 0, "rejected": 0}
++    results_lock = threading.Lock()
++
++    def worker():
++        try:
++            cb.call(slow_probe)
++            with results_lock:
++                results["through"] += 1
++        except CircuitOpenError:
++            with results_lock:
++                results["rejected"] += 1
++
++    threads = [threading.Thread(target=worker) for _ in range(20)]
++    for t in threads:
++        t.start()
++    assert probe_started.wait(timeout=5), "no probe call started"
++    time.sleep(0.2)  # let all other threads pile up on the lock
++    release_probe.set()
++    for t in threads:
++        t.join(timeout=5)
++
++    assert call_count["n"] == 1, f"expected exactly 1 underlying call, got {call_count['n']}"
++    assert results["through"] == 1
++    assert results["rejected"] == 19
++
++
++def test_independent_instances_do_not_share_state():
++    """THE core F-A regression test: two breakers for two different
++    resources must never influence each other. This is the property
++    the old shared-global breaker violated."""
++    resource_a = CircuitBreaker("resource-a", failure_threshold=1, reset_timeout_s=30)
++    resource_b = CircuitBreaker("resource-b", failure_threshold=1, reset_timeout_s=30)
++
++    with pytest.raises(RuntimeError):
++        resource_a.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    assert resource_a.state is CircuitState.OPEN
++
++    # resource_b must be completely unaffected.
++    assert resource_b.state is CircuitState.CLOSED
++    assert resource_b.call(lambda: "still fine") == "still fine"
++    assert resource_b.state is CircuitState.CLOSED
++
++
++def test_no_module_level_shared_breaker_exists():
++    """Structural check mirroring test_api_server_v2.py's own AST-walk
++    convention: this module must expose no pre-built CircuitBreaker
++    instance that two unrelated call sites could accidentally share."""
++    import circuit_breaker as mod
++    for attr_name in dir(mod):
++        if attr_name.startswith("_"):
++            continue
++        attr = getattr(mod, attr_name)
++        assert not isinstance(attr, CircuitBreaker), (
++            f"module-level CircuitBreaker instance found: {attr_name} -- "
++            "this is exactly the shared-global shape F-A was about"
++        )
++
++
++def test_snapshot_reflects_state_without_mutating_it():
++    cb = CircuitBreaker("t9", failure_threshold=1, reset_timeout_s=1)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    snap1 = cb.snapshot()
++    assert snap1["state"] == "open"
++    assert snap1["total_opens"] == 1
++    time.sleep(1.1)
++    snap2 = cb.snapshot()
++    assert snap2["state"] == "half_open"
++
++
++def test_constructor_rejects_invalid_config():
++    with pytest.raises(ValueError):
++        CircuitBreaker("bad", failure_threshold=0, reset_timeout_s=1)
++    with pytest.raises(ValueError):
++        CircuitBreaker("bad", failure_threshold=1, reset_timeout_s=0)
++    with pytest.raises(ValueError):
++        CircuitBreaker("bad", failure_threshold=1, reset_timeout_s=1,
++                        half_open_success_threshold=0)
++
++
++def test_is_failure_predicate_trips_breaker_on_return_value():
++    """The claude_governor use case: func never raises, but its return
++    value encodes failure. Without is_failure, this breaker would never
++    trip no matter how many bad results come back."""
++    cb = CircuitBreaker("t11", failure_threshold=2, reset_timeout_s=5)
++
++    def swallows_and_returns_failure():
++        return {"safe": False, "reasoning": "transport_error: connection refused"}
++
++    is_failure = lambda r: isinstance(r, dict) and str(r.get("reasoning", "")).startswith("transport_error:")
++
++    r1 = cb.call(swallows_and_returns_failure, is_failure=is_failure)
++    assert r1["safe"] is False
++    assert cb.state is CircuitState.CLOSED  # 1 of 2
++
++    r2 = cb.call(swallows_and_returns_failure, is_failure=is_failure)
++    assert r2["safe"] is False
++    assert cb.state is CircuitState.OPEN  # 2 of 2 -- tripped
++
++
++def test_is_failure_predicate_does_not_trip_on_non_matching_return():
++    """A live response that just happens to be a rejection (safe=False,
++    ordinary reasoning) must NOT count as an infra failure -- only the
++    transport_error-tagged shape should."""
++    cb = CircuitBreaker("t12", failure_threshold=1, reset_timeout_s=5)
++
++    def ordinary_rejection():
++        return {"safe": False, "reasoning": "risk too high, policy violation"}
++
++    is_failure = lambda r: isinstance(r, dict) and str(r.get("reasoning", "")).startswith("transport_error:")
++
++    for _ in range(10):
++        r = cb.call(ordinary_rejection, is_failure=is_failure)
++        assert r["safe"] is False
++    assert cb.state is CircuitState.CLOSED, "ordinary rejections must never trip the breaker"
++
++
++def test_is_failure_none_preserves_exception_only_behavior():
++    """Default (no is_failure) must behave exactly as before -- the
++    ledger-write use case, where the callable DOES raise on failure."""
++    cb = CircuitBreaker("t13", failure_threshold=1, reset_timeout_s=5)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    assert cb.state is CircuitState.OPEN
++
++
++def test_reset_forces_closed_for_test_ops_use():
++    cb = CircuitBreaker("t10", failure_threshold=1, reset_timeout_s=30)
++    with pytest.raises(RuntimeError):
++        cb.call(lambda: (_ for _ in ()).throw(RuntimeError()))
++    assert cb.state is CircuitState.OPEN
++    cb.reset()
++    assert cb.state is CircuitState.CLOSED
++    assert cb.call(lambda: "ok") == "ok"
+diff --git a/sentinel_os/test_production_harness_breakers.py b/sentinel_os/test_production_harness_breakers.py
+new file mode 100644
+index 0000000..aff3f0c
+--- /dev/null
++++ b/sentinel_os/test_production_harness_breakers.py
+@@ -0,0 +1,250 @@
++"""test_production_harness_breakers.py -- proves the two breakers wired
++into production_harness.py actually protect what they claim to, against
++REAL infrastructure:
++
++  * ledger_breaker: real Postgres, killed for real (pool closed / bad
++    port), producing real psycopg2 exceptions -- no mock.
++  * claude_breaker: a real anthropic client pointed at the real
++    api.anthropic.com with a deliberately invalid API key, producing a
++    real 401 over a real HTTPS connection -- no mock, no stub server.
++    We are not simulating "the API is down"; we are making a real call
++    that really fails, the same way an expired/revoked key would in
++    production.
++
++Also proves the F-A property directly: tripping one breaker via one
++resource's real failures leaves the other resource's breaker CLOSED and
++fully functional.
++"""
++from __future__ import annotations
++
++import os
++import time
++
++import psycopg2
++import pytest
++
++os.environ.setdefault("ICEBERG_LEDGER_RUNTIME_USER", "")
++
++from circuit_breaker import CircuitState
++from production_harness import IcebergProductionHarness
++
++PG_DSN = dict(host="localhost", port=5432, dbname="iceberg",
++              user="iceberg", password="iceberg")
++
++# A syntactically valid but definitely-invalid Anthropic API key. Real
++# network call, real auth rejection -- this is not a mock.
++BAD_CLAUDE_KEY = "sk-ant-api03-" + "x" * 95
++
++
++def _clear_ledger():
++    conn = psycopg2.connect(**PG_DSN)
++    conn.autocommit = True
++    cur = conn.cursor()
++    cur.execute("ALTER TABLE ledger_entries DISABLE TRIGGER USER;")
++    cur.execute("TRUNCATE ledger_entries RESTART IDENTITY;")
++    cur.execute("ALTER TABLE ledger_entries ENABLE TRIGGER USER;")
++    conn.close()
++
++
++def governed_record(sid, duration=320):
++    return {"sid": sid, "status": "completed", "from": "+15551234561",
++            "duration": duration, "start_time": 0}
++
++
++@pytest.fixture()
++def harness_with_bad_claude_key():
++    """Real ledger (working), real Claude client pointed at the real API
++    with a key that will really be rejected."""
++    h = IcebergProductionHarness({
++        "postgres_host": PG_DSN["host"], "postgres_port": PG_DSN["port"],
++        "postgres_db": PG_DSN["dbname"], "postgres_user": PG_DSN["user"],
++        "postgres_password": PG_DSN["password"], "cassette_domain": "ivr",
++        "claude_api_key": BAD_CLAUDE_KEY,
++    })
++    _clear_ledger()
++    yield h
++    h.shutdown()
++
++
++# ---------------------------------------------------------- claude path --
++def test_real_bad_api_key_produces_a_real_transport_failure(harness_with_bad_claude_key):
++    """Sanity check before trusting the breaker test below: confirm the
++    live API really does reject this key with the transport_error shape
++    the breaker's is_failure predicate keys on, over a real connection."""
++    h = harness_with_bad_claude_key
++    decision = h.claude_decider.safety_check("heal_queue", {"queue": "sales", "wait_time": 500, "friction_count": 5})
++    assert decision["safe"] is False
++    assert decision["reasoning"].startswith("transport_error:"), (
++        f"expected a real transport failure, got: {decision['reasoning']!r} "
++        "-- if this fires, the live API's error shape changed and the "
++        "breaker's is_failure predicate needs updating"
++    )
++
++
++def test_claude_breaker_trips_after_real_repeated_auth_failures(harness_with_bad_claude_key):
++    h = harness_with_bad_claude_key
++    assert h.claude_breaker.state is CircuitState.CLOSED
++
++    for i in range(5):  # failure_threshold=5
++        result = h.process_call(governed_record(f"CBK{i}"))
++        assert result.get("error") is None
++        assert result["governance_blocked"] is True
++
++    assert h.claude_breaker.state is CircuitState.OPEN, (
++        f"expected OPEN after 5 real auth failures, got "
++        f"{h.claude_breaker.state}; snapshot={h.claude_breaker.snapshot()}"
++    )
++
++    # While open, the wrapped call must not even reach the network --
++    # verified indirectly: the job still completes (fail-closed), and
++    # the ledger row still gets written (ledger_breaker independent).
++    result = h.process_call(governed_record("CBK-open"))
++    assert result["governance_blocked"] is True
++    assert h.ledger.sid_exists("CBK-open"), "ledger write must still succeed while claude breaker is open"
++
++
++def test_claude_breaker_open_does_not_affect_ledger_breaker(harness_with_bad_claude_key):
++    """THE F-A property, proven with real failures instead of synthetic
++    ones: driving the Claude breaker OPEN via real auth failures must
++    leave the ledger breaker completely unaffected."""
++    h = harness_with_bad_claude_key
++    for i in range(6):
++        h.process_call(governed_record(f"CBI{i}"))
++    assert h.claude_breaker.state is CircuitState.OPEN
++    assert h.ledger_breaker.state is CircuitState.CLOSED, (
++        "ledger breaker must be unaffected by claude breaker tripping"
++    )
++    # And the ledger itself is still fully functional.
++    assert h.ledger.sid_exists("CBI0")
++    assert h.ledger.sid_exists("CBI5")
++
++
++# ---------------------------------------------------------------- ledger path --
++# Failure injection note: an earlier version of this test killed the
++# WHOLE connection pool (pool.closeall()). That broke sid_exists()
++# too -- an existing, unprotected SELECT at the top of process_call
++# that isn't wrapped by ledger_breaker and has no try/except around it
++# at all. Under a full pool outage the harness raises there, before
++# ever reaching the breaker-wrapped write, which made pool.closeall()
++# the wrong tool for isolating "does the write breaker trip on write
++# failures." That gap (sid_exists has zero failure handling, so any
++# Postgres blip crashes process_call for EVERY call, governed or not,
++# regardless of these breakers) is real and worth fixing, but it's a
++# pre-existing defect outside this build's two named call sites --
++# flagged in the verification report, not silently absorbed into this
++# diff.
++#
++# Instead we inject a real, surgical failure: a genuine restricted
++# Postgres role (`ledger_write_test`, created for this suite) with
++# SELECT on ledger_entries but no INSERT. sid_exists() keeps working
++# for real; append_decision() fails for real with a real permission-
++# denied error from Postgres -- exactly the failure mode of a runtime
++# credential whose grants were narrowed or revoked. No mock involved.
++LEDGER_WRITE_TEST_USER = "ledger_write_test"
++LEDGER_WRITE_TEST_PASSWORD = "ledger_write_test"
++
++
++def _revoke_insert():
++    conn = psycopg2.connect(**PG_DSN)
++    conn.autocommit = True
++    cur = conn.cursor()
++    cur.execute(f"REVOKE INSERT ON ledger_entries FROM {LEDGER_WRITE_TEST_USER};")
++    conn.close()
++
++
++def _grant_insert():
++    conn = psycopg2.connect(**PG_DSN)
++    conn.autocommit = True
++    cur = conn.cursor()
++    cur.execute(f"GRANT INSERT ON ledger_entries TO {LEDGER_WRITE_TEST_USER};")
++    conn.close()
++
++
++@pytest.fixture()
++def harness_no_claude():
++    """No Claude client configured -- harness's own documented
++    fail-closed path (safe=False, 'No API client configured'), which is
++    NOT a transport_error and must never touch claude_breaker's count.
++    Ledger runtime user is the restricted role above so writes can be
++    surgically, realistically failed without breaking sid_exists()."""
++    os.environ["ICEBERG_LEDGER_RUNTIME_USER"] = LEDGER_WRITE_TEST_USER
++    os.environ["ICEBERG_LEDGER_RUNTIME_PASSWORD"] = LEDGER_WRITE_TEST_PASSWORD
++    _grant_insert()
++    h = IcebergProductionHarness({
++        "postgres_host": PG_DSN["host"], "postgres_port": PG_DSN["port"],
++        "postgres_db": PG_DSN["dbname"], "postgres_user": PG_DSN["user"],
++        "postgres_password": PG_DSN["password"], "cassette_domain": "ivr",
++    })
++    _clear_ledger()
++    yield h
++    h.shutdown()
++    _grant_insert()  # leave the role writable for the next test
++    os.environ.pop("ICEBERG_LEDGER_RUNTIME_USER", None)
++    os.environ.pop("ICEBERG_LEDGER_RUNTIME_PASSWORD", None)
++
++
++def test_ledger_breaker_trips_on_real_postgres_failure(harness_no_claude):
++    """Revoke real INSERT privilege (not a mock) so every subsequent
++    append_decision raises a real psycopg2 permission-denied error, and
++    confirm the breaker trips at its configured threshold (3) -- no
++    earlier, no later. sid_exists() keeps working throughout, proving
++    the failure is isolated to the write, same as it would be for a
++    real credential/grants problem in production."""
++    h = harness_no_claude
++    assert h.ledger_breaker.state is CircuitState.CLOSED
++    _revoke_insert()
++
++    for i in range(2):
++        result = h.process_call(governed_record(f"LBK{i}"))
++        assert result.get("ledger_write_failed") is True
++        assert h.ledger_breaker.state is CircuitState.CLOSED, f"tripped early at failure {i+1}"
++
++    result = h.process_call(governed_record("LBK2"))
++    assert result.get("ledger_write_failed") is True
++    assert h.ledger_breaker.state is CircuitState.OPEN, (
++        f"expected OPEN after 3 real Postgres failures, got "
++        f"{h.ledger_breaker.state}; snapshot={h.ledger_breaker.snapshot()}"
++    )
++
++
++def test_ledger_breaker_open_does_not_affect_claude_path(harness_no_claude):
++    """Real Postgres failures tripping the ledger breaker must not
++    touch the (unconfigured, fail-closed-by-design) claude path's own
++    breaker state."""
++    h = harness_no_claude
++    _revoke_insert()
++    for i in range(3):
++        h.process_call(governed_record(f"LBI{i}"))
++    assert h.ledger_breaker.state is CircuitState.OPEN
++    assert h.claude_breaker.state is CircuitState.CLOSED, (
++        "claude breaker must be unaffected by ledger breaker tripping"
++    )
++    assert h.claude_decider is None, "harness_no_claude fixture should have no claude_decider at all"
++
++
++def test_ledger_breaker_recovers_after_real_reconnect(harness_no_claude):
++    """OPEN -> real reset_timeout_s elapses -> HALF_OPEN -> a real
++    successful write once INSERT is genuinely re-granted closes it
++    again."""
++    h = harness_no_claude
++    _revoke_insert()
++    for i in range(3):
++        h.process_call(governed_record(f"LBR{i}"))
++    assert h.ledger_breaker.state is CircuitState.OPEN
++
++    _grant_insert()  # repair the real permission
++
++    time.sleep(15.1)  # real wall-clock wait for reset_timeout_s=15
++    assert h.ledger_breaker.state is CircuitState.HALF_OPEN
++
++    # 2 real successful writes needed to close (half_open_success_threshold=2)
++    r1 = h.process_call(governed_record("LBR-probe1"))
++    assert r1.get("ledger_write_failed") is not True
++    assert h.ledger_breaker.state is CircuitState.HALF_OPEN
++
++    r2 = h.process_call(governed_record("LBR-probe2"))
++    assert r2.get("ledger_write_failed") is not True
++    assert h.ledger_breaker.state is CircuitState.CLOSED
++
++    assert h.ledger.sid_exists("LBR-probe1")
++    assert h.ledger.sid_exists("LBR-probe2")
+diff --git a/sentinel_os/test_rate_limiter_v2.py b/sentinel_os/test_rate_limiter_v2.py
+new file mode 100644
+index 0000000..237bcae
+--- /dev/null
++++ b/sentinel_os/test_rate_limiter_v2.py
+@@ -0,0 +1,302 @@
++"""test_rate_limiter_v2.py -- live verification for rate_limiter_v2.py.
++
++Boots a REAL Redis and a REAL uvicorn api_server_v2 process (same
++pattern as test_api_server_v2.py's L-series), then drives REAL
++concurrent HTTP load at it with real TCP connections -- no mocking of
++the rate limiter, Redis, or the HTTP layer. Every "N over the limit get
++rejected" claim below is proven by actually sending N+1 concurrent
++requests and reading real response codes, per the build's own
++non-negotiables.
++
++Uses a deliberately small, fast configuration
++(RATE_LIMIT_REQUESTS_PER_MINUTE / RATE_LIMIT_BURST_CAPACITY /
++RATE_LIMIT_BUCKET_TTL_SECONDS) so the tests run in seconds instead of
++minutes -- the production defaults (100/min, burst 20) are exercised
++directly in test_rate_limiter_unit.py against the Lua script, not
++timed out here.
++
++Run:  python3 -m pytest test_rate_limiter_v2.py -v -s
++"""
++from __future__ import annotations
++
++import os
++import signal
++import socket
++import subprocess
++import sys
++import time
++import uuid
++from concurrent.futures import ThreadPoolExecutor
++from typing import Dict
++
++import httpx
++import pytest
++
++BUILD_DIR = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, BUILD_DIR)
++
++REDIS_PORT = 6391
++REDIS_URL = f"redis://localhost:{REDIS_PORT}/0"
++INGRESS_PORT = 8110
++BASE = f"http://127.0.0.1:{INGRESS_PORT}"
++API_KEY_A = "rl-test-key-aaa"
++API_KEY_B = "rl-test-key-bbb"
++NAMESPACE = f"rltest_{uuid.uuid4().hex[:8]}"
++
++
++def wait_for(fn, timeout=15.0, interval=0.1, desc="condition"):
++    deadline = time.monotonic() + timeout
++    last = None
++    while time.monotonic() < deadline:
++        try:
++            out = fn()
++            if out:
++                return out
++        except Exception as exc:  # noqa: BLE001
++            last = exc
++        time.sleep(interval)
++    raise TimeoutError(f"timed out waiting for {desc} (last error: {last})")
++
++
++def sid() -> str:
++    return f"RL{uuid.uuid4().hex}"
++
++
++@pytest.fixture(scope="session")
++def redis_proc():
++    proc = subprocess.Popen(
++        ["redis-server", "--port", str(REDIS_PORT), "--save", "", "--appendonly", "no"],
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++    )
++
++    def ping():
++        with socket.create_connection(("127.0.0.1", REDIS_PORT), timeout=0.5) as s:
++            s.sendall(b"PING\r\n")
++            return s.recv(16).startswith(b"+PONG")
++
++    wait_for(ping, desc="redis-server PONG")
++    yield proc
++    try:
++        os.kill(proc.pid, signal.SIGCONT)
++    except ProcessLookupError:
++        pass
++    proc.terminate()
++    proc.wait(timeout=5)
++
++
++def _spawn_ingress(port: int, extra_env: Dict[str, str]) -> subprocess.Popen:
++    env = os.environ.copy()
++    inner = os.path.join(BUILD_DIR, "sentinel_os")
++    pythonpath = BUILD_DIR if not os.path.isdir(inner) else f"{BUILD_DIR}:{inner}"
++    env.update({
++        "TRANSMISSION_REDIS_URL": REDIS_URL,
++        "TRANSMISSION_NAMESPACE": NAMESPACE,
++        "PYTHONPATH": pythonpath,
++        "PYTHONUNBUFFERED": "1",
++        "ICEBERG_API_KEYS": f"{API_KEY_A}:tester-a,{API_KEY_B}:tester-b",
++    })
++    env.update(extra_env)
++    logpath = os.path.join(BUILD_DIR, f"rl_ingress_{port}.log")
++    logf = open(logpath, "w")
++    proc = subprocess.Popen(
++        [sys.executable, "-m", "uvicorn", "api_server_v2:app",
++         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
++        cwd=BUILD_DIR, env=env, stdout=logf, stderr=subprocess.STDOUT, text=True,
++    )
++    try:
++        wait_for(lambda: httpx.get(f"http://127.0.0.1:{port}/health", timeout=1.0).status_code == 200,
++                 desc=f"ingress /health on :{port}")
++    except TimeoutError:
++        logf.flush()
++        tail = open(logpath).read()[-2000:]
++        raise RuntimeError(f"ingress on :{port} never came up. Log tail:\n{tail}")
++    return proc
++
++
++@pytest.fixture()
++def ingress(redis_proc):
++    """Small, fast bucket: capacity 5, 60 req/min (=1/sec refill), so a
++    burst of 6 concurrent requests is enough to prove the limit without
++    waiting minutes, and a 1s wait is enough to prove real refill.
++
++    RATE_LIMIT_NAMESPACE is unique per test invocation: Redis itself is
++    session-scoped (one real server for the whole file) but this
++    fixture is function-scoped (fresh ingress process per test), so
++    without a fresh namespace every test would share the SAME Redis
++    bucket keys as every other test that ran before it in this
++    session -- exactly the cross-test bleed a real isolation test must
++    not have.
++    """
++    rl_namespace = f"rl_{uuid.uuid4().hex[:10]}"
++    proc = _spawn_ingress(INGRESS_PORT, extra_env={
++        "RATE_LIMIT_REQUESTS_PER_MINUTE": "60",
++        "RATE_LIMIT_BURST_CAPACITY": "5",
++        "RATE_LIMIT_BUCKET_TTL_SECONDS": "60",
++        "RATE_LIMIT_NAMESPACE": rl_namespace,
++    })
++    yield proc
++    proc.terminate()
++    proc.wait(timeout=5)
++
++
++def submit(key: str, timeout=10.0) -> httpx.Response:
++    with httpx.Client(timeout=timeout) as c:
++        return c.post(f"{BASE}/submit-call", json={"sid": sid()},
++                      headers={"x-api-key": key})
++
++
++# --------------------------------------------------------------- burst --
++def test_burst_within_capacity_all_succeed(ingress):
++    """5 requests, capacity 5 -- all must succeed (202), none 429."""
++    with ThreadPoolExecutor(max_workers=5) as ex:
++        results = list(ex.map(lambda _: submit(API_KEY_A), range(5)))
++    codes = [r.status_code for r in results]
++    assert codes.count(202) == 5, f"expected 5x202, got {codes}"
++
++
++def test_real_concurrent_burst_over_capacity_gets_429s(ingress):
++    """THE core claim, proven live: 15 real concurrent requests against
++    a capacity-5 bucket. Exactly 5 must succeed (202), the rest must be
++    429 with a Retry-After header -- not simulated, not counted after
++    the fact from logs, read directly off real HTTP responses."""
++    with ThreadPoolExecutor(max_workers=15) as ex:
++        results = list(ex.map(lambda _: submit(API_KEY_B), range(15)))
++    codes = [r.status_code for r in results]
++    n_ok = codes.count(202)
++    n_limited = codes.count(429)
++    assert n_ok + n_limited == 15, f"unexpected status codes present: {codes}"
++    assert n_ok == 5, f"expected exactly 5 successes (capacity), got {n_ok}: {codes}"
++    assert n_limited == 10, f"expected exactly 10 rejections, got {n_limited}: {codes}"
++
++    limited = [r for r in results if r.status_code == 429]
++    for r in limited:
++        assert "retry-after" in {k.lower() for k in r.headers.keys()}
++        body = r.json()
++        assert body["detail"]["error"] == "rate_limit_exceeded"
++
++
++# ---------------------------------------------------------- isolation --
++def test_two_principals_have_independent_buckets(ingress):
++    """F-F's core property, proven live: exhausting API_KEY_A's bucket
++    to zero must not affect API_KEY_B's bucket -- a fresh capacity-5
++    burst for B must still succeed in full immediately afterward, on
++    the SAME ingress process (same Redis, same namespace, different
++    principal)."""
++    with ThreadPoolExecutor(max_workers=8) as ex:
++        results_a = list(ex.map(lambda _: submit(API_KEY_A), range(8)))
++    a_ok = sum(1 for r in results_a if r.status_code == 202)
++    a_limited = sum(1 for r in results_a if r.status_code == 429)
++    assert a_ok == 5 and a_limited == 3, f"sanity: A's bucket should be capacity-bound, got ok={a_ok} limited={a_limited}"
++
++    with ThreadPoolExecutor(max_workers=5) as ex:
++        results_b = list(ex.map(lambda _: submit(API_KEY_B), range(5)))
++    b_ok = sum(1 for r in results_b if r.status_code == 202)
++    assert b_ok == 5, (
++        f"B's bucket must be completely unaffected by A's exhaustion, "
++        f"expected 5/5 success, got {b_ok}/5: {[r.status_code for r in results_b]}"
++    )
++
++
++def test_unauthenticated_requests_never_reach_the_bucket(ingress):
++    """No X-API-Key -> 401 from require_api_key, which runs BEFORE
++    rate_limit_v2 in the guard chain. Proves an attacker can't burn
++    through or discover bucket state without a valid key first."""
++    with httpx.Client(timeout=10.0) as c:
++        r = c.post(f"{BASE}/submit-call", json={"sid": sid()})
++    assert r.status_code == 401
++
++
++def test_health_never_rate_limited(ingress):
++    """`/health` takes no guards at all -- must stay open even after
++    a caller's bucket is fully exhausted."""
++    with ThreadPoolExecutor(max_workers=10) as ex:
++        list(ex.map(lambda _: submit(API_KEY_A), range(10)))
++    for _ in range(5):
++        r = httpx.get(f"{BASE}/health", timeout=5)
++        assert r.status_code == 200
++
++
++# ----------------------------------------------------------- recovery --
++def test_bucket_refills_after_real_wait(ingress):
++    """Exhaust the bucket completely, wait for real wall-clock time to
++    pass, and confirm refill actually happened -- not simulated."""
++    with ThreadPoolExecutor(max_workers=6) as ex:
++        results = list(ex.map(lambda _: submit(API_KEY_A), range(6)))
++    assert sum(1 for r in results if r.status_code == 202) == 5
++    assert sum(1 for r in results if r.status_code == 429) == 1
++
++    # Immediately after exhaustion, the next request must still be limited.
++    r_immediate = submit(API_KEY_A)
++    assert r_immediate.status_code == 429
++
++    # Real wall-clock wait for ~2 tokens to refill at 1/sec.
++    time.sleep(2.2)
++    r = submit(API_KEY_A)
++    assert r.status_code == 202, f"expected refilled capacity to allow a request, got {r.status_code}: {r.text}"
++
++
++# --------------------------------------------------------- fail-open --
++RL_ONLY_REDIS_PORT = 6392
++
++
++@pytest.fixture()
++def rl_only_redis_proc():
++    """A SEPARATE Redis instance dedicated to the rate limiter only, so
++    freezing it exercises rate_limit_v2's fail-open path in isolation
++    from the transmission queue's own (already correct, and different
++    by design) fail-CLOSED 503 behavior when ITS Redis is unreachable.
++    Sharing one Redis for both in production is a legitimate choice,
++    but it makes the two failure domains untestable independently."""
++    proc = subprocess.Popen(
++        ["redis-server", "--port", str(RL_ONLY_REDIS_PORT), "--save", "", "--appendonly", "no"],
++        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++    )
++
++    def ping():
++        with socket.create_connection(("127.0.0.1", RL_ONLY_REDIS_PORT), timeout=0.5) as s:
++            s.sendall(b"PING\r\n")
++            return s.recv(16).startswith(b"+PONG")
++
++    wait_for(ping, desc="rl-only redis-server PONG")
++    yield proc
++    try:
++        os.kill(proc.pid, signal.SIGCONT)
++    except ProcessLookupError:
++        pass
++    proc.terminate()
++    proc.wait(timeout=5)
++
++
++@pytest.fixture()
++def ingress_separate_rl_redis(redis_proc, rl_only_redis_proc):
++    rl_namespace = f"rl_{uuid.uuid4().hex[:10]}"
++    proc = _spawn_ingress(INGRESS_PORT, extra_env={
++        "RATE_LIMIT_REQUESTS_PER_MINUTE": "60",
++        "RATE_LIMIT_BURST_CAPACITY": "5",
++        "RATE_LIMIT_BUCKET_TTL_SECONDS": "60",
++        "RATE_LIMIT_NAMESPACE": rl_namespace,
++        "RATE_LIMIT_REDIS_URL": f"redis://localhost:{RL_ONLY_REDIS_PORT}/0",
++    })
++    yield proc
++    proc.terminate()
++    proc.wait(timeout=5)
++
++
++def test_fails_open_when_redis_is_unreachable(ingress_separate_rl_redis, rl_only_redis_proc):
++    """Freeze ONLY the rate limiter's dedicated Redis (SIGSTOP, same
++    chaos technique test_api_server_v2.py uses for L11) and confirm
++    submissions still succeed -- fail-open is a deliberate design
++    choice (see rate_limit_v2's docstring), not an accident. The
++    transmission queue's own Redis is untouched, so a 503 here would
++    mean the RATE LIMITER failed closed, not an unrelated queue outage.
++    Un-freezes Redis in a finally so the fixture can tear down cleanly.
++    """
++    os.kill(rl_only_redis_proc.pid, signal.SIGSTOP)
++    try:
++        r = submit(API_KEY_A, timeout=6.0)
++        assert r.status_code == 202, (
++            f"expected fail-open (202) with the rate limiter's Redis frozen, "
++            f"got {r.status_code}: {r.text}"
++        )
++    finally:
++        os.kill(rl_only_redis_proc.pid, signal.SIGCONT)
+-- 
+2.43.0
+

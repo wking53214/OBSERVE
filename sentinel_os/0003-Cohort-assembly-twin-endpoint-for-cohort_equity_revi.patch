@@ -1,0 +1,389 @@
+From 92145f5d13b5f925c8c03e34b3c76e6ec44f4459 Mon Sep 17 00:00:00 2001
+From: "Claude (sandbox)" <claude@sandbox.local>
+Date: Wed, 29 Jul 2026 13:37:56 +0000
+Subject: [PATCH 3/3] Cohort assembly: twin endpoint for cohort_equity_review
+
+New table cohort_review_ledger -- own vocabulary, own hash chain,
+parallel to obligation_ledger. The twin never computes a cohort review
+(see obligation_sweep's module docstring); it only receives what
+obligation_sweep.py computed on the primary and chain-links it, same
+independent-witness posture as every other record kind here.
+
+POST /replica/{id}/cohort-reviews -- append one review, 422 on missing
+required fields, 404 on an unregistered replica. Advisory-locked
+append matching _append_obligation's pattern.
+
+GET /replica/{id}/cohort-reviews -- full history, optionally filtered
+by domain and/or obligation_kind, oldest first. An auditor asking
+whether a cohort has ever flagged wants the whole history, not just
+the latest sweep.
+
+obligation_sweep.record_reviews() posts computed reviews through,
+deliberately kept separate from sweep() itself -- computing and
+recording are different steps with different failure modes, and a
+caller may want to inspect reviews before deciding to record them.
+
+Caught and fixed during this piece: an earlier edit in this branch had
+silently dropped the _latest_states function signature line while
+inserting _append_cohort_review next to it -- the obligations listing
+endpoint was broken (NameError) until the full suite surfaced it.
+Fixed; full suite re-run twice clean after.
+
+10 new tests. Full suite 584 passed / 6 skipped, run twice back-to-back
+from a clean ledger. ruff and bandit clean.
+---
+ sentinel_os/Tests/test_twin_cohort_reviews.py | 162 ++++++++++++++++++
+ sentinel_os/obligation_sweep.py               |  20 +++
+ sentinel_os/twin_receiver.py                  | 125 ++++++++++++++
+ 3 files changed, 307 insertions(+)
+ create mode 100644 sentinel_os/Tests/test_twin_cohort_reviews.py
+
+diff --git a/sentinel_os/Tests/test_twin_cohort_reviews.py b/sentinel_os/Tests/test_twin_cohort_reviews.py
+new file mode 100644
+index 0000000..fbb735f
+--- /dev/null
++++ b/sentinel_os/Tests/test_twin_cohort_reviews.py
+@@ -0,0 +1,162 @@
++"""cohort_review_ledger: the twin's tamper-evident store for
++obligation_sweep.py's output. The twin never computes a
++cohort_equity_review -- see obligation_sweep's module docstring -- it
++only receives and chain-links what the primary already computed, same
++posture as every other record kind here.
++"""
++
++import uuid
++
++import psycopg2
++import pytest
++from fastapi.testclient import TestClient
++
++DSN = "host=localhost dbname=iceberg user=iceberg password=iceberg"
++
++
++def _pg_available() -> bool:
++    try:
++        psycopg2.connect(DSN + " connect_timeout=2").close()
++        return True
++    except Exception:
++        return False
++
++
++pytestmark = pytest.mark.skipif(
++    not _pg_available(),
++    reason="cohort review store needs PostgreSQL (iceberg/iceberg@localhost)")
++
++
++@pytest.fixture
++def twin():
++    from twin_receiver import build_app
++
++    client = TestClient(build_app(DSN, site="test"))
++    rid = f"review-{uuid.uuid4().hex[:10]}"
++    resp = client.post(f"/replica/{rid}/register", json={
++        "custody_model": "A", "recipient_pub": "x", "recipient_fp": "fp",
++        "customer_sign_pub": "y", "ship_token": "tok"})
++    assert resp.status_code == 200, resp.text
++    client.replica_id = rid
++    return client
++
++
++def _review(domain="lending", obligation_kind="loan_performance",
++           dimension_4_findings=None, swept_at=1_700_000_000.0):
++    return {
++        "domain": domain, "obligation_kind": obligation_kind,
++        "total_resolved": 1, "dimension_4_cohort_size": 1,
++        "dimension_5_cohort_size": 0,
++        "dimension_4_findings": dimension_4_findings or [
++            {"check": "statistical_outcome_equity", "subject_id": "cohort:1",
++             "regulation": "reg_b", "action": "flag",
++             "classification": "indeterminate_insufficient_cohort",
++             "score": 0.0, "evidence": {}}],
++        "dimension_5_findings": [],
++        "skipped": [], "swept_at": swept_at,
++    }
++
++
++def test_a_review_is_stored_and_returns_seq_one(twin):
++    resp = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["seq"] == 1
++    assert resp.json()["curr_hash"]
++
++
++def test_a_missing_required_field_is_rejected(twin):
++    body = _review()
++    del body["dimension_4_findings"]
++    resp = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=body)
++    assert resp.status_code == 422
++    assert "dimension_4_findings" in resp.json()["detail"]
++
++
++def test_storing_against_an_unregistered_replica_is_refused(twin):
++    resp = twin.post("/replica/never-registered/cohort-reviews", json=_review())
++    assert resp.status_code == 404
++
++
++def test_reviews_chain_by_sequence(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="lending"))
++    second = twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++                       json=_review(domain="insurance"))
++    assert second.json()["seq"] == 2
++    with psycopg2.connect(DSN) as conn:
++        with conn.cursor() as cur:
++            cur.execute("""SELECT seq, prev_hash, curr_hash FROM cohort_review_ledger
++                           WHERE replica_id=%s ORDER BY seq ASC""", (twin.replica_id,))
++            rows = cur.fetchall()
++    assert rows[0][1] == "genesis"
++    assert rows[1][1] == rows[0][2]  # second row's prev_hash == first row's curr_hash
++
++
++def test_two_reviews_that_differ_only_in_findings_hash_differently(twin):
++    resp_a = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(
++        dimension_4_findings=[{"check": "x", "subject_id": "s", "regulation": "r",
++                               "action": "flag", "classification": "pass",
++                               "score": 0.0, "evidence": {}}]))
++    resp_b = twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(
++        dimension_4_findings=[{"check": "x", "subject_id": "s", "regulation": "r",
++                               "action": "flag", "classification": "flag",
++                               "score": 1.0, "evidence": {}}]))
++    assert resp_a.json()["curr_hash"] != resp_b.json()["curr_hash"]
++
++
++def test_reviews_are_never_updated_in_place(twin):
++    """Append-only: a re-sweep of the same cohort is a new row, not an
++    overwrite of the last one, so the history of what a cohort looked
++    like at each sweep survives."""
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews").json()["reviews"]
++    assert len(listed) == 2
++    assert listed[0]["seq"] == 1
++    assert listed[1]["seq"] == 2
++
++
++def test_listing_filters_by_domain(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="lending"))
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review(domain="insurance"))
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews",
++                      params={"domain": "lending"}).json()["reviews"]
++    assert len(listed) == 1
++    assert listed[0]["domain"] == "lending"
++
++
++def test_listing_filters_by_obligation_kind(twin):
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++             json=_review(obligation_kind="loan_performance"))
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews",
++             json=_review(obligation_kind="coverage_performance"))
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews",
++                      params={"obligation_kind": "coverage_performance"}).json()["reviews"]
++    assert len(listed) == 1
++    assert listed[0]["obligation_kind"] == "coverage_performance"
++
++
++def test_the_cohort_review_table_is_not_obligation_ledger(twin):
++    """A cohort review is not an obligation and doesn't share its
++    state machine -- posting a review must not touch obligation_ledger
++    at all."""
++    twin.post(f"/replica/{twin.replica_id}/cohort-reviews", json=_review())
++    obligations = twin.get(f"/replica/{twin.replica_id}/obligations").json()["obligations"]
++    assert obligations == []
++
++
++def test_record_reviews_wires_obligation_sweep_output_into_the_twin(twin):
++    """obligation_sweep.record_reviews posts a CohortEquityReview
++    straight through -- the shape review.as_dict() produces must match
++    what this endpoint actually requires."""
++    from obligation_sweep import CohortEquityReview, record_reviews
++
++    review = CohortEquityReview(
++        domain="lending", obligation_kind="loan_performance", total_resolved=5,
++        dimension_4_cohort_size=5, dimension_5_cohort_size=3,
++        dimension_4_findings=[], dimension_5_findings=[], skipped=[])
++    results = record_reviews(twin, twin.replica_id, [review], swept_at=1_700_000_000.0)
++    assert len(results) == 1
++    assert results[0]["seq"] == 1
++    listed = twin.get(f"/replica/{twin.replica_id}/cohort-reviews").json()["reviews"]
++    assert listed[0]["total_resolved"] == 5
++    assert listed[0]["dimension_5_cohort_size"] == 3
+diff --git a/sentinel_os/obligation_sweep.py b/sentinel_os/obligation_sweep.py
+index 997e387..2836916 100644
+--- a/sentinel_os/obligation_sweep.py
++++ b/sentinel_os/obligation_sweep.py
+@@ -352,3 +352,23 @@ def sweep(twin_client, replica_id: str, ledger_conn, sealed_channel,
+                                     group_distributions, decision_materials)
+         reviews.append(review_cohort(assembled, profile))
+     return reviews
++
++
++def record_reviews(twin_client, replica_id: str,
++                   reviews: List[CohortEquityReview], swept_at: float,
++                   ) -> List[Dict[str, Any]]:
++    """POST each computed review to the twin's cohort-reviews endpoint
++    for tamper-evident storage. Deliberately separate from sweep()
++    itself: computing a review and recording it are two different
++    steps with two different failure modes (a network error recording
++    review 3 of 5 should not mean reviews 1-2 were never computed), and
++    a caller may want to inspect reviews before deciding to record them
++    at all -- e.g. a dry run."""
++    results = []
++    for review in reviews:
++        body = review.as_dict()
++        body["swept_at"] = swept_at
++        resp = twin_client.post(f"/replica/{replica_id}/cohort-reviews", json=body)
++        resp.raise_for_status()
++        results.append(resp.json())
++    return results
+diff --git a/sentinel_os/twin_receiver.py b/sentinel_os/twin_receiver.py
+index 5e82a79..461fcad 100644
+--- a/sentinel_os/twin_receiver.py
++++ b/sentinel_os/twin_receiver.py
+@@ -120,6 +120,33 @@ ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_provenance TEX
+ ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS resolution_method TEXT;
+ ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS favorable BOOLEAN;
+ ALTER TABLE obligation_ledger ADD COLUMN IF NOT EXISTS domain TEXT NOT NULL DEFAULT 'unknown';
++-- cohort_equity_review: the record kind obligation_sweep.py's output
++-- lands as. The twin never computes this itself (see obligation_sweep's
++-- module docstring) -- it only receives and chain-stores what the
++-- primary already computed, same posture as every other record kind
++-- here. Own table, own vocabulary: not a reuse of obligation_ledger's
++-- OPEN/RESOLVED/ABANDONED state machine, because a cohort review isn't
++-- an obligation and doesn't have one.
++CREATE TABLE IF NOT EXISTS cohort_review_ledger (
++    id            BIGSERIAL PRIMARY KEY,
++    replica_id    TEXT NOT NULL REFERENCES replica_meta(replica_id),
++    seq           INTEGER NOT NULL,
++    domain        TEXT NOT NULL,
++    obligation_kind TEXT NOT NULL,
++    total_resolved INTEGER NOT NULL,
++    dimension_4_cohort_size INTEGER NOT NULL,
++    dimension_5_cohort_size INTEGER NOT NULL,
++    dimension_4_findings JSONB NOT NULL,
++    dimension_5_findings JSONB NOT NULL,
++    skipped       JSONB NOT NULL,
++    swept_at      DOUBLE PRECISION NOT NULL,
++    prev_hash     TEXT NOT NULL,
++    curr_hash     TEXT NOT NULL,
++    at            TIMESTAMPTZ NOT NULL DEFAULT now(),
++    UNIQUE (replica_id, seq)
++);
++CREATE INDEX IF NOT EXISTS idx_cohort_review_ledger_key
++    ON cohort_review_ledger (replica_id, domain, obligation_kind, seq DESC);
+ CREATE TABLE IF NOT EXISTS custody_log (
+     id          BIGSERIAL PRIMARY KEY,
+     replica_id  TEXT NOT NULL REFERENCES replica_meta(replica_id),
+@@ -444,6 +471,56 @@ def build_app(dsn: str, site: str) -> FastAPI:
+                  prev_hash, curr_hash, signature, signer_pub))
+         return seq, curr_hash
+ 
++    def _append_cohort_review(conn, replica_id: str, review: Dict[str, Any]):
++        """Append one cohort_equity_review record to its own hash chain.
++
++        The twin does not compute this -- it stores what
++        obligation_sweep.py already computed on the primary and chain-
++        links it, so a later re-sweep of the same cohort (or a
++        disagreement with a future re-audit) is a detectable NEW row,
++        never a silent overwrite. Same append-only, advisory-locked
++        posture as _append_obligation.
++        """
++        with conn.cursor() as cur:
++            cur.execute(
++                "SELECT pg_advisory_xact_lock(hashtext('cohort_review_ledger_' || %s))",
++                (replica_id,))
++            cur.execute("""SELECT seq, curr_hash FROM cohort_review_ledger
++                           WHERE replica_id=%s ORDER BY seq DESC LIMIT 1""",
++                       (replica_id,))
++            row = cur.fetchone()
++            seq = (row[0] + 1) if row else 1
++            prev_hash = row[1] if row else "genesis"
++            payload = {
++                "replica_id": replica_id, "seq": seq,
++                "domain": review["domain"],
++                "obligation_kind": review["obligation_kind"],
++                "total_resolved": review["total_resolved"],
++                "dimension_4_cohort_size": review["dimension_4_cohort_size"],
++                "dimension_5_cohort_size": review["dimension_5_cohort_size"],
++                "dimension_4_findings": review["dimension_4_findings"],
++                "dimension_5_findings": review["dimension_5_findings"],
++                "skipped": review["skipped"],
++                "swept_at": review["swept_at"],
++                "prev_hash": prev_hash,
++            }
++            curr_hash = hashlib.sha256(canonical_json(payload)).hexdigest()
++            cur.execute(
++                """INSERT INTO cohort_review_ledger
++                     (replica_id, seq, domain, obligation_kind, total_resolved,
++                      dimension_4_cohort_size, dimension_5_cohort_size,
++                      dimension_4_findings, dimension_5_findings, skipped,
++                      swept_at, prev_hash, curr_hash)
++                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
++                (replica_id, seq, review["domain"], review["obligation_kind"],
++                 review["total_resolved"], review["dimension_4_cohort_size"],
++                 review["dimension_5_cohort_size"],
++                 json.dumps(review["dimension_4_findings"]),
++                 json.dumps(review["dimension_5_findings"]),
++                 json.dumps(review["skipped"]), review["swept_at"],
++                 prev_hash, curr_hash))
++        return seq, curr_hash
++
+     def _latest_states(conn, replica_id: str) -> Dict[str, Dict[str, Any]]:
+         """Current state per obligation: the highest-seq row for each id.
+         The chain keeps every transition; this is the read view over it."""
+@@ -610,6 +687,54 @@ def build_app(dsn: str, site: str) -> FastAPI:
+         return {"replica_id": replica_id, "as_of": clock,
+                 "summary": summary, "obligations": obligations}
+ 
++    @app.post("/replica/{replica_id}/cohort-reviews")
++    def store_cohort_review(replica_id: str, body: Dict[str, Any]):
++        """Append one cohort_equity_review record -- the output of one
++        run of obligation_sweep.py over one (domain, obligation_kind)
++        cohort. The twin does not recompute the findings; it stores
++        what the primary already computed and chain-links it, same
++        posture as every other record kind here (independent witness,
++        not independent judge)."""
++        required = ("domain", "obligation_kind", "total_resolved",
++                   "dimension_4_cohort_size", "dimension_5_cohort_size",
++                   "dimension_4_findings", "dimension_5_findings",
++                   "skipped", "swept_at")
++        missing = [k for k in required if k not in body]
++        if missing:
++            raise HTTPException(status_code=422,
++                               detail=f"missing fields: {missing}")
++        with db() as conn:
++            _meta(conn, replica_id)
++            seq, curr_hash = _append_cohort_review(conn, replica_id, body)
++        return {"seq": seq, "curr_hash": curr_hash}
++
++    @app.get("/replica/{replica_id}/cohort-reviews")
++    def list_cohort_reviews(replica_id: str, domain: Optional[str] = None,
++                            obligation_kind: Optional[str] = None):
++        """Every recorded review, oldest first, optionally filtered to
++        one cohort's history over time -- an auditor asking 'has
++        lending's loan_performance cohort ever flagged' wants the whole
++        history for that bucket, not just its latest sweep."""
++        with db() as conn:
++            _meta(conn, replica_id)
++            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
++                query = """SELECT seq, domain, obligation_kind, total_resolved,
++                                  dimension_4_cohort_size, dimension_5_cohort_size,
++                                  dimension_4_findings, dimension_5_findings,
++                                  skipped, swept_at, prev_hash, curr_hash
++                           FROM cohort_review_ledger WHERE replica_id=%s"""
++                params = [replica_id]
++                if domain is not None:
++                    query += " AND domain=%s"
++                    params.append(domain)
++                if obligation_kind is not None:
++                    query += " AND obligation_kind=%s"
++                    params.append(obligation_kind)
++                query += " ORDER BY seq ASC"
++                cur.execute(query, params)
++                reviews = [dict(row) for row in cur.fetchall()]
++        return {"replica_id": replica_id, "reviews": reviews}
++
+     @app.exception_handler(Exception)
+     def unhandled(_req: Request, exc: Exception):
+         return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+-- 
+2.43.0
+

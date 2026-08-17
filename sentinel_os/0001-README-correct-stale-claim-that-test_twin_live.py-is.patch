@@ -1,0 +1,37 @@
+From d9ac3c71ab89b8e22aeb88f0ef72da382a5720f6 Mon Sep 17 00:00:00 2001
+From: William King <wm@sentinel-os.local>
+Date: Sat, 1 Aug 2026 10:11:38 +0000
+Subject: [PATCH] README: correct stale claim that test_twin_live.py is still
+ excluded from CI
+
+It isn't -- commit d881bc0 (2026-07-23) already closed this gap by
+switching the CI job to a natively-installed Postgres and running
+scripts/twin_ensure_services.sh to provision the same OS identities
+test_twin_live.py needs, before this README paragraph was last
+touched (198cf46, 2026-07-24). The paragraph never got updated to
+match, so it's been claiming a gap that was already closed.
+
+Also documents, for anyone running the suite outside CI, that
+twin_ensure_services.sh creates three real OS user accounts on
+whatever box it runs on -- worth knowing before running it on a
+personal dev machine.
+---
+ sentinel_os/README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sentinel_os/README.md b/sentinel_os/README.md
+index 3f82afc..1107fd0 100644
+--- a/sentinel_os/README.md
++++ b/sentinel_os/README.md
+@@ -168,7 +168,7 @@ python3 sentinel_os/iceberg_complete_simulator.py
+ 
+ **Still open** (see `governance/README.md` and `docs/CHANGELOG.md` for detail):
+ - Bias testing and adverse-action specificity for governance decisions
+-- `test_twin_live.py` needs a native (non-Docker) Postgres install sharing a Unix socket with the test process, for real OS-identity peer-auth boundaries (`sentinelsvc`/`twincustomer`/`twincustodian` -- provisioned by `scripts/twin_ensure_services.sh`, now committed). Passes 383/383 alongside the rest of the suite locally or in any environment with a native Postgres, verified twice back-to-back from a clean state. Still excluded from the GitHub Actions workflow specifically, because its `services: postgres:` block is a separate Docker container reachable only over TCP -- there's no Unix socket to share, so peer auth structurally can't work there. Closing that gap means giving this CI job a natively-installed Postgres instead of the services: container, a separable follow-up.
++- `test_twin_live.py` needs a native (non-Docker) Postgres install sharing a Unix socket with the test process, for real OS-identity peer-auth boundaries (`sentinelsvc`/`twincustomer`/`twincustodian` -- provisioned by `scripts/twin_ensure_services.sh`, now committed). Passes 383/383 alongside the rest of the suite locally or in any environment with a native Postgres, verified twice back-to-back from a clean state. **No longer excluded from the GitHub Actions workflow** (closed by commit `d881bc0`): the CI job now installs Postgres natively instead of using a `services: postgres:` Docker container, runs `scripts/twin_ensure_services.sh` to provision the same three OS identities, and the full suite -- `test_twin_live.py` included -- runs with no exclusions. Running it outside CI (locally or in a dev container) means running `scripts/twin_ensure_services.sh` as root first; it creates three real OS user accounts on the box it runs on, so treat that as a deliberate one-time setup step, not something to run casually on a machine you don't want new system users on.
+ 
+ **Status:** Core governance logic, test coverage, and both primary deployment paths (Docker Compose, standalone simulator) are live-verified. Production deployment against real call systems has not been attempted.
+ 
+-- 
+2.43.0
+

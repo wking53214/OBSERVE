@@ -1,0 +1,194 @@
+From ebe31943f21f72e8337fcc78b0c09fb73144159a Mon Sep 17 00:00:00 2001
+From: wking53214 <wking53214@gmail.com>
+Date: Thu, 30 Jul 2026 13:10:43 +0000
+Subject: [PATCH] Resolve remaining duplicate/colliding class names outside
+ intelligence/
+
+The consolidation report only ever scanned inside intelligence/, so it
+missed four collisions elsewhere in the codebase:
+
+- ConversationArtifact (conversations/parser.py vs conversations/importer.py):
+  different shapes (source_path/title/content_length vs messages/keywords).
+  Unrelated concepts sharing a name -> renamed the importer.py one to
+  ParsedConversation.
+
+- Artifact (models.py vs registry/artifact_registry.py): models.py's version
+  isn't used anywhere outside its own test; registry's version is the one
+  actually used in production (repository/mapper.py). Renamed the unused
+  one to ArtifactRecord.
+
+- ArchiveArtifact (reconstruction/archive_engine.py vs archive/connector.py):
+  same concept (a file found while scanning a directory), same core fields,
+  only a third bonus field differed (size vs name). True duplicate -> merged
+  into a new archive/models.py as the single source of truth; both callers
+  now import from there.
+
+- ImportedArtifact (importer/models.py vs archive/importer.py): similar
+  field names but incompatible artifact_type vocabularies (format labels
+  vs content categories) and separate id schemes. Unrelated concepts
+  sharing a name -> renamed the archive/importer.py one to
+  ArchiveImportRecord; left importer/models.py's version (used by the
+  production ingestion pipeline) untouched.
+
+245 tests passing before and after.
+---
+ src/innovation_os/archive/connector.py        |  9 +-------
+ src/innovation_os/archive/importer.py         |  6 +++---
+ src/innovation_os/archive/models.py           | 21 +++++++++++++++++++
+ src/innovation_os/conversations/importer.py   |  4 ++--
+ src/innovation_os/models.py                   |  2 +-
+ .../reconstruction/archive_engine.py          | 10 +--------
+ tests/test_models.py                          |  2 +-
+ 7 files changed, 30 insertions(+), 24 deletions(-)
+ create mode 100644 src/innovation_os/archive/models.py
+
+diff --git a/src/innovation_os/archive/connector.py b/src/innovation_os/archive/connector.py
+index c3b9d1c..dac83ac 100644
+--- a/src/innovation_os/archive/connector.py
++++ b/src/innovation_os/archive/connector.py
+@@ -1,14 +1,7 @@
+-from dataclasses import dataclass
+ from pathlib import Path
+ from typing import List
+ 
+-
+-@dataclass
+-class ArchiveArtifact:
+-
+-    path: str
+-    artifact_type: str
+-    name: str
++from src.innovation_os.archive.models import ArchiveArtifact
+ 
+ 
+ class ArchiveConnector:
+diff --git a/src/innovation_os/archive/importer.py b/src/innovation_os/archive/importer.py
+index ca97811..3814a2a 100644
+--- a/src/innovation_os/archive/importer.py
++++ b/src/innovation_os/archive/importer.py
+@@ -5,7 +5,7 @@ import hashlib
+ 
+ 
+ @dataclass
+-class ImportedArtifact:
++class ArchiveImportRecord:
+ 
+     artifact_id: str
+     source_path: str
+@@ -25,7 +25,7 @@ class ArchiveImporter:
+     def import_directory(
+         self,
+         directory: str,
+-    ) -> List[ImportedArtifact]:
++    ) -> List[ArchiveImportRecord]:
+ 
+         results = []
+ 
+@@ -36,7 +36,7 @@ class ArchiveImporter:
+ 
+             if file.is_file():
+ 
+-                artifact = ImportedArtifact(
++                artifact = ArchiveImportRecord(
+                     self._create_id(file),
+                     str(file),
+                     self._classify(file),
+diff --git a/src/innovation_os/archive/models.py b/src/innovation_os/archive/models.py
+new file mode 100644
+index 0000000..f4b03d7
+--- /dev/null
++++ b/src/innovation_os/archive/models.py
+@@ -0,0 +1,21 @@
++from dataclasses import dataclass
++from typing import Optional
++
++
++@dataclass
++class ArchiveArtifact:
++    """
++    Canonical record for a file found while scanning a directory
++    for archival purposes.
++
++    This used to be defined separately in archive.connector and
++    reconstruction.archive_engine, with the same core shape
++    (path + artifact_type) plus one differing bonus field each
++    (name vs size). Both are kept here, optional, so neither
++    caller's behavior changes.
++    """
++
++    path: str
++    artifact_type: str
++    size: Optional[int] = None
++    name: Optional[str] = None
+diff --git a/src/innovation_os/conversations/importer.py b/src/innovation_os/conversations/importer.py
+index 2e152c0..8e50c25 100644
+--- a/src/innovation_os/conversations/importer.py
++++ b/src/innovation_os/conversations/importer.py
+@@ -3,7 +3,7 @@ from typing import List
+ 
+ 
+ @dataclass
+-class ConversationArtifact:
++class ParsedConversation:
+ 
+     conversation_id: str
+     messages: List[str]
+@@ -32,7 +32,7 @@ class ConversationImporter:
+         )
+ 
+ 
+-        return ConversationArtifact(
++        return ParsedConversation(
+             conversation_id,
+             messages,
+             keywords,
+diff --git a/src/innovation_os/models.py b/src/innovation_os/models.py
+index 2d23fd1..e8fa863 100644
+--- a/src/innovation_os/models.py
++++ b/src/innovation_os/models.py
+@@ -38,7 +38,7 @@ class Decision:
+ 
+ 
+ @dataclass
+-class Artifact:
++class ArtifactRecord:
+     id: str
+     name: str
+     artifact_type: str
+diff --git a/src/innovation_os/reconstruction/archive_engine.py b/src/innovation_os/reconstruction/archive_engine.py
+index 0548cb7..9e5e11c 100644
+--- a/src/innovation_os/reconstruction/archive_engine.py
++++ b/src/innovation_os/reconstruction/archive_engine.py
+@@ -1,15 +1,7 @@
+-from dataclasses import dataclass
+ from pathlib import Path
+ from typing import List
+ 
+-
+-@dataclass
+-class ArchiveArtifact:
+-
+-    path: str
+-    artifact_type: str
+-    size: int
+-
++from src.innovation_os.archive.models import ArchiveArtifact
+ 
+ 
+ class ArchiveReconstructionEngine:
+diff --git a/tests/test_models.py b/tests/test_models.py
+index ffe5098..099f256 100644
+--- a/tests/test_models.py
++++ b/tests/test_models.py
+@@ -3,7 +3,7 @@ from src.innovation_os.models import (
+     Question,
+     Concept,
+     Decision,
+-    Artifact,
++    ArtifactRecord,
+     Relationship,
+ )
+ 
+-- 
+2.43.0
+

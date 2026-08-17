@@ -1,0 +1,1373 @@
+diff --git a/sentinel_os/AUDIT_PLAYBOOK.md b/sentinel_os/AUDIT_PLAYBOOK.md
+index 46991df..0db825c 100644
+--- a/sentinel_os/AUDIT_PLAYBOOK.md
++++ b/sentinel_os/AUDIT_PLAYBOOK.md
+@@ -124,48 +124,67 @@ LIMIT 10;
+ 
+ **Claim:** Ledger entries form an unbroken SHA-256 chain (tamper-evident).
+ 
+-### Query: Verify hash chain integrity
++### Command: Verify hash chain integrity
++
++The stored hash is `SHA256` of a full canonical JSON object (sorted keys),
++not a simple concatenation of three columns -- and the canonical shape
++differs between legacy `append()` rows and structured `append_decision()`
++governance rows (see `governance/ledger_postgres.py`, `verify_chain()`).
++That canonicalization is Python-specific (`json.dumps(..., sort_keys=True)`)
++and is **not** reliably reproducible as a single raw SQL query -- Postgres's
++own JSON key ordering does not guarantee a byte-identical match. An earlier
++version of this playbook shipped a SQL query that both referenced a
++nonexistent `hash` column (the real column is `current_hash`) and used a
++canonical form that does not match the real one -- it would either error
++outright or silently report false MISMATCHes against a perfectly valid
++ledger. Use the app's own verifier instead; it is the single source of
++truth for what "valid" means here, and re-deriving an equivalent in SQL is
++exactly how the previous version drifted out of sync.
++
++```bash
++python3 -c "
++from governance.ledger_postgres import PostgreSQLLedger
++led = PostgreSQLLedger(host='<HOST>', port=5432, dbname='iceberg',
++                        user='<SCHEMA_OWNER_USER>', password='<SCHEMA_OWNER_PASSWORD>',
++                        runtime_user='<RUNTIME_USER>', runtime_password='<RUNTIME_PASSWORD>')
++r = led.verify_chain(mode='tolerant')
++print(f\"ok={r['ok']} entries={r['entries']} violations={len(r['violations'])}\")
++for v in r['violations']:
++    print(' -', v)
++"
++```
++`user`/`password` need enough privilege to run the one-time schema migration
++(`_initialize_schema()`) -- they are discarded immediately after. All actual
++reads, including this verification, run over `runtime_user`/`runtime_password`
++(the restricted `ledger_reader` role from `ledger_immutability.sql`, or set
++`ICEBERG_LEDGER_RUNTIME_USER`/`ICEBERG_LEDGER_RUNTIME_PASSWORD` instead of
++passing them as arguments). Passing the restricted role's credentials as
++`user`/`password` here will fail with `InsufficientPrivilege` -- that role
++deliberately cannot run schema DDL.
++
++### Query: Structural sanity check (row count, ID gaps)
++
++This is what raw SQL is actually reliable for -- note it catches **deletions**
++(a gap in the ID sequence) but **not in-place edits** (a tampered row keeps
++its ID; only the content-hash recomputation above catches that):
++
+ ```sql
+--- Check ledger hash chain
+--- For each entry, compute SHA256(previous_hash || action_type || data)
+--- and verify it matches the stored hash
+-
+-WITH hash_check AS (
+-  SELECT 
+-    id,
+-    hash as stored_hash,
+-    SHA256(
+-      COALESCE(
+-        (LAG(hash) OVER (ORDER BY id))::text, 
+-        '0'
+-      ) || action_type || data::text
+-    ) as computed_hash,
+-    (hash = SHA256(
+-      COALESCE(
+-        (LAG(hash) OVER (ORDER BY id))::text, 
+-        '0'
+-      ) || action_type || data::text
+-    )) as hash_valid
+-  FROM ledger_entries
+-  ORDER BY id DESC
+-  LIMIT 100
+-)
+-SELECT 
+-  id,
+-  hash_valid,
+-  CASE WHEN hash_valid THEN 'OK' ELSE 'MISMATCH' END as status
+-FROM hash_check
+-ORDER BY id;
++SELECT
++  count(*) AS total_rows,
++  min(id) AS min_id,
++  max(id) AS max_id,
++  (max(id) - min(id) + 1) AS expected_count_if_no_gaps,
++  (max(id) - min(id) + 1) - count(*) AS missing_rows
++FROM ledger_entries;
+ ```
+ 
+ ### Expected Result
+-- All rows have `hash_valid = true`
+-- Status column shows 'OK' for all rows
+-- No breaks in the chain (no gaps in sequential IDs)
++- `verify_chain()` returns `ok=True` with zero violations
++- `missing_rows` = 0 (no gaps in the ID sequence)
+ 
+ ### Pass / Fail
+-- **PASS:** All 100 rows have hash_valid=true AND no gaps in ID sequence
+-- **FAIL:** Any row has hash_valid=false (tampering detected!) OR gap in IDs (missing entries)
++- **PASS:** `verify_chain()` ok=True AND missing_rows=0
++- **FAIL:** any violation reported by `verify_chain()` (tampering detected in-place) OR missing_rows>0 (rows deleted)
+ 
+ ---
+ 
+diff --git a/sentinel_os/Engines/rl_ppo_adaptive.py b/sentinel_os/Engines/rl_ppo_adaptive.py
+index 933adcd..1598e7a 100644
+--- a/sentinel_os/Engines/rl_ppo_adaptive.py
++++ b/sentinel_os/Engines/rl_ppo_adaptive.py
+@@ -13,7 +13,7 @@ Best–in–Class Notes:
+ 
+ from __future__ import annotations
+ from dataclasses import dataclass
+-from typing import Dict, Any, List, Tuple
++from typing import Dict, List, Tuple
+ import array_ops as np
+ 
+ 
+diff --git a/sentinel_os/Tests/conftest.py b/sentinel_os/Tests/conftest.py
+index 06acbe4..e474dff 100644
+--- a/sentinel_os/Tests/conftest.py
++++ b/sentinel_os/Tests/conftest.py
+@@ -120,6 +120,19 @@ def test_ledger():
+     conn.close()
+ 
+     ledger = PostgreSQLLedger(**PG_CONFIG)
++
++    # The DROP TABLE above wipes any immutability triggers/grants along with
++    # the table (they're attached to the table, not the schema). Reapply
++    # them so the fixture doesn't silently leave H-A's protections undone
++    # for whatever uses this database next.
++    immutability_sql_path = os.path.join(parent, "ledger_immutability.sql")
++    if os.path.exists(immutability_sql_path):
++        conn = psycopg2.connect(connect_timeout=2, **PG_CONFIG)
++        conn.autocommit = True
++        with open(immutability_sql_path) as f:
++            conn.cursor().execute(f.read())
++        conn.close()
++
+     yield ledger
+     ledger.close()
+ 
+diff --git a/sentinel_os/Tests/test_api_key_auth.py b/sentinel_os/Tests/test_api_key_auth.py
+index 5163cda..811dbee 100644
+--- a/sentinel_os/Tests/test_api_key_auth.py
++++ b/sentinel_os/Tests/test_api_key_auth.py
+@@ -46,7 +46,7 @@ def test_api_key_validation_valid():
+         assert "name" in info
+         assert "enabled" in info
+         
+-        print(f"  ✓ PASSED - Valid API key accepted")
++        print("  ✓ PASSED - Valid API key accepted")
+         print(f"             Key name: {info['name']}")
+         return True
+     except Exception as e:
+@@ -62,11 +62,11 @@ def test_api_key_validation_invalid():
+     
+     try:
+         manager.validate_key("invalid_key_12345")
+-        print(f"  ✗ FAILED - Should have rejected invalid key")
++        print("  ✗ FAILED - Should have rejected invalid key")
+         return False
+     except HTTPException as e:
+         assert e.status_code == 403
+-        print(f"  ✓ PASSED - Invalid key rejected with 403")
++        print("  ✓ PASSED - Invalid key rejected with 403")
+         return True
+ 
+ def test_api_key_validation_missing():
+@@ -78,11 +78,11 @@ def test_api_key_validation_missing():
+     
+     try:
+         manager.validate_key(None)
+-        print(f"  ✗ FAILED - Should have rejected missing key")
++        print("  ✗ FAILED - Should have rejected missing key")
+         return False
+     except HTTPException as e:
+         assert e.status_code == 401
+-        print(f"  ✓ PASSED - Missing key rejected with 401")
++        print("  ✓ PASSED - Missing key rejected with 401")
+         return True
+ 
+ def test_api_key_from_env():
+@@ -129,14 +129,14 @@ def test_api_server_has_auth():
+                     has_auth = True
+     
+     if has_auth:
+-        print(f"  ✗ FAILED - /health endpoint should be public")
++        print("  ✗ FAILED - /health endpoint should be public")
+         return False
+     
+-    print(f"  ✓ PASSED - API server configured with authentication")
+-    print(f"             - /health: public (no auth)")
+-    print(f"             - /process: protected")
+-    print(f"             - /batch: protected")
+-    print(f"             - /metrics: protected")
++    print("  ✓ PASSED - API server configured with authentication")
++    print("             - /health: public (no auth)")
++    print("             - /process: protected")
++    print("             - /batch: protected")
++    print("             - /metrics: protected")
+     return True
+ 
+ def main():
+diff --git a/sentinel_os/Tests/test_cassette_snapshot_forensics.py b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+index ab2e60d..6fd1e23 100644
+--- a/sentinel_os/Tests/test_cassette_snapshot_forensics.py
++++ b/sentinel_os/Tests/test_cassette_snapshot_forensics.py
+@@ -11,13 +11,12 @@ Proves that:
+ 
+ import pytest
+ import json
+-from governance.ledger_postgres import PostgreSQLLedger, GovernanceDecisionRecord
++from governance.ledger_postgres import GovernanceDecisionRecord
+ from cassette_schema import validate_cassette, cassette_version_of
+ from cassette_forensics import (
+     serialize_cassette_for_ledger,
+     compute_cassette_hash,
+     reconstruct_cassette_for_decision,
+-    validate_cassette_snapshot_chain,
+ )
+ 
+ 
+diff --git a/sentinel_os/Tests/test_cassette_source_of_truth.py b/sentinel_os/Tests/test_cassette_source_of_truth.py
+index e2bd4df..eb6f32c 100644
+--- a/sentinel_os/Tests/test_cassette_source_of_truth.py
++++ b/sentinel_os/Tests/test_cassette_source_of_truth.py
+@@ -22,13 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ from cassette_schema import (
+     SCHEMA_VERSION,
+     CassetteValidationError,
+-    GovernanceParameters,
+     validate_cassette,
+-    validate_governance_parameters,
+-    cassette_version_of,
+ )
+-from cassette_interface import Cassette, CassetteConfig, QualityResult, CassetteRegistry
+-from cassette_loader import CassetteLoader
++from cassette_interface import CassetteConfig, CassetteRegistry
+ from cassettes.ivr_cassette import IvrCassette
+ from cassettes.banking_cassette import BankingCassette
+ from sentinel_core import SentinelCore
+diff --git a/sentinel_os/Tests/test_cassette_system.py b/sentinel_os/Tests/test_cassette_system.py
+index f9cf669..c770681 100644
+--- a/sentinel_os/Tests/test_cassette_system.py
++++ b/sentinel_os/Tests/test_cassette_system.py
+@@ -68,7 +68,7 @@ def test_banking_cassette_structure():
+     assert intent == "FRAUD_ALERT", f"Expected FRAUD_ALERT, got {intent}"
+     
+     print(f"  ✓ PASSED - Banking cassette valid, {len(queues)} queues")
+-    print(f"             Completely different from IVR")
++    print("             Completely different from IVR")
+     return True
+ 
+ def test_cassette_swapping():
+@@ -98,7 +98,7 @@ def test_cassette_swapping():
+     assert ivr_info["queues"] != banking_info["queues"], "Different cassettes should have different queues"
+     assert ivr_info["domain"] != banking_info["domain"], "Different domains"
+     
+-    print(f"  ✓ PASSED - Boom box works with multiple cassettes")
++    print("  ✓ PASSED - Boom box works with multiple cassettes")
+     print(f"             IVR domain: {ivr_info['domain']}, queues: {len(ivr_info['queues'])}")
+     print(f"             Banking domain: {banking_info['domain']}, queues: {len(banking_info['queues'])}")
+     return True
+@@ -134,7 +134,7 @@ def test_call_processing_different_cassettes():
+     
+     assert banking_result["domain"] == "banking"
+     
+-    print(f"  ✓ PASSED - Same call, different cassettes")
++    print("  ✓ PASSED - Same call, different cassettes")
+     print(f"             IVR: intent={ivr_result.get('intent')}, quality={ivr_result.get('quality_tier')}")
+     print(f"             Banking: intent={banking_result.get('intent')}, quality={banking_result.get('quality_tier')}")
+     return True
+@@ -149,7 +149,7 @@ def test_cassette_validates():
+     assert ivr.validate() == True, "IVR should validate"
+     assert banking.validate() == True, "Banking should validate"
+     
+-    print(f"  ✓ PASSED - All cassettes valid")
++    print("  ✓ PASSED - All cassettes valid")
+     return True
+ 
+ def main():
+diff --git a/sentinel_os/Tests/test_critical_integration.py b/sentinel_os/Tests/test_critical_integration.py
+index cf1ec0a..265d298 100644
+--- a/sentinel_os/Tests/test_critical_integration.py
++++ b/sentinel_os/Tests/test_critical_integration.py
+@@ -24,7 +24,7 @@ def test_ppo_router_expected_wait():
+     
+     print(f"  Router1 expected_wait: {router1.expected_wait}")
+     print(f"  Router2 expected_wait: {router2.expected_wait}")
+-    print(f"  ✓ PASSED")
++    print("  ✓ PASSED")
+     return True
+ 
+ def test_zero_drift():
+@@ -37,7 +37,7 @@ def test_zero_drift():
+     breached = [s for s in signals if s.breached]
+     
+     assert len(breached) == 0, "Should detect no drift in stable conditions"
+-    print(f"  ✓ PASSED - No false positives")
++    print("  ✓ PASSED - No false positives")
+     return True
+ 
+ def test_multiple_drifts():
+@@ -56,7 +56,7 @@ def test_multiple_drifts():
+     breached = [s for s in signals if s.breached]
+     
+     assert len(breached) == 3, f"Should detect 3 drifts, got {len(breached)}"
+-    print(f"  ✓ PASSED - All 3 simultaneous drifts detected")
++    print("  ✓ PASSED - All 3 simultaneous drifts detected")
+     return True
+ 
+ def test_clamping_boundaries():
+diff --git a/sentinel_os/Tests/test_gallm.py b/sentinel_os/Tests/test_gallm.py
+index e62e208..636bb2d 100644
+--- a/sentinel_os/Tests/test_gallm.py
++++ b/sentinel_os/Tests/test_gallm.py
+@@ -31,7 +31,7 @@ def test_gallm_routing():
+     work4 = router.assign_task(work4)
+     assert work4.assigned_ai == AIRole.CLAUDE, f"Should route to Claude, got {work4.assigned_ai}"
+     
+-    print(f"  ✓ PASSED - Routed 4 tasks to correct AIs")
++    print("  ✓ PASSED - Routed 4 tasks to correct AIs")
+     return True
+ 
+ def test_gallm_execution():
+@@ -49,7 +49,7 @@ def test_gallm_execution():
+     result2 = executor.execute(work2)
+     assert "✓" in result2, "Should succeed"
+     
+-    print(f"  ✓ PASSED - Executed 2 tasks with AI responses")
++    print("  ✓ PASSED - Executed 2 tasks with AI responses")
+     return True
+ 
+ def test_gallm_audit():
+@@ -73,7 +73,7 @@ def test_gallm_audit():
+     for decision in audit.decisions:
+         assert len(decision["hash"]) == 64, "Hash should be SHA256"
+     
+-    print(f"  ✓ PASSED - Recorded 3 decisions with valid hash chain")
++    print("  ✓ PASSED - Recorded 3 decisions with valid hash chain")
+     return True
+ 
+ def test_gallm_end_to_end():
+diff --git a/sentinel_os/Tests/test_governance_cassettes.py b/sentinel_os/Tests/test_governance_cassettes.py
+index 08594e3..c60e5f5 100644
+--- a/sentinel_os/Tests/test_governance_cassettes.py
++++ b/sentinel_os/Tests/test_governance_cassettes.py
+@@ -3,7 +3,7 @@ import os
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
+-from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
++from governance.drift_core_v1 import DriftPolicy, detect_drift
+ 
+ def test_log_rotation_basic(tmp_path):
+     ledger = LogRotationManager(LocalDiskAdapter(str(tmp_path)), seed="815")
+diff --git a/sentinel_os/Tests/test_graph_integrity.py b/sentinel_os/Tests/test_graph_integrity.py
+index 5630b99..6591f27 100644
+--- a/sentinel_os/Tests/test_graph_integrity.py
++++ b/sentinel_os/Tests/test_graph_integrity.py
+@@ -26,7 +26,7 @@ import json
+ import hashlib
+ import pytest
+ 
+-from Domain.build_graph import build_graph, RoutingGraph, GraphNode
++from Domain.build_graph import build_graph, RoutingGraph
+ 
+ 
+ # ---------------------------------------------------------
+diff --git a/sentinel_os/Tests/test_observe_perceive.py b/sentinel_os/Tests/test_observe_perceive.py
+index 239be63..d3b3cea 100644
+--- a/sentinel_os/Tests/test_observe_perceive.py
++++ b/sentinel_os/Tests/test_observe_perceive.py
+@@ -3,14 +3,12 @@ Tests for OBSERVE and PERCEIVE Core Engines
+ """
+ 
+ import array_ops as np
+-import pytest
+ from observe_perceive_core import (
+     ObserveCore, 
+     PerceiveCore, 
+     EmotionalState, 
+     FrictionEvent, 
+     CallOutcome, 
+-    CallPercept,
+     synthesize_percept
+ )
+ 
+@@ -109,7 +107,7 @@ def test_full_percept_synthesis():
+     assert len(percept.next_action_distribution) > 0, "Should have next actions"
+     assert percept.outcome == CallOutcome.IN_PROGRESS, "Should be in progress"
+     
+-    print(f"  ✓ PASSED - Full percept synthesized")
++    print("  ✓ PASSED - Full percept synthesized")
+     print(f"    Journey length: {len(percept.journey)}")
+     print(f"    Abandonment risk: {percept.abandonment_risk:.2f}")
+     print(f"    Inferred outcome: {percept.outcome.value}")
+diff --git a/sentinel_os/Tests/test_observe_perceive_fix.py b/sentinel_os/Tests/test_observe_perceive_fix.py
+index 73fc1eb..0987244 100644
+--- a/sentinel_os/Tests/test_observe_perceive_fix.py
++++ b/sentinel_os/Tests/test_observe_perceive_fix.py
+@@ -27,7 +27,7 @@ def test_full_percept_synthesis():
+     assert len(percept.next_action_distribution) > 0, "Should have next actions"
+     assert percept.outcome == CallOutcome.RESOLVED, f"Should be resolved, got {percept.outcome}"
+     
+-    print(f"  ✓ PASSED - Full percept synthesized")
++    print("  ✓ PASSED - Full percept synthesized")
+     print(f"    Journey length: {len(percept.journey)}")
+     print(f"    Abandonment risk: {percept.abandonment_risk:.2f}")
+     print(f"    Outcome: {percept.outcome.value}")
+diff --git a/sentinel_os/Tests/test_production_integration.py b/sentinel_os/Tests/test_production_integration.py
+index ba02c2a..b3803e9 100644
+--- a/sentinel_os/Tests/test_production_integration.py
++++ b/sentinel_os/Tests/test_production_integration.py
+@@ -3,7 +3,7 @@ import os
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from metrics_prometheus import PrometheusMetrics
+-from twilio_log_ingestion import TwilioLogParser, IcebergJourney
++from twilio_log_ingestion import TwilioLogParser
+ from cassettes.ivr_cassette import IvrCassette
+ 
+ def test_prometheus_metrics():
+@@ -127,7 +127,7 @@ def test_full_production_integration():
+     assert len(prometheus_text) > 100
+     assert "iceberg_calls_total" in prometheus_text
+     
+-    print(f"  ✓ PASSED - Full integration: 5 calls processed")
++    print("  ✓ PASSED - Full integration: 5 calls processed")
+     print(f"             Resolution: {summary['calls_resolved']}/5")
+     print(f"             Abandonment: {summary['abandonment_rate']*100:.0f}%")
+     return True
+diff --git a/sentinel_os/Tests/test_queue_staffing_bayes.py b/sentinel_os/Tests/test_queue_staffing_bayes.py
+index f188c4b..efba15b 100644
+--- a/sentinel_os/Tests/test_queue_staffing_bayes.py
++++ b/sentinel_os/Tests/test_queue_staffing_bayes.py
+@@ -16,7 +16,7 @@ def test_queue_dynamics():
+     
+     # Heavy traffic
+     wait2 = coord.queue_dynamics.predict_wait_time(agents=5, traffic_intensity=4.5, avg_handle_time=5.0)
+-    assert wait2 > wait1, f"Heavy traffic should have longer wait"
++    assert wait2 > wait1, "Heavy traffic should have longer wait"
+     
+     # Recommend agents for target
+     agents_needed = coord.queue_dynamics.recommended_agents(traffic_intensity=4.5, target_wait=30.0, avg_handle_time=5.0)
+diff --git a/sentinel_os/Tests/test_remaining_edge_cases.py b/sentinel_os/Tests/test_remaining_edge_cases.py
+index a36fcd8..1e4c3f5 100644
+--- a/sentinel_os/Tests/test_remaining_edge_cases.py
++++ b/sentinel_os/Tests/test_remaining_edge_cases.py
+@@ -77,10 +77,10 @@ def test_ledger_recovery():
+     
+     # Strict should fail on corrupted chunk
+     if not report["ok"]:
+-        print(f"  ✓ PASSED - Strict mode correctly rejected corrupted tail")
++        print("  ✓ PASSED - Strict mode correctly rejected corrupted tail")
+         return True
+     else:
+-        print(f"  ✗ FAILED - Should have detected corruption")
++        print("  ✗ FAILED - Should have detected corruption")
+         return False
+ 
+ def test_parameter_persistence():
+diff --git a/sentinel_os/Tests/test_resilience_observability.py b/sentinel_os/Tests/test_resilience_observability.py
+index 507ae5f..f778d55 100644
+--- a/sentinel_os/Tests/test_resilience_observability.py
++++ b/sentinel_os/Tests/test_resilience_observability.py
+@@ -63,7 +63,7 @@ def test_health_checker():
+     assert status["components"]["good"]["status"] == "healthy"
+     assert status["components"]["bad"]["status"] == "unhealthy"
+     
+-    print(f"  ✓ PASSED - Health checker detected degraded system")
++    print("  ✓ PASSED - Health checker detected degraded system")
+     return True
+ 
+ def test_logging():
+@@ -77,7 +77,7 @@ def test_logging():
+     # Log a message (won't raise)
+     logger.info("Test message")
+     
+-    print(f"  ✓ PASSED - Structured logging initialized")
++    print("  ✓ PASSED - Structured logging initialized")
+     return True
+ 
+ def test_grafana_dashboard():
+@@ -117,7 +117,7 @@ def test_resilient_harness_initialization():
+     assert "overall" in health
+     assert "components" in health
+     
+-    print(f"  ✓ PASSED - Resilient harness initialized, health check working")
++    print("  ✓ PASSED - Resilient harness initialized, health check working")
+     return True
+ 
+ def test_resilient_process_call():
+@@ -145,7 +145,7 @@ def test_resilient_process_call():
+     assert "resolved" in result
+     assert "quality" in result
+     
+-    print(f"  ✓ PASSED - Resilient harness processed call successfully")
++    print("  ✓ PASSED - Resilient harness processed call successfully")
+     return True
+ 
+ def test_metrics_export_with_fallback():
+diff --git a/sentinel_os/Tests/test_rl_governance_integration.py b/sentinel_os/Tests/test_rl_governance_integration.py
+index 8c3be7e..08a5138 100644
+--- a/sentinel_os/Tests/test_rl_governance_integration.py
++++ b/sentinel_os/Tests/test_rl_governance_integration.py
+@@ -83,11 +83,11 @@ def test_complete_rl_governance_integration():
+     
+     print("\n" + "="*70)
+     print("INTEGRATION RESULTS")
+-    print(f"  RL Training:")
++    print("  RL Training:")
+     print(f"    Phase 1 loss: {losses[0]:.4f}")
+     print(f"    Phase 2 loss: {losses[1]:.4f}")
+     print(f"    Improvement: {(losses[0]-losses[1])/losses[0]*100:.1f}%")
+-    print(f"  Governance:")
++    print("  Governance:")
+     print(f"    Drifts detected: {len(breached)}")
+     print(f"    Parameters healed: {len(recs) if breached else 0}")
+     print(f"    Ledger verified: {'✓ YES' if report['ok'] else '✗ NO'}")
+diff --git a/sentinel_os/Tests/test_rl_learning.py b/sentinel_os/Tests/test_rl_learning.py
+index 368b727..beaf95e 100644
+--- a/sentinel_os/Tests/test_rl_learning.py
++++ b/sentinel_os/Tests/test_rl_learning.py
+@@ -38,7 +38,7 @@ def test_rl_training_learns():
+     
+     loss2 = trainer.update_weights()
+     
+-    print(f"\n  Training Results:")
++    print("\n  Training Results:")
+     print(f"    Phase 1 loss (bad routing): {loss1:.4f}")
+     print(f"    Phase 2 loss (good routing): {loss2:.4f}")
+     
+@@ -49,8 +49,8 @@ def test_rl_training_learns():
+     # Verify learning happened
+     assert loss2 < loss1, f"Should improve: {loss1:.4f} -> {loss2:.4f}"
+     
+-    print(f"\n  ✓ PASSED - RL agent learns to prefer better actions")
+-    print(f"  ✓ Router can optimize policy based on call outcomes")
++    print("\n  ✓ PASSED - RL agent learns to prefer better actions")
++    print("  ✓ Router can optimize policy based on call outcomes")
+     return True
+ 
+ if __name__ == "__main__":
+diff --git a/sentinel_os/Tests/test_sentinel.py b/sentinel_os/Tests/test_sentinel.py
+index 73c425c..97c3108 100644
+--- a/sentinel_os/Tests/test_sentinel.py
++++ b/sentinel_os/Tests/test_sentinel.py
+@@ -3,10 +3,10 @@ import os
+ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ 
+ from sentinel_core import (
+-    SentinelCore, CallerIntent, OutcomeQuality
++    SentinelCore, OutcomeQuality
+ )
+ from cassettes.ivr_cassette import IvrCassette
+-from observe_perceive_core import EmotionalState, FrictionEvent
++from observe_perceive_core import EmotionalState
+ 
+ def test_sentinel_intent_inference():
+     print("\n[TEST 1] Sentinel: Intent inference from queue choice")
+diff --git a/sentinel_os/Tests/test_telemetry_pipeline.py b/sentinel_os/Tests/test_telemetry_pipeline.py
+index 7f6a3b8..11abc90 100644
+--- a/sentinel_os/Tests/test_telemetry_pipeline.py
++++ b/sentinel_os/Tests/test_telemetry_pipeline.py
+@@ -98,7 +98,7 @@ def test_end_to_end_flow():
+     assert result["avg_frustration"] > 0.2
+     assert result["reaction_count"] >= 0
+     
+-    print(f"  ✓ PASSED - E2E flow:")
++    print("  ✓ PASSED - E2E flow:")
+     print(f"             Metrics: {result['metrics_collected']}")
+     print(f"             Resolution rate: {result['avg_resolution_rate']*100:.1f}%")
+     print(f"             Frustration: {result['avg_frustration']:.2f}")
+diff --git a/sentinel_os/Tests/test_tls_security.py b/sentinel_os/Tests/test_tls_security.py
+index c765b0f..b169762 100644
+--- a/sentinel_os/Tests/test_tls_security.py
++++ b/sentinel_os/Tests/test_tls_security.py
+@@ -15,7 +15,7 @@ def test_tls_certificates_exist():
+     assert os.path.getsize(cert_file) > 0, "Certificate is empty"
+     assert os.path.getsize(key_file) > 0, "Key is empty"
+     
+-    print(f"  ✓ PASSED - TLS certificates found")
++    print("  ✓ PASSED - TLS certificates found")
+     print(f"             Cert: {cert_file} ({os.path.getsize(cert_file)} bytes)")
+     print(f"             Key:  {key_file} ({os.path.getsize(key_file)} bytes)")
+     return True
+@@ -31,7 +31,7 @@ def test_tls_certificate_validity():
+     assert "BEGIN CERTIFICATE" in content, "Not a valid PEM certificate"
+     assert "END CERTIFICATE" in content, "Certificate format invalid"
+     
+-    print(f"  ✓ PASSED - Certificate is valid PEM format")
++    print("  ✓ PASSED - Certificate is valid PEM format")
+     return True
+ 
+ def test_tls_key_validity():
+@@ -45,7 +45,7 @@ def test_tls_key_validity():
+     assert "BEGIN PRIVATE KEY" in content or "BEGIN RSA PRIVATE KEY" in content, "Not a valid PEM private key"
+     assert "END PRIVATE KEY" in content or "END RSA PRIVATE KEY" in content, "Key format invalid"
+     
+-    print(f"  ✓ PASSED - Private key is valid PEM format")
++    print("  ✓ PASSED - Private key is valid PEM format")
+     return True
+ 
+ def test_tls_can_be_used():
+@@ -61,7 +61,7 @@ def test_tls_can_be_used():
+     )
+     
+     if result.returncode == 0:
+-        print(f"  ✓ PASSED - Certificate is valid X.509")
++        print("  ✓ PASSED - Certificate is valid X.509")
+         # Extract CN from cert
+         for line in result.stdout.split("\n"):
+             if "CN=" in line or "Subject:" in line:
+@@ -83,10 +83,10 @@ def test_api_server_tls_ready():
+     assert "CERT_FILE" in content, "CERT_FILE env var not configured"
+     assert "KEY_FILE" in content, "KEY_FILE env var not configured"
+     
+-    print(f"  ✓ PASSED - API server configured for TLS")
+-    print(f"             - ssl_certfile support")
+-    print(f"             - ssl_keyfile support")
+-    print(f"             - Environment variable configuration")
++    print("  ✓ PASSED - API server configured for TLS")
++    print("             - ssl_certfile support")
++    print("             - ssl_keyfile support")
++    print("             - Environment variable configuration")
+     return True
+ 
+ def main():
+diff --git a/sentinel_os/api_key_auth.py b/sentinel_os/api_key_auth.py
+index f1a1ffa..515e98f 100644
+--- a/sentinel_os/api_key_auth.py
++++ b/sentinel_os/api_key_auth.py
+@@ -6,10 +6,13 @@ Simple API key validation for production
+ 
+ import os
+ import secrets
+-import hashlib
++import hmac
++import time
++import threading
++from collections import deque, defaultdict
+ from typing import Optional, Dict
+ from datetime import datetime, timezone
+-from fastapi import HTTPException, Header
++from fastapi import HTTPException, Header, Request
+ 
+ class APIKeyManager:
+     """Manage API keys"""
+@@ -25,6 +28,12 @@ class APIKeyManager:
+         keys_env = os.getenv("ICEBERG_API_KEYS", "")
+         
+         if not keys_env:
++            if os.getenv("ICEBERG_REQUIRE_API_KEYS", "").lower() in ("1", "true", "yes"):
++                raise RuntimeError(
++                    "ICEBERG_API_KEYS is not set and ICEBERG_REQUIRE_API_KEYS=true -- "
++                    "refusing to start with a silently-generated development key. "
++                    "Set ICEBERG_API_KEYS=key:name explicitly."
++                )
+             # Generate a default development key
+             dev_key = self._generate_key()
+             self.keys[dev_key] = {
+@@ -32,7 +41,7 @@ class APIKeyManager:
+                 "created": datetime.now(timezone.utc).isoformat(),
+                 "enabled": True
+             }
+-            print(f"⚠️  No API keys configured. Generated development key:")
++            print("⚠️  No API keys configured. Generated development key:")
+             print(f"    ICEBERG_API_KEYS={dev_key}:development")
+             return
+         
+@@ -54,16 +63,29 @@ class APIKeyManager:
+         """Generate a random API key"""
+         return f"icebergkey_{secrets.token_urlsafe(32)}"
+     
++    def _find_key_constant_time(self, api_key: str) -> Optional[str]:
++        """Compare api_key against every configured key with hmac.compare_digest,
++        never short-circuiting, so response time doesn't leak how much of the
++        key matched or which key (if any) it matched."""
++        match = None
++        api_key_bytes = api_key.encode("utf-8")
++        for candidate in self.keys:
++            if hmac.compare_digest(candidate.encode("utf-8"), api_key_bytes):
++                match = candidate
++            # deliberately no early return/break -- keep comparing all keys
++        return match
++
+     def validate_key(self, api_key: Optional[str]) -> Dict:
+         """Validate an API key"""
+         
+         if not api_key:
+             raise HTTPException(status_code=401, detail="Missing API key")
+         
+-        if api_key not in self.keys:
++        matched = self._find_key_constant_time(api_key)
++        if matched is None:
+             raise HTTPException(status_code=403, detail="Invalid API key")
+-        
+-        key_info = self.keys[api_key]
++
++        key_info = self.keys[matched]
+         
+         if not key_info.get("enabled", False):
+             raise HTTPException(status_code=403, detail="API key is disabled")
+@@ -82,9 +104,56 @@ class APIKeyManager:
+             "enabled": self.keys[api_key]["enabled"]
+         }
+ 
++class RateLimiter:
++    """Simple in-memory fixed-window-ish rate limiter (sliding via deque).
++
++    Not distributed -- fine for a single-process deployment; a multi-replica
++    deployment would need a shared store (e.g. Redis) instead. Documented as
++    a known limitation rather than silently pretending this scales.
++    """
++
++    def __init__(self, max_requests: int = 60, window_seconds: float = 60.0):
++        self.max_requests = max_requests
++        self.window_seconds = window_seconds
++        self._hits: Dict[str, deque] = defaultdict(deque)
++        self._lock = threading.Lock()
++
++    def check(self, identity: str) -> None:
++        """Raise HTTPException(429) if `identity` has exceeded the limit."""
++        now = time.monotonic()
++        with self._lock:
++            q = self._hits[identity]
++            cutoff = now - self.window_seconds
++            while q and q[0] < cutoff:
++                q.popleft()
++            if len(q) >= self.max_requests:
++                retry_after = max(0.0, self.window_seconds - (now - q[0]))
++                raise HTTPException(
++                    status_code=429,
++                    detail="Rate limit exceeded",
++                    headers={"Retry-After": str(int(retry_after) + 1)},
++                )
++            q.append(now)
++
++
++rate_limiter = RateLimiter(
++    max_requests=int(os.getenv("ICEBERG_RATE_LIMIT_MAX", "60")),
++    window_seconds=float(os.getenv("ICEBERG_RATE_LIMIT_WINDOW_SECONDS", "60")),
++)
++
++
+ # Global API key manager
+ api_key_manager = APIKeyManager()
+ 
+-def require_api_key(x_api_key: str = Header(None)) -> Dict:
+-    """FastAPI dependency: require valid API key"""
++def require_api_key(request: Request, x_api_key: str = Header(None)) -> Dict:
++    """FastAPI dependency: require a valid API key AND enforce a per-key
++    (or per-IP, if the key is missing/invalid) rate limit.
++
++    Rate-limiting on the identity used for the *attempt* -- not only on
++    successfully-authenticated keys -- so an attacker hammering invalid
++    keys (which is exactly the brute-force scenario the timing-safe
++    comparison above is hardening against) is throttled too.
++    """
++    identity = x_api_key if x_api_key else (request.client.host if request.client else "unknown")
++    rate_limiter.check(identity)
+     return api_key_manager.validate_key(x_api_key)
+diff --git a/sentinel_os/api_server_resilient.py b/sentinel_os/api_server_resilient.py
+index fde8c71..c1ab359 100644
+--- a/sentinel_os/api_server_resilient.py
++++ b/sentinel_os/api_server_resilient.py
+@@ -4,7 +4,7 @@ Iceberg API Server (Resilient + TLS + API Key Auth)
+ With SSL/HTTPS and API key authentication
+ """
+ 
+-from fastapi import FastAPI, HTTPException, Depends, Header
++from fastapi import FastAPI, HTTPException, Depends
+ from fastapi.responses import PlainTextResponse, JSONResponse
+ import uvicorn
+ import os
+diff --git a/sentinel_os/cassette_forensics.py b/sentinel_os/cassette_forensics.py
+index 116fb73..fd2702b 100644
+--- a/sentinel_os/cassette_forensics.py
++++ b/sentinel_os/cassette_forensics.py
+@@ -19,7 +19,7 @@ it matches the cassette hash stored in the chain.
+ 
+ import json
+ import hashlib
+-from typing import Any, Dict, Optional
++from typing import Any, Dict
+ 
+ 
+ def serialize_cassette_for_ledger(governance_params: Any) -> Dict[str, Any]:
+diff --git a/sentinel_os/cassette_harness.py b/sentinel_os/cassette_harness.py
+index 74ef8c3..ebbf89d 100644
+--- a/sentinel_os/cassette_harness.py
++++ b/sentinel_os/cassette_harness.py
+@@ -4,10 +4,8 @@ Cassette Harness - Boom box that accepts any cassette
+ Routes all domain logic through loaded cassette
+ """
+ 
+-import os
+-from typing import Dict, Optional
++from typing import Dict
+ from cassette_loader import CassetteLoader
+-from cassette_interface import Cassette
+ from cassette_schema import validate_cassette
+ from governance.friction_core import compute_friction
+ from resilient_harness import ResilientHarness
+diff --git a/sentinel_os/cassette_interface.py b/sentinel_os/cassette_interface.py
+index 6d8937b..d4bab24 100644
+--- a/sentinel_os/cassette_interface.py
++++ b/sentinel_os/cassette_interface.py
+@@ -6,8 +6,7 @@ Allows any industry to plug in their own cassette without touching boom box
+ 
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import Dict, List, Optional
+-from enum import Enum
++from typing import Dict, List
+ 
+ @dataclass
+ class CassetteConfig:
+diff --git a/sentinel_os/cassette_loader.py b/sentinel_os/cassette_loader.py
+index 321eead..2fb32f6 100644
+--- a/sentinel_os/cassette_loader.py
++++ b/sentinel_os/cassette_loader.py
+@@ -5,9 +5,8 @@ Enables boom box to work with any cassette without code changes
+ """
+ 
+ import importlib.util
+-import sys
+ from pathlib import Path
+-from typing import Dict, Optional
++from typing import Dict
+ from cassette_interface import Cassette, CassetteRegistry
+ from cassette_schema import CassetteValidationError, validate_cassette
+ 
+diff --git a/sentinel_os/governance/drift_core_v1.py b/sentinel_os/governance/drift_core_v1.py
+index 29207b0..55a95ca 100644
+--- a/sentinel_os/governance/drift_core_v1.py
++++ b/sentinel_os/governance/drift_core_v1.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-from typing import Dict, List, Optional
++from typing import Dict, List
+ 
+ # Percentile statistic
+ def percentile(xs: List[float], q: float) -> float:
+diff --git a/sentinel_os/governance/ledger_postgres.py b/sentinel_os/governance/ledger_postgres.py
+index fec8e95..cbe87ff 100644
+--- a/sentinel_os/governance/ledger_postgres.py
++++ b/sentinel_os/governance/ledger_postgres.py
+@@ -6,9 +6,9 @@ Replaces LocalDiskAdapter with real database: transactions, durability, ACID
+ 
+ import json
+ import hashlib
+-from dataclasses import dataclass, field
++import os
++from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional
+-import psycopg2
+ from psycopg2.pool import SimpleConnectionPool
+ 
+ # Forensic cassette handling (ledger item: cassette snapshots for audit)
+@@ -60,15 +60,51 @@ class PostgreSQLLedger:
+     
+     def __init__(self, host: str = "localhost", port: int = 5432, 
+                  dbname: str = "iceberg", user: str = "iceberg", 
+-                 password: str = "iceberg", min_connections: int = 1, max_connections: int = 10):
+-        """Initialize connection pool"""
+-        
++                 password: str = "iceberg", min_connections: int = 1, max_connections: int = 10,
++                 runtime_user: str = None, runtime_password: str = None):
++        """Initialize connection pool.
++
++        `user`/`password` must be privileged enough to create/alter the
++        ledger schema (run once, at startup, then discarded).
++
++        `runtime_user`/`runtime_password` (or the ICEBERG_LEDGER_RUNTIME_USER /
++        ICEBERG_LEDGER_RUNTIME_PASSWORD env vars) are what every append/read
++        after startup actually connects as. This should be a restricted role
++        (see ledger_immutability.sql's `ledger_reader`: SELECT + INSERT only,
++        no UPDATE/DELETE/DDL) so the app itself cannot tamper with or drop the
++        immutability triggers even if compromised or misused. If unset, falls
++        back to the schema-init credentials with a warning -- immutability is
++        then enforced by triggers alone, not by connection privilege.
++        """
++
++        # One-off privileged connection: create/migrate schema, then discard.
++        # Never reused for ongoing reads/writes.
+         self.pool = SimpleConnectionPool(
+-            min_connections, max_connections,
++            1, 1,
+             host=host, port=port, database=dbname,
+             user=user, password=password
+         )
+         self._initialize_schema()
++        self.pool.closeall()
++
++        runtime_user = runtime_user or os.getenv("ICEBERG_LEDGER_RUNTIME_USER")
++        runtime_password = runtime_password or os.getenv("ICEBERG_LEDGER_RUNTIME_PASSWORD")
++        if not runtime_user:
++            print(
++                "[WARN] ICEBERG_LEDGER_RUNTIME_USER not set -- ledger is running "
++                "with full schema-init privileges for all operations (no "
++                "connection-level defense-in-depth). Set ICEBERG_LEDGER_RUNTIME_USER "
++                "/ ICEBERG_LEDGER_RUNTIME_PASSWORD (e.g. the ledger_reader role from "
++                "ledger_immutability.sql) in production so the app connection itself "
++                "cannot UPDATE/DELETE/DROP TRIGGER even if compromised."
++            )
++            runtime_user, runtime_password = user, password
++
++        self.pool = SimpleConnectionPool(
++            min_connections, max_connections,
++            host=host, port=port, database=dbname,
++            user=runtime_user, password=runtime_password
++        )
+     
+     def _initialize_schema(self):
+         """Create ledger table if not exists"""
+diff --git a/sentinel_os/governance/log_rotation_v1.py b/sentinel_os/governance/log_rotation_v1.py
+index 9e35f8e..6d54226 100644
+--- a/sentinel_os/governance/log_rotation_v1.py
++++ b/sentinel_os/governance/log_rotation_v1.py
+@@ -3,10 +3,9 @@ import hashlib
+ import os
+ import tempfile
+ import threading
+-import logging
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List
+ 
+ class StorageAdapter(ABC):
+     @abstractmethod
+diff --git a/sentinel_os/grafana_dashboard.py b/sentinel_os/grafana_dashboard.py
+index a9b95df..e0dee80 100644
+--- a/sentinel_os/grafana_dashboard.py
++++ b/sentinel_os/grafana_dashboard.py
+@@ -5,7 +5,7 @@ Auto-generates Grafana dashboard JSON for visualization
+ """
+ 
+ import json
+-from typing import List, Dict
++from typing import Dict
+ 
+ class GrafanaDashboard:
+     """Generate Grafana dashboard for Iceberg monitoring"""
+diff --git a/sentinel_os/iceberg_complete_simulator.py b/sentinel_os/iceberg_complete_simulator.py
+index 17ff357..9aaa67a 100644
+--- a/sentinel_os/iceberg_complete_simulator.py
++++ b/sentinel_os/iceberg_complete_simulator.py
+@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.dirname(__file__))
+ 
+ from Model.Build_Graph import build_graph
+ from Engines.simple_rl_trainer import SimpleRLTrainer
+-from observe_perceive_core import ObserveCore, synthesize_percept, FrictionEvent
+-from governance.drift_core_v1 import DriftPolicy, detect_drift, baseline_from_holds
++from observe_perceive_core import ObserveCore, FrictionEvent
++from governance.drift_core_v1 import DriftPolicy, detect_drift
+ from governance.self_heal_v1 import heal, HealBand, InMemoryParameterStore
+ from governance.log_rotation_v1 import LogRotationManager, LocalDiskAdapter
+ from governance.friction_core import compute_friction
+@@ -180,7 +180,7 @@ def main():
+     
+     print("\n" + "="*70)
+     print("COMPLETE ICEBERG RESULTS")
+-    print(f"  Total callers: 100")
++    print("  Total callers: 100")
+     print(f"  Real graph nodes traversed: {len(simulator.graph.nodes)}")
+     print(f"  Resolution rate: {resolved1*100:.1f}% → {resolved2*100:.1f}%")
+     print(f"  RL improvement: {(loss1-loss2)/loss1*100:.1f}%")
+diff --git a/sentinel_os/k8s/deployment.yaml b/sentinel_os/k8s/deployment.yaml
+index 24d72f0..8253aa1 100644
+--- a/sentinel_os/k8s/deployment.yaml
++++ b/sentinel_os/k8s/deployment.yaml
+@@ -13,10 +13,26 @@ spec:
+       labels:
+         app: iceberg
+     spec:
++      securityContext:
++        # Pod-level: enforced regardless of what the image's own USER
++        # directive says, so a compromised/rebuilt image can't silently
++        # start running as root.
++        runAsNonRoot: true
++        runAsUser: 1000   # matches the Dockerfile's `useradd --uid 1000 iceberg`
++        runAsGroup: 1000
++        fsGroup: 1000      # so the mounted PVC is writable by that uid
++        seccompProfile:
++          type: RuntimeDefault
+       containers:
+       - name: iceberg
+         image: iceberg:latest
+         imagePullPolicy: IfNotPresent
++        securityContext:
++          allowPrivilegeEscalation: false
++          readOnlyRootFilesystem: true
++          capabilities:
++            drop:
++            - ALL
+         ports:
+         - containerPort: 9090
+           name: metrics
+@@ -48,6 +64,25 @@ spec:
+             secretKeyRef:
+               name: iceberg-secrets
+               key: postgres-password
++        # Restricted, non-superuser role the ledger actually connects as
++        # for all reads/writes after startup (see ledger_immutability.sql
++        # and PostgreSQLLedger's runtime_user/runtime_password). POSTGRES_USER
++        # above stays privileged, but only for the one-time schema migration.
++        # Optional so a deployment that hasn't provisioned ledger_reader yet
++        # still starts (PostgreSQLLedger falls back to the schema-owner
++        # credentials with a printed warning if these are unset).
++        - name: ICEBERG_LEDGER_RUNTIME_USER
++          valueFrom:
++            secretKeyRef:
++              name: iceberg-secrets
++              key: ledger-runtime-user
++              optional: true
++        - name: ICEBERG_LEDGER_RUNTIME_PASSWORD
++          valueFrom:
++            secretKeyRef:
++              name: iceberg-secrets
++              key: ledger-runtime-password
++              optional: true
+         - name: CLAUDE_API_KEY
+           valueFrom:
+             secretKeyRef:
+@@ -75,7 +110,11 @@ spec:
+         volumeMounts:
+         - name: ledger
+           mountPath: /data
++        - name: tmp
++          mountPath: /tmp
+       volumes:
+       - name: ledger
+         persistentVolumeClaim:
+           claimName: iceberg-ledger-pvc
++      - name: tmp
++        emptyDir: {}
+diff --git a/sentinel_os/ledger_immutability.sql b/sentinel_os/ledger_immutability.sql
+index 425f4c7..ed36a38 100644
+--- a/sentinel_os/ledger_immutability.sql
++++ b/sentinel_os/ledger_immutability.sql
+@@ -37,6 +37,28 @@ FOR EACH ROW
+ EXECUTE FUNCTION block_ledger_delete();
+ 
+ 
++-- Block TRUNCATE on ledger_entries
++-- Rationale: row-level BEFORE DELETE/UPDATE triggers above do NOT fire on
++-- TRUNCATE (Postgres fires TRUNCATE triggers separately, statement-level
++-- only). Without this, TRUNCATE ledger_entries; empties the entire
++-- tamper-evident audit trail in one statement, bypassing both triggers
++-- above entirely -- confirmed live: it succeeded even with both row
++-- triggers installed and even as a non-owner role, because TRUNCATE only
++-- requires TRUNCATE privilege on the table, not row-trigger permission.
++CREATE OR REPLACE FUNCTION block_ledger_truncate()
++RETURNS TRIGGER AS $$
++BEGIN
++    RAISE EXCEPTION 'ledger_entries is append-only: TRUNCATE not permitted';
++END;
++$$ LANGUAGE plpgsql;
++
++DROP TRIGGER IF EXISTS prevent_ledger_truncate ON ledger_entries;
++CREATE TRIGGER prevent_ledger_truncate
++BEFORE TRUNCATE ON ledger_entries
++FOR EACH STATEMENT
++EXECUTE FUNCTION block_ledger_truncate();
++
++
+ -- ============================================================================
+ -- Optional: Create a non-superuser role for the application
+ -- ============================================================================
+@@ -64,6 +86,20 @@ GRANT INSERT ON ledger_entries TO ledger_reader;
+ GRANT USAGE, SELECT ON SEQUENCE ledger_entries_id_seq TO ledger_reader;
+ 
+ -- Explicitly deny UPDATE and DELETE (defense-in-depth)
+-REVOKE UPDATE, DELETE ON ledger_entries FROM ledger_reader;
++REVOKE UPDATE, DELETE, TRUNCATE ON ledger_entries FROM ledger_reader;
+ REVOKE ALL ON SEQUENCE ledger_entries_id_seq FROM ledger_reader;
+ GRANT USAGE, SELECT ON SEQUENCE ledger_entries_id_seq TO ledger_reader;
++
++-- ============================================================================
++-- Setting the ledger_reader password
++-- ============================================================================
++-- CREATE ROLE above intentionally does not set a password inline (don't want
++-- a credential baked into a file that gets committed to version control).
++-- Set it out-of-band after applying this file, from the same
++-- ICEBERG_LEDGER_RUNTIME_PASSWORD value the app reads at startup:
++--
++--     python3 set_ledger_reader_password.py
++--
++-- (reads ICEBERG_LEDGER_RUNTIME_PASSWORD from the environment, connects as
++-- the schema-owning superuser, and issues ALTER ROLE ledger_reader WITH
++-- PASSWORD ...). Re-run it any time the password rotates.
+diff --git a/sentinel_os/load_test.py b/sentinel_os/load_test.py
+index cc19aa3..214e3ff 100755
+--- a/sentinel_os/load_test.py
++++ b/sentinel_os/load_test.py
+@@ -55,7 +55,7 @@ def run_load_test(scale_name: str):
+     print(f" {t_current:.2f}s")
+     
+     # Stage 3: Detect drift
+-    print(f"[3/4] Detecting drift...", end="", flush=True)
++    print("[3/4] Detecting drift...", end="", flush=True)
+     t0 = time.time()
+     signals = detect_drift(baseline, current_holds, DriftPolicy())
+     breached = [s for s in signals if s.breached]
+@@ -64,7 +64,7 @@ def run_load_test(scale_name: str):
+     print(f" {t_detect:.4f}s ({len(breached)} breached)")
+     
+     # Stage 4: Self-heal
+-    print(f"[4/4] Applying self-healing...", end="", flush=True)
++    print("[4/4] Applying self-healing...", end="", flush=True)
+     t0 = time.time()
+     store = InMemoryParameterStore()
+     lo, hi = validate_cassette(CassetteLoader().load_cassette("ivr")).range_value("expected_wait_bounds")
+diff --git a/sentinel_os/load_test_live.py b/sentinel_os/load_test_live.py
+index 908fb48..99df6c2 100644
+--- a/sentinel_os/load_test_live.py
++++ b/sentinel_os/load_test_live.py
+@@ -7,7 +7,6 @@ Measures latency, throughput, error rates
+ 
+ import requests
+ import time
+-import json
+ import statistics
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ import sys
+@@ -128,11 +127,11 @@ class LiveLoadTester:
+                     print(f"  Processed: {i+1}/{num_calls}")
+         
+         # Test batch
+-        print(f"\n[3/3] Testing batch endpoint...")
++        print("\n[3/3] Testing batch endpoint...")
+         self.test_batch(batch_size=10)
+         
+         # Test metrics
+-        print(f"\nTesting metrics endpoint...")
++        print("\nTesting metrics endpoint...")
+         self.test_metrics()
+         
+         return True
+diff --git a/sentinel_os/observe/TwilioSyntheticLogGenerator.py b/sentinel_os/observe/TwilioSyntheticLogGenerator.py
+index f9da055..8812e60 100644
+--- a/sentinel_os/observe/TwilioSyntheticLogGenerator.py
++++ b/sentinel_os/observe/TwilioSyntheticLogGenerator.py
+@@ -1,6 +1,5 @@
+ import json
+ import hashlib
+-import math
+ import random
+ from datetime import datetime, timedelta, timezone
+ from typing import Any, Dict, List, Optional
+diff --git a/sentinel_os/observe_perceive_core.py b/sentinel_os/observe_perceive_core.py
+index 7e233aa..62025fd 100644
+--- a/sentinel_os/observe_perceive_core.py
++++ b/sentinel_os/observe_perceive_core.py
+@@ -6,7 +6,7 @@ PERCEIVE: Infers outcomes, predicts next states, tracks world dynamics
+ """
+ 
+ from dataclasses import dataclass
+-from typing import List, Dict, Any, Optional
++from typing import List, Dict
+ from enum import Enum
+ 
+ class CallOutcome(Enum):
+diff --git a/sentinel_os/operational_resilience.py b/sentinel_os/operational_resilience.py
+index a4b4868..56ccb36 100644
+--- a/sentinel_os/operational_resilience.py
++++ b/sentinel_os/operational_resilience.py
+@@ -8,9 +8,9 @@ import logging
+ import json
+ import time
+ from functools import wraps
+-from typing import Callable, Any, Optional
++from typing import Callable, Any
+ from enum import Enum
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timezone
+ 
+ # JSON structured logging
+ class JSONFormatter(logging.Formatter):
+@@ -75,7 +75,7 @@ class CircuitBreaker:
+             result = func(*args, **kwargs)
+             self._on_success()
+             return result
+-        except Exception as e:
++        except Exception:
+             self._on_failure()
+             raise
+     
+diff --git a/sentinel_os/production_harness.py b/sentinel_os/production_harness.py
+index 208614c..864103b 100644
+--- a/sentinel_os/production_harness.py
++++ b/sentinel_os/production_harness.py
+@@ -5,24 +5,21 @@ Real Twilio → Real Prometheus → Real PostgreSQL → Real Claude → Real Gov
+ """
+ 
+ import os
+-import json
+-import sys
+-from typing import Dict, Optional
+-from datetime import datetime
++from typing import Dict
+ 
+ # Import all production components
+ from twilio_log_ingestion import TwilioLogParser, TwilioStreamAdapter
+ from metrics_prometheus import PrometheusMetrics
+ from governance.ledger_postgres import PostgreSQLLedger
+ from claude_governance_api import ClaudeGovernanceDecider
+-from observe_perceive_core import ObserveCore, synthesize_percept, EmotionalState, FrictionEvent
++from observe_perceive_core import ObserveCore, FrictionEvent
+ from sentinel_core import SentinelCore
+ from cassette_loader import CassetteLoader
+ from cassette_schema import validate_cassette
+ from governance.ledger_postgres import GovernanceDecisionRecord
+ from governance.friction_core import compute_friction
+ from queue_staffing_bayes_integration import (
+-    StaffingCoordinator, BayesianIntentEngine, QueueState
++    StaffingCoordinator, BayesianIntentEngine
+ )
+ 
+ class IcebergProductionHarness:
+@@ -380,7 +377,7 @@ def main():
+     
+     summary = harness.process_batch(mock_calls)
+     
+-    print(f"\n[RESULTS]")
++    print("\n[RESULTS]")
+     print(f"  Calls processed: {summary['calls_processed']}")
+     print(f"  Total calls: {summary['calls_total']}")
+     print(f"  Resolved: {summary['calls_resolved']}")
+@@ -390,13 +387,13 @@ def main():
+     print(f"  Governance actions: {summary['governance_actions']}")
+     
+     # Export metrics
+-    print(f"\n[PROMETHEUS METRICS]")
++    print("\n[PROMETHEUS METRICS]")
+     metrics_text = harness.export_metrics()
+     print(metrics_text[:500] + "..." if len(metrics_text) > 500 else metrics_text)
+     
+     # Verify ledger if connected
+     if harness.ledger:
+-        print(f"\n[LEDGER VERIFICATION]")
++        print("\n[LEDGER VERIFICATION]")
+         verify = harness.verify_ledger()
+         print(f"  Ledger OK: {verify.get('ok')}")
+         print(f"  Entries: {verify.get('entries', 0)}")
+diff --git a/sentinel_os/requirements.txt b/sentinel_os/requirements.txt
+index f3a748f..c8084b9 100644
+--- a/sentinel_os/requirements.txt
++++ b/sentinel_os/requirements.txt
+@@ -1,9 +1,10 @@
+-fastapi==0.104.1
++fastapi==0.139.0
++starlette>=1.0.1  # CVE-2026-48710 (BadHost) fix floor -- pinned explicitly, not just via fastapi's transitive bound
+ uvicorn==0.24.0
+ psycopg2-binary==2.9.12
+ anthropic==0.116.0
+ httpx<0.28  # anthropic 0.116.0 breaks on client construction ("unexpected keyword argument 'proxies'") with httpx>=0.28
+ pytest==7.4.0
+ numpy>=2.1,<2.9
+-pydantic==2.4.0
++pydantic>=2.9,<3  # fastapi 0.139.0 requires pydantic>=2.9.0
+ python-dotenv==1.0.0
+diff --git a/sentinel_os/resilient_harness.py b/sentinel_os/resilient_harness.py
+index cfd8fe5..43eb689 100644
+--- a/sentinel_os/resilient_harness.py
++++ b/sentinel_os/resilient_harness.py
+@@ -4,11 +4,10 @@ Resilient Harness - Production harness with error handling, logging, health chec
+ Wraps production_harness.py with operational hardening
+ """
+ 
+-import logging
+-from typing import Dict, Optional
++from typing import Dict
+ from operational_resilience import (
+     setup_logging, CircuitBreaker, retry_with_backoff,
+-    HealthChecker, GracefulDegradation
++    HealthChecker
+ )
+ from production_harness import IcebergProductionHarness
+ 
+diff --git a/sentinel_os/sentinel_core.py b/sentinel_os/sentinel_core.py
+index f4a29bb..aa1c5b8 100644
+--- a/sentinel_os/sentinel_core.py
++++ b/sentinel_os/sentinel_core.py
+@@ -4,7 +4,7 @@ Sentinel - IVR Analytics & Diagnostics Layer
+ Infers caller intent, scores quality, diagnoses abandonment, prescribes fixes
+ """
+ 
+-from dataclasses import dataclass, field
++from dataclasses import dataclass
+ from typing import List, Dict, Optional
+ from enum import Enum
+ import hashlib
+diff --git a/sentinel_os/set_ledger_reader_password.py b/sentinel_os/set_ledger_reader_password.py
+new file mode 100644
+index 0000000..ef75f04
+--- /dev/null
++++ b/sentinel_os/set_ledger_reader_password.py
+@@ -0,0 +1,40 @@
++"""Set or rotate the ledger_reader role's password.
++
++Run once after applying ledger_immutability.sql, and again any time the
++password rotates. Reads the target password from ICEBERG_LEDGER_RUNTIME_PASSWORD
++(the same env var the app's PostgreSQLLedger reads at startup) so there is a
++single source of truth for the credential -- it is never hardcoded in SQL
++that might get committed.
++
++Requires schema-owner/superuser credentials to run (POSTGRES_USER/PASSWORD),
++same as applying ledger_immutability.sql itself does.
++"""
++import os
++import sys
++import psycopg2
++
++
++def main():
++    password = os.getenv("ICEBERG_LEDGER_RUNTIME_PASSWORD")
++    if not password:
++        print("ICEBERG_LEDGER_RUNTIME_PASSWORD is not set -- nothing to do.", file=sys.stderr)
++        sys.exit(1)
++
++    conn = psycopg2.connect(
++        host=os.getenv("POSTGRES_HOST", "localhost"),
++        port=int(os.getenv("POSTGRES_PORT", "5432")),
++        dbname=os.getenv("POSTGRES_DB", "iceberg"),
++        user=os.getenv("POSTGRES_USER", "iceberg"),
++        password=os.getenv("POSTGRES_PASSWORD", "iceberg"),
++    )
++    conn.autocommit = True
++    try:
++        with conn.cursor() as cur:
++            cur.execute("ALTER ROLE ledger_reader WITH PASSWORD %s;", (password,))
++        print("ledger_reader password set.")
++    finally:
++        conn.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sentinel_os/telemetry_pipeline.py b/sentinel_os/telemetry_pipeline.py
+index 680cf55..b1b1e76 100644
+--- a/sentinel_os/telemetry_pipeline.py
++++ b/sentinel_os/telemetry_pipeline.py
+@@ -4,7 +4,7 @@ Real Telemetry Pipeline - Live metrics flow through governance
+ Captures call metrics in real-time, feeds drift detection, triggers responses
+ """
+ 
+-from dataclasses import dataclass, field
++from dataclasses import dataclass
+ from typing import Dict, List
+ from collections import defaultdict
+ import time
+diff --git a/sentinel_os/twilio_log_ingestion.py b/sentinel_os/twilio_log_ingestion.py
+index ebb47fb..3d89446 100644
+--- a/sentinel_os/twilio_log_ingestion.py
++++ b/sentinel_os/twilio_log_ingestion.py
+@@ -7,7 +7,6 @@ Converts actual Twilio call records into Iceberg call journeys with real frictio
+ import json
+ from typing import List, Dict, Optional
+ from dataclasses import dataclass
+-from datetime import datetime
+ from cassette_schema import validate_cassette
+ 
+ @dataclass

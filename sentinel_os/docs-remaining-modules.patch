@@ -1,0 +1,332 @@
+From 198cf467cbb455025cae497d7f4219c7680167bb Mon Sep 17 00:00:00 2001
+From: Claude <claude@anthropic.com>
+Date: Fri, 24 Jul 2026 02:09:33 +0000
+Subject: [PATCH] Document the last 5 undocumented module directories
+
+Closes the remaining repo-hygiene item from July 22: only governance/,
+cassettes/, and regulatory_cassettes/ had READMEs; Domain/, Engines/,
+Model/, Sim/, observe/ did not.
+
+All five turned out to be used only by the standalone simulator
+(iceberg_complete_simulator.py) and its tests -- confirmed by grepping
+for actual importers before writing anything, not assumed. The
+production governance path (production_harness.py, sentinel_worker.py,
+api_server*.py) does not import from any of them; each README says so
+up front rather than leaving the reader to guess.
+
+Content is derived directly from reading the code, not from the
+existing in-file docstrings, which lean heavily on unverified
+'Best-in-Class'/'deterministic'/'governance-safe' marketing language.
+Where a docstring's claim didn't hold up against the actual
+implementation, the README says so rather than repeating it:
+
+- Engines/README.md: rl_ppo_adaptive.py's PPORouter doesn't implement
+  PPO despite the name and docstring -- no clipped surrogate objective,
+  no advantage estimation, no training loop at all. It's a fixed,
+  untrained random policy with a deterministic wait-time adjustment.
+  simple_rl_trainer.py is the one that actually trains (REINFORCE-style
+  with a value baseline).
+- Sim/README.md: cluster_runner.py's run_batch() docstring claims
+  deterministic ordering via stable future completion -- collects via
+  concurrent.futures.as_completed(), which yields in actual completion
+  order, not a guaranteed-stable one. Noted as a real correctness
+  caveat for anyone relying on output order, with the actual fix (sort
+  by caller_id after collection) if that matters.
+- Model/README.md: surfaces Build_Graph.py's own in-file review notes
+  (mutable GraphNode.neighbors, no topology versioning, no cycle
+  detection) rather than re-deriving or silently dropping them.
+
+Also added a pointer to these five directories in the top-level
+README.md's code-navigation section, which listed governance/ etc. but
+had no mention of the simulator's supporting modules at all.
+
+No code touched -- documentation only. Tests/test_graph_integrity.py
+and Tests/test_system_readiness.py (the two files most directly
+exercising this code) still pass, confirming nothing about the actual
+behavior was changed by writing these.
+
+Base: ledger-boot-and-ci-gates (77b7589), itself unmodified.
+---
+ sentinel_os/Domain/README.md  | 44 +++++++++++++++++++++++++
+ sentinel_os/Engines/README.md | 41 ++++++++++++++++++++++++
+ sentinel_os/Model/README.md   | 37 +++++++++++++++++++++
+ sentinel_os/README.md         |  4 +++
+ sentinel_os/Sim/README.md     | 40 +++++++++++++++++++++++
+ sentinel_os/observe/README.md | 60 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 226 insertions(+)
+ create mode 100644 sentinel_os/Domain/README.md
+ create mode 100644 sentinel_os/Engines/README.md
+ create mode 100644 sentinel_os/Model/README.md
+ create mode 100644 sentinel_os/Sim/README.md
+ create mode 100644 sentinel_os/observe/README.md
+
+diff --git a/sentinel_os/Domain/README.md b/sentinel_os/Domain/README.md
+new file mode 100644
+index 0000000..6cb0e68
+--- /dev/null
++++ b/sentinel_os/Domain/README.md
+@@ -0,0 +1,44 @@
++# Domain/
++
++Canonical state-representation types for the standalone simulator
++(`iceberg_complete_simulator.py`) and its supporting RL/routing engines
++(`Engines/`, `Model/`, `Sim/`). Not used by the production governance path
++(`production_harness.py`, `sentinel_worker.py`, `api_server*.py`) --
++that path has its own request/decision types and doesn't import from here.
++
++## Files
++
++- **`CallerState.py`** -- `CallerState` (a caller's intent, emotion,
++  Bayesian posterior over intents, and per-step `DynamicState`: perceived
++  wait, frustration) and `DynamicState`. Plain dataclasses; mutated only
++  by simulator step updates, never by these classes themselves.
++  `snapshot()`/`to_dict()` are JSON-safe serializations for telemetry.
++
++- **`Emotion.py`** -- `Emotion` enum: `NEUTRAL`, `IMPATIENT`,
++  `FRUSTRATED`, `ANGRY` (values 0-3, fixed order). Used as the emotion
++  axis of `CallerState` and as an RL input feature (`Engines/rl_ppo_adaptive.py`
++  one-hot encodes it via `encode_state`).
++
++- **`Intent.py`** -- `Intent` enum: `BILLING`, `TECH_SUPPORT`, `CANCEL`,
++  `UPGRADE`, `COMPLAINT`, `SALES`, `GENERAL`, `OTHER` (values 0-7, fixed
++  order). Same role as `Emotion.py`: routing/RL input feature and
++  `CallerState`'s intent axis.
++
++- **`QueueState.py`** -- `QueueState`: one queue's operational metrics
++  (`active_calls`, `staffing`, `target_service_level`,
++  `abandonment_rate`). `apply_delta()`/`update_active_calls()` both clamp
++  at zero (staffing and queue depth can't go negative). Updated by
++  `Sim/Simulator.py` and the staffing RL trainer.
++
++## What these are, and aren't
++
++Plain dataclasses/enums with no side effects and no dependency on the
++governance/ledger machinery. `Emotion`/`Intent` guarantee a fixed
++enumeration order (the ordinal value backing `.list()`/`.index()`, used
++for one-hot encoding) -- that ordering is a real invariant other code
++depends on for replay consistency, not just documentation flavor.
++
++`Build_Graph.py` (in `Model/`, not here) already lists several concrete
++gaps in the code's own review notes -- mutable `GraphNode.neighbors`,
++no topology version identifier -- worth reading if you're touching graph
++construction; nothing analogous is currently flagged in this directory.
+diff --git a/sentinel_os/Engines/README.md b/sentinel_os/Engines/README.md
+new file mode 100644
+index 0000000..8a0af86
+--- /dev/null
++++ b/sentinel_os/Engines/README.md
+@@ -0,0 +1,41 @@
++# Engines/
++
++Two small, self-contained RL implementations used by the standalone
++simulator. Neither reads from or writes to the governance ledger --
++they train against synthetic reward signals within a simulator run,
++nothing more.
++
++## Files
++
++- **`rl_ppo_adaptive.py`** -- `PPORouter`: a stateless, cached-weight
++  routing policy. `choose_action(caller, node_id)` encodes the caller's
++  intent/emotion/dynamic-state one-hot, runs it through a cached random
++  projection (`_get_weights`, keyed by `(rows, cols, seed)` so the same
++  shape+seed always gets the same weights), applies a small wait-time
++  penalty per candidate next-node, and returns the argmax action plus
++  its log-probability. "PPO" in the name is aspirational relative to the
++  current implementation: there's no clipped surrogate objective, no
++  advantage estimation, no training loop here at all -- this is a fixed,
++  untrained random policy with a deterministic wait-time adjustment
++  layered on top, not a trained PPO agent. `PPOConfig.seed_policy` /
++  `seed_value` (both `815`) fix the weights, so runs are reproducible.
++
++- **`simple_rl_trainer.py`** -- `SimpleRLTrainer`: an actual (if
++  minimal) policy-gradient trainer -- REINFORCE-style with a value
++  baseline, not PPO's clipped objective either, but this one does learn:
++  `collect_trajectory()` records (state, action, reward, done) tuples,
++  `update_weights()` computes discounted returns, normalizes them,
++  and applies a plain gradient-descent update to both the policy and
++  value weight matrices. `seed` is threaded through a single
++  `np.random.default_rng(seed)` call that initializes both weight
++  matrices -- worth knowing if you're reading the git history, since an
++  earlier version re-seeded from the unseeded global RNG two lines
++  later, which silently made the `seed` parameter dead (passing the same
++  seed twice produced two different policies). Fixed; the current
++  version is genuinely seed-reproducible.
++
++## Naming note
++
++Despite the filename, `rl_ppo_adaptive.py`'s `PPORouter` doesn't
++actually implement PPO (see above) -- if you're looking for the file
++that trains something, that's `simple_rl_trainer.py`.
+diff --git a/sentinel_os/Model/README.md b/sentinel_os/Model/README.md
+new file mode 100644
+index 0000000..e653db9
+--- /dev/null
++++ b/sentinel_os/Model/README.md
+@@ -0,0 +1,37 @@
++# Model/
++
++The routing graph topology for the standalone simulator
++(`iceberg_complete_simulator.py`). One file, one job: build and validate
++the fixed node/edge structure calls route through.
++
++## Files
++
++- **`Build_Graph.py`** -- `GraphNode`, `RoutingGraph`, `GraphBuilder`
++  (fluent builder), and `build_graph()`, which constructs the actual
++  topology used: `root -> intent_menu -> {billing,tech,cancel,upgrade,
++  complaint,sales,general}_queue -> {same}_agent -> exit`. `RoutingGraph.validate()`
++  checks every neighbor reference resolves to a real node and raises on
++  a dangling edge -- called automatically at the end of `GraphBuilder.build()`,
++  so a malformed topology never reaches the simulator.
++
++## Disclosed gaps (from the file's own review notes, not re-derived here)
++
++`Build_Graph.py` documents several unresolved items directly in-file
++rather than leaving them silent:
++
++- `GraphNode.neighbors` is a plain mutable `list`, not frozen -- nothing
++  stops a caller from mutating it after construction, which would be a
++  replay-safety risk if anything downstream ever did that (nothing
++  currently does).
++- `validate()` only checks forward references (node -> neighbor exists),
++  not reverse-edge consistency or orphaned nodes.
++- No topology version identifier, so two `RoutingGraph` instances can't
++  be compared for "same topology" without a manual field-by-field diff.
++- No cycle detection (cycles are valid for IVR menus generally, but
++  currently unmonitored -- a misconfigured graph could route a caller
++  in circles with nothing to flag it).
++
++None of these are correctness failures in the topology this file
++actually builds (which is acyclic and fully connected); they're gaps
++that would matter if `build_graph()`'s hardcoded topology were ever
++replaced with a data-driven or user-editable one.
+diff --git a/sentinel_os/README.md b/sentinel_os/README.md
+index f08e3e7..3f82afc 100644
+--- a/sentinel_os/README.md
++++ b/sentinel_os/README.md
+@@ -152,6 +152,10 @@ python3 sentinel_os/iceberg_complete_simulator.py
+ - **Analytics:** `sentinel_os/observe_perceive_core.py`
+ - **Operations:** `sentinel_os/queue_staffing_bayes_integration.py`
+ - **API Server:** `sentinel_os/api_server.py`
++- **Standalone simulator's supporting modules:** `sentinel_os/Domain/`,
++  `Engines/`, `Model/`, `Sim/`, `observe/` (each has its own README) --
++  used only by `iceberg_complete_simulator.py` and its tests, not by the
++  production governance path above.
+ 
+ ---
+ 
+diff --git a/sentinel_os/Sim/README.md b/sentinel_os/Sim/README.md
+new file mode 100644
+index 0000000..b752dd9
+--- /dev/null
++++ b/sentinel_os/Sim/README.md
+@@ -0,0 +1,40 @@
++# Sim/
++
++The simulator's execution loop: one caller's single step, and running
++many callers in parallel.
++
++## Files
++
++- **`Simulator.py`** -- `Simulator.step(caller, start_node)`: the fixed
++  per-step pipeline -- routing decision, then (if a `governance` object
++  is attached) the routing decision is passed through it, then a
++  staffing proposal, a Bayesian intent-posterior update, the queue
++  transition, and latent-state evolution -- in that order, every step.
++  Raises `RuntimeError` past `max_steps` (default 815) as a hard loop
++  guard. Returns a structured telemetry packet (caller id, intent,
++  emotion, routing/staffing/bayes output, `next_node`) rather than
++  mutating the caller in place.
++
++- **`cluster_runner.py`** -- `ClusterRunner`: runs a batch of callers
++  through `Simulator.step` concurrently (`ThreadPoolExecutor`,
++  default 8 workers). `run_batch()` submits every caller in the batch
++  and collects results; `run_episode()` wraps `run_batch()` for RL
++  callers that want one structured episode return instead of a bare
++  list. `_run_single()` does the actual per-caller work and telemetry
++  recording; `ClusterRunner` itself holds no state beyond its
++  `simulator`/`telemetry` handles.
++
++## One correction to the code's own claim
++
++`run_batch()`'s docstring says "deterministic ordering: futures
++completed in stable order." That's not accurate as written: it collects
++results via `concurrent.futures.as_completed(futures)`, which yields
++futures in actual **completion** order, not submission order --
++real thread-scheduling timing, not something pinned to be stable run to
++run. In practice, with this simulator's uniformly fast per-caller work,
++completion order will often track submission order closely, but that's
++an artifact of the work being fast and uniform, not a guarantee the code
++makes. If `run_batch()`'s output order needs to be genuinely
++deterministic (e.g. for replay-exact comparisons), sort results by
++`caller_id` (or another stable batch-provided key) after collection
++rather than relying on completion order.
+diff --git a/sentinel_os/observe/README.md b/sentinel_os/observe/README.md
+new file mode 100644
+index 0000000..dcf4fcf
+--- /dev/null
++++ b/sentinel_os/observe/README.md
+@@ -0,0 +1,60 @@
++# observe/
++
++Synthetic call-log generation and friction-signal derivation for testing
++and the standalone simulator. Generates fake call traces that look like
++real Twilio webhook events, and converts raw call-event traces into
++per-hop friction signals.
++
++## Files
++
++- **`IngestAdapter.py`**
++  - `generate_synthetic_call(call_id, journey, rng, friction_profile)` --
++    builds a raw event trace (`call_start` / `menu_reached` / `hold_start`
++    / `hold_end` / `call_end`) for one call walking a given node
++    `journey`. `friction_profile` injects a specific failure shape:
++    `"clean"` (no friction), `"hangup"` (truncates the journey early),
++    `"overrun"` (one node's dwell time is 4x the expected value),
++    `"revisit"` (backtracks to a previous node mid-journey, i.e. the
++    caller got bounced back). Hold events are injected probabilistically
++    (30% chance per node) regardless of profile.
++  - `derive_stimuli(events, resolution_nodes, handoff_nodes, ...)` --
++    the reverse direction: takes a raw event trace and derives, per
++    menu node visited, whether that hop showed friction (`revisit` or
++    `overrun` past `dwell_anomaly_seconds`), actual vs. expected wait,
++    and whether the node counts as resolved. Returns a `DerivedCall`
++    (frozen dataclass: `call_id`, `route`, `stimuli_by_hop`,
++    `final_outcome_hint` -- `"success"` if the call's last node is in
++    `resolution_nodes`/`handoff_nodes`, else `"abandonment"`).
++    `hold_between()` correctly handles hold segments that only
++    partially overlap a queried time window (clips to the window, not
++    just an all-or-nothing overlap check).
++
++- **`TwilioSyntheticLogGenerator.py`** -- wraps `IngestAdapter.generate_synthetic_call`
++  to produce output shaped like real Twilio webhook events (`CallSid`,
++  `AccountSid`, status-callback event types like `initiated`/`queued`/
++  `dequeued`/`completed`) rather than the internal event format.
++  `generate_twilio_population(n_calls, seed, journeys)` generates a
++  full day's synthetic call population (default journeys: `billing`,
++  `claims`, `pharmacy`, each a fixed node path) spread across a
++  configurable business-hours window (`BUSINESS_OPEN_S`/`BUSINESS_CLOSE_S`,
++  default 08:00-20:00), and returns it as JSONL sorted by
++  `(timestamp, CallSid, SequenceNumber)`. Every ID (`CallSid`,
++  `AccountSid`, phone number) is deterministically derived from the
++  seed via SHA-256, not randomly generated -- same seed always
++  reproduces the identical population, byte for byte.
++  `load_twilio_jsonl(text)` is the matching reader: parses the JSONL
++  back into a `{CallSid: [events]}` dict.
++
++## Relationship to the two files
++
++`TwilioSyntheticLogGenerator.py` imports and wraps `IngestAdapter.generate_synthetic_call`
++directly (`from IngestAdapter import generate_synthetic_call`) -- it's a
++presentation layer on top of `IngestAdapter`'s internal event format, not
++an independent generator. `derive_stimuli` is the only consumer-facing
++function that goes the other direction (events -> friction signals); it
++is not currently wired to `TwilioSyntheticLogGenerator`'s output format
++in this directory -- a caller wanting friction stimuli from realistic
++Twilio-shaped JSONL would need to convert via `load_twilio_jsonl` first
++and reconstruct `IngestAdapter`'s internal event shape, since the two
++formats differ (Twilio event types vs. the internal `call_start`/
++`menu_reached`/etc. vocabulary `derive_stimuli` expects).
+-- 
+2.43.0
+

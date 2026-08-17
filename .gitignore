@@ -1,5 +1,15 @@
+# Generated
 __pycache__/
 *.pyc
 .env
 .venv/
 *.db
+# Node
+node_modules/
+# OS
+.DS_Store
+Thumbs.db
+# Logs
+*.log
+# Jupyter
+.ipynb_checkpoints/

@@ -1,0 +1,15 @@
+-- KEYS[1]=job hash, KEYS[2]=pending list
+-- ARGV[1]=job_id ARGV[2]=payload_json ARGV[3]=max_attempts
+-- Idempotent on job_id: an existing job is NEVER reset or re-queued.
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  local st = redis.call('HGET', KEYS[1], 'status')
+  return {'deduped', st}
+end
+redis.call('HSET', KEYS[1],
+  'job_id', ARGV[1], 'payload', ARGV[2], 'status', 'pending',
+  'attempts', 0, 'max_attempts', ARGV[3],
+  'created_at', now, 'updated_at', now, 'error_trail', '[]')
+redis.call('RPUSH', KEYS[2], ARGV[1])
+return {'enqueued', 'pending'}

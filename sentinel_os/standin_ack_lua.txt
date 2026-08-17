@@ -1,0 +1,13 @@
+-- KEYS[1]=processing zset, KEYS[2]=done counter
+-- ARGV[1]=job_id ARGV[2]=claim_token ARGV[3]=result_json('' = none) ARGV[4]=job key prefix
+-- Fenced: a stale claim_token (job reaped + re-claimed) cannot ack.
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local jk = ARGV[4] .. ARGV[1]
+if redis.call('HGET', jk, 'claim_token') ~= ARGV[2] then return 0 end
+if redis.call('HGET', jk, 'status') ~= 'processing' then return 0 end
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('HSET', jk, 'status', 'done', 'completed_at', now, 'updated_at', now)
+if ARGV[3] ~= '' then redis.call('HSET', jk, 'result', ARGV[3]) end
+redis.call('INCR', KEYS[2])
+return 1

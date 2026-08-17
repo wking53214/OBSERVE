@@ -1,0 +1,17 @@
+Rewrite AUDIT_PLAYBOOK.md: disclose H3/H4/H5 tamper-evidence limits, fix broken column refs
+
+- Replace the unqualified "verify chain integrity" framing with an honest
+  account of what verify_chain() does and doesn't cover: chain-link and
+  content-hash checks over a specific canonical form that excludes id,
+  timestamp, call_sid, and cassette_snapshot. Add runnable repro SQL for
+  H3 (full rewrite verifies clean), H4 (forged cassette_snapshot passes
+  verify_chain, only validate_cassette_snapshot_chain catches it), and H5
+  (full wipe verifies clean, entries=0).
+- Fix two systemic broken-column bugs (created_at -> timestamp, output ->
+  decision_output) across the fail-closed, intent, cassette, error-handling,
+  bias, traceability, and retention checks -- every affected query would
+  have errored against the live schema.
+- Add the previously-unreferenced validate_cassette_snapshot_chain() check,
+  a Regulator Q&A section, and the Witness (Phase 2) roadmap; remove
+  unsupported claims ("Estimated accuracy: 99.99%", "no further
+  investigation needed").

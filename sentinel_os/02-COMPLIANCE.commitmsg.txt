@@ -1,0 +1,20 @@
+Rewrite COMPLIANCE.md: add Known Limitations, correct tamper-evidence/TCPA overclaims
+
+- Add a "Known Limitations" section (required by D1, previously absent) and
+  qualify the tamper-evidence, cassette-version, cassette-hash, and
+  human-override claims to match confirmed findings (H2/H3/H4/H5/F-H);
+  add a checkmark legend (verified / qualified / not shipped) since a flat
+  checkmark no longer distinguished those three states.
+- Rewrite the TCPA section: confirmed zero dialer, consent, outbound, or
+  do-not-call code exists anywhere in the codebase. Reframed from "✅
+  compliance" to "architectural fit, not shipped" -- the section's own
+  verification line already admitted this ("auditors should create a
+  tcpa_compliance_cassette.py") while the checkmarks above it asserted
+  the opposite.
+- Correct the human-override claim (no reversal mechanism exists in code)
+  and the database-unavailable claim (no in-memory buffer exists; write
+  failures surface as a structured failure per the already-shipped R-2
+  fix, not a silent flush); remove two unsupported time estimates; remap
+  all AUDIT_PLAYBOOK.md section cross-references to its new structure,
+  including one (the bias-section pointer) that was already wrong before
+  this rewrite.

@@ -3,6 +3,34 @@
 Dated, human-readable summary of notable changes. Git history has the
 full detail; this is the skim version.
 
+## 2026-08-27
+
+- **Resilience-candidate assessment + findings fixed** — the "URE /
+  IntegratedResilienceOrchestrator" candidate was investigated and
+  **rejected** (another, weaker implementation of capabilities OBSERVE
+  already has; see `RESILIENCE_INTEGRATION_ASSESSMENT.md`). Three fixes
+  the investigation surfaced were applied:
+  - **Canonical source adopted.** `observe_consolidated.py` is now an
+    OBSERVE-owned file at the repo root (was only a vendored copy under
+    `sentinel_os/`). The flattened, non-parsing
+    `observe_clinical_risk_source.py` is retired to `.broken`.
+  - **Input validation restored (T-2/T-6).** The consolidated engine did
+    NO vital validation — a `NaN`/out-of-range vital fused to a confident
+    `STABLE`. `validate_vitals` + `VITALS_PHYSICAL_BOUNDS` ported back
+    from the retired source; `evaluate()` now returns a `WARNING` verdict
+    carrying `validation_faults` (never `STABLE`) and audits the
+    rejection.
+  - **Parameter-set provenance (I-3).** Calibration constants are hoisted
+    to a named surface and declared in `PARAMETER_SET`;
+    `PARAMETER_SET_VERSION` (its SHA-256) is stamped on every
+    `FusedVerdict` and folded into every audit entry.
+    `compute_decision_fingerprint()` gives a deterministic, wall-clock-free
+    decision hash for replay / drift detection.
+  - New `test_observe_invariants.py` — 23 property tests (OBSERVE's first
+    repo-owned invariant suite) locking out the candidate's failure modes.
+    Full: 99 passed (76 existing + 23 new); vendored `sentinel_os` suite
+    still 82 passed.
+
 ## 2026-07-24
 
 - **C2 dimension 4: statistical outcome-equity** — the fourth C2

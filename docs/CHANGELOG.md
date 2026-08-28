@@ -3,6 +3,34 @@
 Dated, human-readable summary of notable changes. Git history has the
 full detail; this is the skim version.
 
+## 2026-08-28
+
+- **Resilience-fix review round.** Code review of the 2026-08-27 change
+  found the validation gate was too blunt. Reworked:
+  - A faulted channel is now **masked** to a non-alerting value and the
+    remaining channels are still assessed — a `NaN` SpO2 no longer
+    suppresses a real `HR=210`.
+  - The fault is overlaid as a **WARNING floor that never downgrades**
+    the patient's tracked regime (a sensor dropout on a CRITICAL patient
+    stays CRITICAL), routes escalation through the 300 s cooldown (no
+    page-storm on a flapping lead), and floors `risk_score` to match the
+    forced regime (an unassessable patient can't be sorted to the bottom
+    of a risk-ranked ward).
+  - `VITALS_PHYSICAL_BOUNDS` widened to sensor-plausibility only —
+    clinically extreme but real values (profound hypothermia ~20 °C,
+    infant SVT ~300 bpm) are assessed, not rejected.
+  - `compute_decision_fingerprint()` is now **called by `evaluate()`** and
+    stored on the verdict and in the audit entry (it was defined but
+    unwired). New `FusedVerdict` fields: `decision_fingerprint`,
+    `unassessable`.
+  - `EscalationPolicy` is constructed with the declared
+    `ESCALATION_*` constants explicitly; the `PARAMETER_SET` scope note
+    now states what the version does and does not attest.
+  - `test_observe_invariants.py` grew from 23 to 33 tests (added
+    fault-overlay safety, fingerprint persistence, manifest/constant
+    wiring, and a root ↔ `sentinel_os/` byte-sync guard). Full: 109 root
+    pass, 152 vendored observe/perceive pass.
+
 ## 2026-08-27
 
 - **Resilience-candidate assessment + findings fixed** — the "URE /

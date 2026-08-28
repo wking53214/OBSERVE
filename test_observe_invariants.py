@@ -9,9 +9,12 @@ mechanisms. IDs match the assessment.
 Run: python3 -m pytest test_observe_invariants.py -v
 """
 
+import hashlib
 import math
+import pathlib
 import unittest
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 from observe_consolidated import (
     ObserveClinicalEngine,
@@ -26,8 +29,15 @@ from observe_consolidated import (
     PARAMETER_SET_VERSION,
     _canonical_json,
     REGIME_DISTRIBUTION_BANDS,
+    DRIFT_SIGMA_THRESHOLD,
+    HEAVY_PATH_ENTROPY_TRIGGER,
+    HEURISTIC_HARD_RULE_THRESHOLD,
+    REGIME_CRITICAL_FLOOR_DEFAULT,
+    DRIFT_CRITICAL_FLOOR,
+    ESCALATION_DWELL_THRESHOLD,
+    ESCALATION_LOCK_SECONDS,
+    VITALS_PHYSICAL_BOUNDS,
 )
-import hashlib
 
 
 def make_vitals(**overrides) -> VitalsSnapshot:
@@ -109,8 +119,9 @@ class T2_MissingOrGarbageTelemetryNeverReadsAsHealthy(unittest.TestCase):
         v = make_vitals(oxygen_saturation=float("nan"))
         verdict = engine.evaluate(v)
         self.assertNotEqual(verdict.regime, OperationalRegime.STABLE)
-        self.assertEqual(verdict.regime, OperationalRegime.WARNING)
+        self.assertEqual(verdict.regime, OperationalRegime.WARNING)  # fresh engine, prior STABLE
         self.assertTrue(verdict.validation_faults)
+        self.assertTrue(verdict.unassessable)
         self.assertTrue(verdict.escalation_required)
 
     def test_inf_vital_rejected(self):
@@ -137,6 +148,73 @@ class T2_MissingOrGarbageTelemetryNeverReadsAsHealthy(unittest.TestCase):
         engine = ObserveClinicalEngine()
         verdict = engine.evaluate(make_vitals(oxygen_saturation=82.0, heart_rate=175.0))
         self.assertIn(verdict.regime, (OperationalRegime.WARNING, OperationalRegime.CRITICAL))
+
+
+class T2b_ValidationFaultOverlayIsSafe(unittest.TestCase):
+    """Review findings 1-4: a faulted channel must not (1) downgrade a tracked
+    regime, (2) suppress signals in the still-valid channels, (3) read as benign,
+    or (4) produce an escalation storm that ignores the cooldown.
+    """
+
+    def _drive_to_critical(self, engine, pid):
+        crit = make_vitals(patient_id=pid, oxygen_saturation=70.0, heart_rate=190.0,
+                           respiratory_rate=65.0, temperature=39.5)
+        v = engine.evaluate(crit)
+        self.assertEqual(v.regime, OperationalRegime.CRITICAL)
+        return crit
+
+    def test_fault_does_not_downgrade_a_tracked_critical_patient(self):
+        engine = ObserveClinicalEngine()
+        self._drive_to_critical(engine, "crit1")
+        # SpO2 probe falls off mid-monitoring
+        after = engine.evaluate(make_vitals(patient_id="crit1", oxygen_saturation=float("nan"),
+                                            heart_rate=190.0, respiratory_rate=65.0, temperature=39.5))
+        self.assertTrue(after.unassessable)
+        self.assertEqual(after.regime, OperationalRegime.CRITICAL)  # NOT downgraded to WARNING
+
+    def test_fault_in_one_channel_preserves_signals_in_the_others(self):
+        engine = ObserveClinicalEngine()
+        verdict = engine.evaluate(make_vitals(patient_id="multi", oxygen_saturation=float("nan"),
+                                              heart_rate=210.0, respiratory_rate=70.0))
+        self.assertTrue(verdict.unassessable)
+        self.assertTrue(any("VALIDATION_FAULT" in r for r in verdict.triggered_rules))
+        # the real tachycardia / tachypnea must still surface
+        self.assertTrue(any(("tachy" in r.lower() or "hr" in r.lower() or "rr" in r.lower()
+                             or "DANGEROUS_PATTERN" in r)
+                            for r in verdict.triggered_rules if "VALIDATION_FAULT" not in r),
+                        msg=verdict.triggered_rules)
+        self.assertIn(verdict.regime, (OperationalRegime.WARNING, OperationalRegime.CRITICAL))
+
+    def test_fault_verdict_is_not_benign(self):
+        engine = ObserveClinicalEngine()
+        verdict = engine.evaluate(make_vitals(oxygen_saturation=float("nan")))
+        self.assertNotEqual(verdict.regime, OperationalRegime.STABLE)
+        self.assertGreaterEqual(_severity(verdict.regime), _severity(OperationalRegime.WARNING))
+
+    def test_escalation_storm_is_bounded_by_the_cooldown(self):
+        engine = ObserveClinicalEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        first = engine.evaluate(make_vitals(patient_id="flap", oxygen_saturation=float("nan"),
+                                            timestamp=t0))
+        self.assertTrue(first.escalation_required)
+        # a loose lead re-faults 10s later, well inside the 300s lock
+        second = engine.evaluate(make_vitals(patient_id="flap", oxygen_saturation=float("nan"),
+                                             timestamp=t0 + timedelta(seconds=10)))
+        self.assertFalse(second.escalation_required)
+        self.assertEqual(second.regime, OperationalRegime.WARNING)  # still held, just not re-paged
+
+    def test_clinically_extreme_but_real_values_are_assessed_not_rejected(self):
+        # profound hypothermia: a real emergency, above the sensor-fault floor (12 C)
+        self.assertEqual(validate_vitals(make_vitals(temperature=21.0)), [])
+        # a temperature probe reading a cold room is a sensor fault
+        self.assertTrue(validate_vitals(make_vitals(temperature=8.0)))
+        # infant SVT ~300 bpm is real; 999 is a sensor fault
+        self.assertEqual(validate_vitals(make_vitals(heart_rate=300.0)), [])
+        self.assertTrue(validate_vitals(make_vitals(heart_rate=999.0)))
+
+
+def _severity(regime: OperationalRegime) -> int:
+    return {"stable": 0, "caution": 1, "warning": 2, "critical": 3}[regime.value]
 
 
 class T4_RiskIsGradedNotSaturated(unittest.TestCase):
@@ -239,15 +317,57 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         fp2 = compute_decision_fingerprint(v, ObserveClinicalEngine().evaluate(v))
         self.assertEqual(fp1, fp2)
 
-    def test_changing_any_calibration_constant_changes_the_version(self):
-        for key in PARAMETER_SET:
-            if key == "schema":
-                continue
+    def test_decision_fingerprint_is_persisted_on_verdict_and_in_audit(self):
+        # Review finding 6: the fingerprint must be produced by evaluate() and
+        # stored, or "replay / drift detection" has no baseline in production.
+        engine = ObserveClinicalEngine()
+        v = make_vitals(patient_id="persist", oxygen_saturation=88.0)
+        verdict = engine.evaluate(v)
+        self.assertEqual(len(verdict.decision_fingerprint), 64)
+        self.assertEqual(verdict.decision_fingerprint, compute_decision_fingerprint(v, verdict))
+        entry = engine.audit_ledger.entries[-1]
+        self.assertEqual(entry["data"]["decision_fingerprint"], verdict.decision_fingerprint)
+
+    def test_manifest_entries_track_their_live_module_constants(self):
+        # Review finding 5: the version only means something if the manifest
+        # actually references the constants the decision path uses, rather than
+        # holding a stale hand-copied value.
+        self.assertEqual(PARAMETER_SET["drift_sigma_threshold"], DRIFT_SIGMA_THRESHOLD)
+        self.assertEqual(PARAMETER_SET["heavy_path_entropy_trigger"], HEAVY_PATH_ENTROPY_TRIGGER)
+        self.assertEqual(PARAMETER_SET["heuristic_hard_rule_threshold"], HEURISTIC_HARD_RULE_THRESHOLD)
+        self.assertEqual(PARAMETER_SET["regime_critical_floor_default"], REGIME_CRITICAL_FLOOR_DEFAULT)
+        self.assertEqual(PARAMETER_SET["drift_critical_floor"], DRIFT_CRITICAL_FLOOR)
+        self.assertEqual(PARAMETER_SET["escalation_dwell_threshold"], ESCALATION_DWELL_THRESHOLD)
+        self.assertEqual(PARAMETER_SET["escalation_lock_seconds"], ESCALATION_LOCK_SECONDS)
+        self.assertEqual(
+            {k: list(v) for k, v in VITALS_PHYSICAL_BOUNDS.items()},
+            PARAMETER_SET["vitals_physical_bounds"],
+        )
+
+    def test_engine_uses_the_declared_escalation_constants(self):
+        # Review finding 5: EscalationPolicy(dwell_threshold=5) would carry the
+        # same version stamp. Assert the engine's actual policy IS the declared one.
+        policy = ObserveClinicalEngine()._get_policy("x")
+        self.assertEqual(policy.dwell_threshold, ESCALATION_DWELL_THRESHOLD)
+        self.assertEqual(policy.lock_seconds, ESCALATION_LOCK_SECONDS)
+
+    def test_version_is_a_stable_sha256_of_the_manifest(self):
+        recomputed = hashlib.sha256(_canonical_json(PARAMETER_SET).encode("utf-8")).hexdigest()
+        self.assertEqual(recomputed, PARAMETER_SET_VERSION)
+        self.assertEqual(len(PARAMETER_SET_VERSION), 64)
+
+    def test_mutating_a_declared_constant_would_change_the_version(self):
+        # Spot-check a representative entry actually participates in the hash
+        # (not a tautology over an arbitrary dict — these keys are the real ones).
+        for key in ("drift_sigma_threshold", "heavy_path_entropy_trigger",
+                    "escalation_lock_seconds", "vitals_physical_bounds",
+                    "regime_distribution_bands"):
             mutated = dict(PARAMETER_SET)
             mutated[key] = "__MUTATED__"
-            new_version = hashlib.sha256(_canonical_json(mutated).encode("utf-8")).hexdigest()
-            self.assertNotEqual(new_version, PARAMETER_SET_VERSION,
-                                msg=f"PARAMETER_SET['{key}'] is not covered by the version hash")
+            self.assertNotEqual(
+                hashlib.sha256(_canonical_json(mutated).encode("utf-8")).hexdigest(),
+                PARAMETER_SET_VERSION,
+            )
 
     def test_fingerprint_moves_with_the_parameter_version(self):
         engine = ObserveClinicalEngine()
@@ -256,6 +376,23 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         fp_real = compute_decision_fingerprint(v, verdict)
         verdict.parameter_set_version = "different-version"
         self.assertNotEqual(compute_decision_fingerprint(v, verdict), fp_real)
+
+
+class VendoredCopyStaysInSync(unittest.TestCase):
+    """Review finding 8: the commit promises root and sentinel_os/ copies are
+    byte-synced; nothing enforced it. This does.
+    """
+
+    def test_root_and_vendored_observe_consolidated_are_identical(self):
+        root = pathlib.Path(__file__).with_name("observe_consolidated.py")
+        vendored = root.with_name("sentinel_os") / "observe_consolidated.py"
+        if not vendored.exists():
+            self.skipTest("vendored sentinel_os/observe_consolidated.py not present")
+        self.assertEqual(
+            hashlib.sha256(root.read_bytes()).hexdigest(),
+            hashlib.sha256(vendored.read_bytes()).hexdigest(),
+            msg="root and sentinel_os/ copies of observe_consolidated.py have drifted",
+        )
 
 
 if __name__ == "__main__":

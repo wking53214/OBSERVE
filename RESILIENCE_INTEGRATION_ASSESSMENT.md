@@ -617,16 +617,26 @@ Three findings were fixed on branch `fix/resilience-assessment-findings`
 | Finding | Change | Files |
 |---|---|---|
 | **G-2** canonical source | `observe_consolidated.py` + `test_observe_consolidated.py` promoted to repo root as OBSERVE-owned; flattened `observe_clinical_risk_source.py` retired to `.broken`. Vendored `sentinel_os/observe_consolidated.py` kept in sync. | root (new), `observe_clinical_risk_source.py.broken` |
-| **T-2 / T-6** input validation | `VITALS_PHYSICAL_BOUNDS` + `validate_vitals()` ported back from the retired source. `ObserveClinicalEngine.evaluate()` gates on it: a non-finite / out-of-range vital returns a `WARNING` verdict carrying `validation_faults` (never `STABLE`), and is written to the audit ledger as `clinical_assessment_rejected`. | `observe_consolidated.py` |
-| **I-3** parameter provenance | Buried calibration literals hoisted to named module constants; declared in `PARAMETER_SET`; `PARAMETER_SET_VERSION` (SHA-256) added to `FusedVerdict` and every audit entry; `compute_decision_fingerprint(vitals, verdict)` added — deterministic, wall-clock-free, moves with the parameter version. Adapter-internal `score +=` increments are **not** yet hoisted (noted in code). | `observe_consolidated.py` |
+| **T-2 / T-6** input validation | `VITALS_PHYSICAL_BOUNDS` (sensor-plausibility only) + `validate_vitals()` ported back from the retired source. A faulted channel is masked to a non-alerting value so the remaining channels are still assessed; the fault is overlaid as a WARNING floor that never downgrades the tracked regime, routes escalation through the cooldown, floors `risk_score` to match the forced regime, and sets `unassessable=True`. | `observe_consolidated.py` |
+| **I-3** parameter provenance | Buried calibration literals hoisted to named module constants; declared in `PARAMETER_SET` (entries reference the live constants); `PARAMETER_SET_VERSION` (SHA-256) + `decision_fingerprint` on `FusedVerdict` and every audit entry; `compute_decision_fingerprint()` is called by `evaluate()` and persisted. `EscalationPolicy` built from the declared constants. Adapter-internal `score +=` increments **not** yet hoisted (noted in code). | `observe_consolidated.py` |
 
-Test harvest (§12) landed as `test_observe_invariants.py` — 23 property tests
-(I-1, T-1, T-2/T-6, T-4, T-5, I-2, I-3). **OBSERVE's first repo-owned test file.**
+Test harvest landed as `test_observe_invariants.py` — **33 property tests**
+(I-1, T-1, T-2/T-6 incl. fault-overlay safety, T-4, T-5, I-2, I-3 incl.
+fingerprint persistence + constant wiring, root↔vendored byte-sync).
+**OBSERVE's first repo-owned test file.**
 
-Suites after the change: `test_observe_consolidated.py` + `test_observe_invariants.py`
-= **99 passed**; vendored `sentinel_os` suite = **82 passed**.
+A code-review round (2026-08-28) found the first-pass validation gate was too
+blunt — it aborted the whole assessment on any fault, downgraded CRITICAL
+patients on sensor dropout, read as benign downstream, and could escalation-storm;
+and `compute_decision_fingerprint` was defined but never wired. All addressed
+above.
+
+Suites after the change: root (`test_observe_consolidated.py` +
+`test_observe_invariants.py`) = **109 passed**; vendored `sentinel_os`
+observe/perceive = **152 passed**.
 
 Not done (out of scope / needs separate decision):
 - Hoisting adapter-internal score weights into `PARAMETER_SET`.
 - Reconciling the wider vendored `sentinel_os/` tree to a single source of truth.
-- `origin/main` is ahead (`2b660b9`, README); this branch was cut from detached `d44e15e`. A rebase/merge is needed before any push.
+- Shipped as **OBSERVE PR #1** (branch `fix/resilience-assessment-findings`,
+  rebased onto `origin/main` `2b660b9`).

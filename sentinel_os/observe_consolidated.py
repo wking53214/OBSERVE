@@ -24,7 +24,7 @@ import json
 import logging
 import math
 from collections import OrderedDict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Any, Callable
@@ -92,7 +92,12 @@ class FusedVerdict:
     # Binds the calibration set into provenance so a verdict is independently
     # replayable and parameter drift between two builds is detectable. See
     # RESILIENCE_INTEGRATION_ASSESSMENT.md finding I-3.
-    validation_faults: List[str] = field(default_factory=list)  # non-empty => vitals unassessable
+    decision_fingerprint: str = ""  # compute_decision_fingerprint(vitals, verdict); also stored
+    # in the audit entry so a replay has a persisted baseline to diff against.
+    validation_faults: List[str] = field(default_factory=list)  # non-empty => a channel was unassessable
+    unassessable: bool = False  # True iff >=1 vital channel failed sensor-plausibility validation.
+    # The verdict is then a partial assessment of the VALID channels with a WARNING
+    # floor; risk_score/regime reflect what could be read, never a benign default.
 
 @dataclass
 class ScheduledJob:
@@ -128,13 +133,49 @@ DRIFT_SIGMA_THRESHOLD = 2.0
 # validation — a NaN or out-of-range vital would sail through every adapter as
 # "no abnormality" and fuse to a confident STABLE verdict). See
 # RESILIENCE_INTEGRATION_ASSESSMENT.md finding T-2 / T-6.
+#
+# These are SENSOR-PLAUSIBILITY bounds, not clinical-normal bounds: they reject
+# only values a working sensor cannot physically produce (NaN/inf, negatives,
+# a temperature probe reading a cold room). Clinically extreme but real values —
+# profound hypothermia (~20 C), infant SVT (~300 bpm) — must pass through to the
+# adapters and be assessed, never rejected as "unassessable". (Review finding:
+# a 20.0 C lower bound was rejecting genuine hypothermia as risk 0.0.)
 # ============================================================================
 VITALS_PHYSICAL_BOUNDS = {
-    "heart_rate": (0.0, 350.0),
+    "heart_rate": (0.0, 400.0),
     "oxygen_saturation": (0.0, 100.0),
-    "respiratory_rate": (0.0, 150.0),
-    "temperature": (20.0, 45.0),
+    "respiratory_rate": (0.0, 250.0),
+    "temperature": (12.0, 50.0),
 }
+
+# When a channel is faulted, it is replaced with this known-non-alerting value so
+# the OTHER channels can still be assessed (a NaN SpO2 must not suppress a real
+# HR=210). The fault itself is then overlaid as a WARNING floor + `unassessable`.
+_VITALS_NEUTRAL = {
+    "heart_rate": 110.0,
+    "oxygen_saturation": 98.0,
+    "respiratory_rate": 25.0,
+    "temperature": 37.0,
+}
+UNASSESSABLE_CONFIDENCE_PENALTY = 0.5  # multiplies fused confidence when any channel is faulted
+
+_REGIME_SEVERITY = {
+    OperationalRegime.STABLE: 0,
+    OperationalRegime.CAUTION: 1,
+    OperationalRegime.WARNING: 2,
+    OperationalRegime.CRITICAL: 3,
+}
+
+
+def _max_severity(*regimes: "OperationalRegime") -> "OperationalRegime":
+    """Return the most severe of the given regimes (STABLE < CAUTION < WARNING < CRITICAL)."""
+    return max(regimes, key=lambda r: _REGIME_SEVERITY[r])
+
+
+def _escalation_in_cooldown(policy: "EscalationPolicy", now: datetime) -> bool:
+    if policy.escalation_locked and policy.last_escalation_time is not None:
+        return (now - policy.last_escalation_time).total_seconds() < policy.lock_seconds
+    return False
 
 # ---------------------------------------------------------------------------
 # CALIBRATION SURFACE — named so it is a single source of truth AND so the
@@ -182,13 +223,20 @@ def validate_vitals(vitals: "VitalsSnapshot") -> List[str]:
 # a threshold was invisible downstream.
 #
 # PARAMETER_SET is the declared manifest of that calibration surface (mirrors the
-# sentinel_os cassette version-binding pattern). PARAMETER_SET_VERSION is its
-# SHA-256; it is stamped onto every FusedVerdict and folded into every audit
-# entry. Change any constant above and the version changes; the invariant test
-# suite enforces that.
+# sentinel_os cassette version-binding pattern). Its entries REFERENCE the module
+# constants directly, so editing a constant changes PARAMETER_SET_VERSION (a
+# SHA-256), which is stamped onto every FusedVerdict and folded into every audit
+# entry. `test_observe_invariants.py` asserts each entry still tracks its live
+# constant.
 #
-# NOT yet covered: adapter-internal score increments (e.g. `score += 0.3` inside
-# individual RiskAdapters). Hoisting those is a known follow-up.
+# SCOPE — what the version does and does not attest:
+#   * Covered: the module-level constants below. The engine constructs
+#     EscalationPolicy with these exact values (see _get_policy), so the stamp
+#     describes the effective config, not just a default.
+#   * NOT covered: adapter-internal score increments (`score += 0.3` inside
+#     individual RiskAdapters), and any caller that constructs EscalationPolicy /
+#     calls regime_distribution() with non-default arguments. Hoisting the
+#     adapter weights is a known follow-up.
 # ============================================================================
 PARAMETER_SET: Dict[str, Any] = {
     "schema": "observe.parameters/v1",
@@ -228,6 +276,7 @@ def compute_decision_fingerprint(vitals: "VitalsSnapshot", verdict: "FusedVerdic
         "escalation_required": verdict.escalation_required,
         "triggered_rules": sorted(verdict.triggered_rules),
         "validation_faults": sorted(verdict.validation_faults),
+        "unassessable": verdict.unassessable,
         "parameter_set_version": verdict.parameter_set_version,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
@@ -569,6 +618,9 @@ class RiskAdapters:
                 triggered.append(f"LOW_VARIANCE_SENSOR: variance={variance:.4f} over 10 readings")
                 score += 0.15
 
+        # Defense-in-depth: unreachable via ObserveClinicalEngine.evaluate() (the
+        # sensor-plausibility gate rejects O2 outside [0,100] before any adapter
+        # runs), but retained for adapters invoked directly / in isolation.
         if vitals.oxygen_saturation > 100.0 or vitals.oxygen_saturation < 0.0:
             triggered.append(f"OUT_OF_RANGE_O2: {vitals.oxygen_saturation}%")
             score += 0.3
@@ -1155,7 +1207,10 @@ class ObserveClinicalEngine:
 
     def _get_policy(self, patient_id: str) -> EscalationPolicy:
         if patient_id not in self._patient_policies:
-            self._patient_policies[patient_id] = EscalationPolicy()
+            self._patient_policies[patient_id] = EscalationPolicy(
+                dwell_threshold=ESCALATION_DWELL_THRESHOLD,
+                lock_seconds=ESCALATION_LOCK_SECONDS,
+            )
         self._touch_patient(patient_id)
         return self._patient_policies[patient_id]
 
@@ -1193,39 +1248,24 @@ class ObserveClinicalEngine:
         """Fast synchronous evaluation: validate → select → run → fuse → policy → audit."""
 
         policy = self._get_policy(vitals.patient_id)
+        prior_regime = policy.current_regime
 
-        # SAFETY GATE (I-3 finding T-2/T-6): a non-finite or out-of-range vital is
-        # unassessable. It must never be fed to the adapters, where absent
-        # abnormality would fuse to a confident STABLE. Emit a WARNING verdict
-        # that carries the faults, and audit it.
+        # SAFETY: validate each channel for sensor plausibility (finding T-2/T-6).
+        # A faulted channel is NOT a reason to abandon the assessment (review
+        # findings 1-4): it is masked to a non-alerting value so the remaining
+        # channels are still assessed (a NaN SpO2 must not hide a real HR=210),
+        # and the fault is then overlaid below as a WARNING floor that never
+        # downgrades the patient's tracked regime.
         faults = validate_vitals(vitals)
-        if faults:
-            verdict = FusedVerdict(
-                risk_score=0.0,
-                regime=OperationalRegime.WARNING,
-                confidence=0.0,
-                entropy=0.0,
-                active_engines=[],
-                triggered_rules=[f"VALIDATION_FAULT: {f}" for f in faults],
-                timestamp=datetime.now(timezone.utc),
-                escalation_required=True,
-                parameter_set_version=PARAMETER_SET_VERSION,
-                validation_faults=faults,
-            )
-            verdict.audit_hash = self.audit_ledger.append(
-                vitals.patient_id, "clinical_assessment_rejected",
-                {
-                    "vitals": asdict(vitals),
-                    "validation_faults": faults,
-                    "parameter_set_version": PARAMETER_SET_VERSION,
-                    "verdict": {"risk_score": 0.0, "regime": "warning", "escalation_required": True},
-                },
-            )
-            logger.warning(f"VALIDATION_FAULT: patient={vitals.patient_id} faults={faults}")
-            return verdict
+        unassessable = bool(faults)
+        assessment_vitals = vitals
+        if unassessable:
+            faulted_fields = {f.split("=", 1)[0] for f in faults}
+            masked = {fld: _VITALS_NEUTRAL[fld] for fld in faulted_fields if fld in _VITALS_NEUTRAL}
+            assessment_vitals = replace(vitals, **masked)
 
-        selected = self.select_engines(vitals)
-        outputs = [self.ENGINE_MAP[name](vitals) for name in selected]
+        selected = self.select_engines(assessment_vitals)
+        outputs = [self.ENGINE_MAP[name](assessment_vitals) for name in selected]
 
         fused_risk, entropy, regime_probs, rationale = BayesianFusion.fuse(outputs)
         self._patient_entropy[vitals.patient_id] = entropy
@@ -1263,8 +1303,43 @@ class ObserveClinicalEngine:
             final_regime, escalation = policy.evaluate(candidate_regime, vitals.timestamp)
             all_triggered_bypass_note = []
 
-        all_triggered = all_triggered_bypass_note + [r for o in outputs for r in o.triggered_rules]
+        fault_notes: List[str] = []
+        if unassessable:
+            # Overlay (review findings 1-4): a fault forces AT LEAST WARNING and
+            # never lets the result fall below the patient's tracked regime — but
+            # it must not fabricate a NEW escalation unless the patient genuinely
+            # crossed up from a calm state, and it respects the escalation
+            # cooldown so a flapping sensor cannot page-storm.
+            forced = _max_severity(final_regime, OperationalRegime.WARNING, prior_regime)
+            crossed_up = (
+                _REGIME_SEVERITY[forced] >= _REGIME_SEVERITY[OperationalRegime.WARNING]
+                and _REGIME_SEVERITY[prior_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
+            )
+            if forced is not final_regime:
+                final_regime = forced
+                policy.current_regime = forced
+                policy.pending_regime = None
+                policy.dwell_count = 0
+                # Keep risk_score consistent with the forced regime so a consumer
+                # ranking a ward by risk_score cannot sink an unassessable patient
+                # to the bottom (review finding 3). The valid-channel risk is kept
+                # if it is already higher.
+                _floor = REGIME_DISTRIBUTION_BANDS[-1][0]
+                for lb, shape in REGIME_DISTRIBUTION_BANDS:
+                    if max(shape, key=shape.get) == forced.value:
+                        _floor = lb
+                        break
+                fused_risk = max(fused_risk, _floor)
+            if crossed_up and not escalation and not _escalation_in_cooldown(policy, vitals.timestamp):
+                escalation = True
+                policy.escalation_locked = True
+                policy.last_escalation_time = vitals.timestamp
+            fault_notes = [f"VALIDATION_FAULT: {f}" for f in faults]
+
+        all_triggered = fault_notes + all_triggered_bypass_note + [r for o in outputs for r in o.triggered_rules]
         avg_confidence = sum(o.confidence for o in outputs) / len(outputs) if outputs else 0.0
+        if unassessable:
+            avg_confidence *= UNASSESSABLE_CONFIDENCE_PENALTY
 
         verdict = FusedVerdict(
             risk_score=fused_risk,
@@ -1276,7 +1351,10 @@ class ObserveClinicalEngine:
             timestamp=datetime.now(timezone.utc),
             escalation_required=escalation,
             parameter_set_version=PARAMETER_SET_VERSION,
+            validation_faults=list(faults),
+            unassessable=unassessable,
         )
+        verdict.decision_fingerprint = compute_decision_fingerprint(vitals, verdict)
 
         audit_hash = self.audit_ledger.append(
             vitals.patient_id, "clinical_assessment",
@@ -1284,12 +1362,16 @@ class ObserveClinicalEngine:
                 "vitals": asdict(vitals),
                 "selected_engines": selected,
                 "parameter_set_version": PARAMETER_SET_VERSION,
+                "decision_fingerprint": verdict.decision_fingerprint,
+                "validation_faults": list(faults),
                 "outputs": [{"engine": o.engine_name, "risk": o.risk_score, "confidence": o.confidence, "rules": o.triggered_rules} for o in outputs],
-                "verdict": {"risk_score": fused_risk, "regime": final_regime.value, "escalation_required": escalation, "entropy": entropy},
+                "verdict": {"risk_score": fused_risk, "regime": final_regime.value, "escalation_required": escalation, "entropy": entropy, "unassessable": unassessable},
             },
         )
         verdict.audit_hash = audit_hash
 
+        if unassessable:
+            logger.warning(f"VALIDATION_FAULT: patient={vitals.patient_id} faults={faults} -> regime={final_regime.value}")
         if escalation:
             logger.info(f"ESCALATION: patient={vitals.patient_id} regime={final_regime.value} risk={fused_risk:.2f}")
 

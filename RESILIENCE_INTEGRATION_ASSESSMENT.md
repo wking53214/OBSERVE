@@ -109,7 +109,7 @@ Capabilities already present, with locations:
 | Capability | Location |
 |---|---|
 | Telemetry / signal ingestion + typed contract | `VitalsSnapshot`, `observe_consolidated.py:57` |
-| Physical-plausibility validation | `validate_vitals` / `VITALS_PHYSICAL_BOUNDS`, `observe_clinical_risk_source.py` §"SAFETY"; adapter `VitalValidationModule` |
+| Physical-plausibility validation | *(at investigation time: only in the non-parsing `observe_clinical_risk_source.py` §"SAFETY" and the adapter's `VitalValidationModule`.)* Now `validate_vitals` / `VITALS_PHYSICAL_BOUNDS` in `observe_consolidated.py` — ported back and wired into `evaluate()` by PR #1. |
 | Baseline-relative drift (per signal) | `RiskAdapters.drift`, `observe_consolidated.py:327` — z-score of baseline vs. rolling-history mean/σ, None-guards, `critical_floor=0.02`, named `DRIFT_SIGMA_THRESHOLD` |
 | Adversarial / stuck-sensor detection | `RiskAdapters.adversarial` (streak detection) |
 | Regime classification as **distribution**, not label | `regime_distribution()`, `FusionEngineModule`, `observe_consolidated.py` |
@@ -594,6 +594,13 @@ from the candidate.
 
 # RECOMMENDED NEXT STEP
 
+> **Resolved 2026-08-27/28 — see "Implementation status" below.** The repo owner
+> chose to formally adopt the consolidated file as OBSERVE-owned
+> (`observe_consolidated.py` at the repo root); the non-parsing
+> `observe_clinical_risk_source.py` was retired and then deleted. The I-3
+> provenance change and the test harvest landed in PR #1. This section is kept
+> for the investigation record.
+
 Put the §16.2 question to the repo owner: **designate the canonical OBSERVE
 source** (reconstruct `observe_clinical_risk_source.py` from
 `sentinel_os/observe_consolidated.py`, or formally adopt the consolidated file as
@@ -616,7 +623,7 @@ Three findings were fixed on branch `fix/resilience-assessment-findings`
 
 | Finding | Change | Files |
 |---|---|---|
-| **G-2** canonical source | `observe_consolidated.py` + `test_observe_consolidated.py` promoted to repo root as OBSERVE-owned; flattened `observe_clinical_risk_source.py` retired to `.broken`. Vendored `sentinel_os/observe_consolidated.py` kept in sync. | root (new), `observe_clinical_risk_source.py.broken` |
+| **G-2** canonical source | `observe_consolidated.py` + `test_observe_consolidated.py` promoted to repo root as OBSERVE-owned; the flattened non-parsing `observe_clinical_risk_source.py` was retired to `.broken` in PR #1 and then **deleted** in the follow-up (its content is in git history — `git log --follow observe_consolidated.py` / the pre-PR-#1 blob; nothing imported it). Vendored `sentinel_os/observe_consolidated.py` kept in sync. | root (new) |
 | **T-2 / T-6** input validation | `VITALS_PHYSICAL_BOUNDS` (sensor-plausibility only) + `validate_vitals()` ported back from the retired source. A faulted channel is masked to a non-alerting value so the remaining channels are still assessed; the fault is overlaid as a WARNING floor that never downgrades the tracked regime, routes escalation through the cooldown, floors `risk_score` to match the forced regime, and sets `unassessable=True`. | `observe_consolidated.py` |
 | **I-3** parameter provenance | Buried calibration literals hoisted to named module constants; declared in `PARAMETER_SET` (entries reference the live constants); `PARAMETER_SET_VERSION` (SHA-256) + `decision_fingerprint` on `FusedVerdict` and every audit entry; `compute_decision_fingerprint()` is called by `evaluate()` and persisted. `EscalationPolicy` built from the declared constants. Adapter-internal `score +=` increments **not** yet hoisted (noted in code). | `observe_consolidated.py` |
 

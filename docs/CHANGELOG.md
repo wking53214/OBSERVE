@@ -26,10 +26,22 @@ full detail; this is the skim version.
   - `EscalationPolicy` is constructed with the declared
     `ESCALATION_*` constants explicitly; the `PARAMETER_SET` scope note
     now states what the version does and does not attest.
-  - `test_observe_invariants.py` grew from 23 to 33 tests (added
-    fault-overlay safety, fingerprint persistence, manifest/constant
-    wiring, and a root ↔ `sentinel_os/` byte-sync guard). Full: 109 root
-    pass, 152 vendored observe/perceive pass.
+  - A **second review round** found the overlay still fed masked data
+    through the stateful `EscalationPolicy` (corrupting/stalling the
+    real-signal dwell state), masked delta-channels injected a synthetic
+    improving trend, the risk floor was skipped on hold calls, a transient
+    fault permanently bumped the tracked regime, and `PARAMETER_SET`
+    aliased mutable module dicts. Reworked: on a fault with no
+    valid-channel emergency the policy is **frozen** (not evaluated with
+    masked data); faulted channels also drop their trend-context keys;
+    the risk floor uses an explicit `REGIME_RISK_FLOOR` map applied every
+    call; fault-escalation dedup moved to engine-level per-patient state;
+    `PARAMETER_SET` is a `deepcopy` snapshot.
+  - `test_observe_invariants.py` grew 23 → 39 tests (fault-overlay safety
+    incl. policy-freeze / no-permanent-bump / trend-masking, fingerprint
+    persistence, manifest snapshot + constant wiring, `REGIME_RISK_FLOOR`
+    coverage, root ↔ `sentinel_os/` byte-sync guard). Full: 115 root pass,
+    152 vendored observe/perceive pass.
 
 ## 2026-08-27
 

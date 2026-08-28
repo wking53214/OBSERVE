@@ -157,6 +157,18 @@ _VITALS_NEUTRAL = {
     "respiratory_rate": 25.0,
     "temperature": 37.0,
 }
+# Context keys that a delta/momentum adapter (trajectory, drift, adversarial)
+# reads for a given channel. When a channel is faulted these are dropped along
+# with the value, so those adapters ABSTAIN on that channel rather than seeing a
+# synthetic "improvement" from the masked value (review finding: masking O2 to
+# 98 while previous_o2=90 fabricated a +8 %/min uptrend that cancelled real
+# deterioration in the other channels).
+_CHANNEL_CONTEXT_KEYS = {
+    "oxygen_saturation": ("previous_o2", "history_o2", "baseline_o2", "recent_o2_readings"),
+    "heart_rate": ("previous_hr", "history_hr", "baseline_hr"),
+    "respiratory_rate": ("previous_rr", "history_rr"),
+    "temperature": ("previous_temp", "history_temp"),
+}
 UNASSESSABLE_CONFIDENCE_PENALTY = 0.5  # multiplies fused confidence when any channel is faulted
 
 _REGIME_SEVERITY = {
@@ -165,17 +177,15 @@ _REGIME_SEVERITY = {
     OperationalRegime.WARNING: 2,
     OperationalRegime.CRITICAL: 3,
 }
+# Explicit risk floor per regime (review finding: the previous inline
+# re-derivation by scanning REGIME_DISTRIBUTION_BANDS for a matching argmax was
+# a fragile re-implementation of band semantics). Bottom of each band.
+REGIME_RISK_FLOOR = {"stable": 0.0, "caution": 0.25, "warning": 0.50, "critical": 0.75}
 
 
 def _max_severity(*regimes: "OperationalRegime") -> "OperationalRegime":
     """Return the most severe of the given regimes (STABLE < CAUTION < WARNING < CRITICAL)."""
     return max(regimes, key=lambda r: _REGIME_SEVERITY[r])
-
-
-def _escalation_in_cooldown(policy: "EscalationPolicy", now: datetime) -> bool:
-    if policy.escalation_locked and policy.last_escalation_time is not None:
-        return (now - policy.last_escalation_time).total_seconds() < policy.lock_seconds
-    return False
 
 # ---------------------------------------------------------------------------
 # CALIBRATION SURFACE — named so it is a single source of truth AND so the
@@ -238,19 +248,25 @@ def validate_vitals(vitals: "VitalsSnapshot") -> List[str]:
 #     calls regime_distribution() with non-default arguments. Hoisting the
 #     adapter weights is a known follow-up.
 # ============================================================================
-PARAMETER_SET: Dict[str, Any] = {
+# copy.deepcopy so PARAMETER_SET is an immutable SNAPSHOT of the calibration as
+# of import — not live aliases of the module dicts. A runtime mutation of
+# PEDIATRIC_NORMS (or a band shape) would then diverge from this snapshot, which
+# the invariant test detects (review finding: with aliasing, the version stayed
+# byte-identical while the effective config drifted).
+PARAMETER_SET: Dict[str, Any] = copy.deepcopy({
     "schema": "observe.parameters/v1",
     "pediatric_norms": PEDIATRIC_NORMS,
     "drift_sigma_threshold": DRIFT_SIGMA_THRESHOLD,
     "vitals_physical_bounds": {k: list(v) for k, v in VITALS_PHYSICAL_BOUNDS.items()},
     "regime_distribution_bands": [[lb, shape] for lb, shape in REGIME_DISTRIBUTION_BANDS],
+    "regime_risk_floor": REGIME_RISK_FLOOR,
     "regime_critical_floor_default": REGIME_CRITICAL_FLOOR_DEFAULT,
     "drift_critical_floor": DRIFT_CRITICAL_FLOOR,
     "heavy_path_entropy_trigger": HEAVY_PATH_ENTROPY_TRIGGER,
     "heuristic_hard_rule_threshold": HEURISTIC_HARD_RULE_THRESHOLD,
     "escalation_dwell_threshold": ESCALATION_DWELL_THRESHOLD,
     "escalation_lock_seconds": ESCALATION_LOCK_SECONDS,
-}
+})
 
 
 def _canonical_json(obj: Any) -> str:
@@ -1196,6 +1212,11 @@ class ObserveClinicalEngine:
         self._max_tracked_patients = max_tracked_patients
         self._patient_policies: "OrderedDict[str, EscalationPolicy]" = OrderedDict()
         self._patient_entropy: Dict[str, float] = {}
+        # Last time a page fired for THIS patient purely because of a
+        # sensor-validation fault. Deduplicates fault escalations (a flapping
+        # lead) without touching the EscalationPolicy lock that the real-signal
+        # path depends on for dwell accumulation.
+        self._patient_fault_paged: Dict[str, datetime] = {}
 
     def _touch_patient(self, patient_id: str) -> None:
         """Mark patient as most-recently-used and evict LRU if over capacity."""
@@ -1204,6 +1225,7 @@ class ObserveClinicalEngine:
         while len(self._patient_policies) > self._max_tracked_patients:
             evicted_id, _ = self._patient_policies.popitem(last=False)  # drop LRU
             self._patient_entropy.pop(evicted_id, None)
+            self._patient_fault_paged.pop(evicted_id, None)
 
     def _get_policy(self, patient_id: str) -> EscalationPolicy:
         if patient_id not in self._patient_policies:
@@ -1248,21 +1270,28 @@ class ObserveClinicalEngine:
         """Fast synchronous evaluation: validate → select → run → fuse → policy → audit."""
 
         policy = self._get_policy(vitals.patient_id)
-        prior_regime = policy.current_regime
 
         # SAFETY: validate each channel for sensor plausibility (finding T-2/T-6).
-        # A faulted channel is NOT a reason to abandon the assessment (review
-        # findings 1-4): it is masked to a non-alerting value so the remaining
-        # channels are still assessed (a NaN SpO2 must not hide a real HR=210),
-        # and the fault is then overlaid below as a WARNING floor that never
-        # downgrades the patient's tracked regime.
+        # A faulted channel does NOT abort the assessment (review round 1): it is
+        # masked to a non-alerting value — and its delta/momentum context keys are
+        # dropped so the trend adapters abstain on it rather than see a fake
+        # improvement (review round 2) — so the remaining channels are still
+        # assessed. A real emergency in the VALID channels still fires the bypass
+        # below. Otherwise the fault path (a) freezes the EscalationPolicy so a
+        # sustained sensor fault cannot corrupt or stall the real-signal dwell
+        # state, and (b) reports a WARNING floor that never downgrades the tracked
+        # regime and never permanently bumps it.
         faults = validate_vitals(vitals)
         unassessable = bool(faults)
         assessment_vitals = vitals
         if unassessable:
             faulted_fields = {f.split("=", 1)[0] for f in faults}
             masked = {fld: _VITALS_NEUTRAL[fld] for fld in faulted_fields if fld in _VITALS_NEUTRAL}
-            assessment_vitals = replace(vitals, **masked)
+            ctx = dict(vitals.context)
+            for fld in faulted_fields:
+                for k in _CHANNEL_CONTEXT_KEYS.get(fld, ()):
+                    ctx.pop(k, None)
+            assessment_vitals = replace(vitals, context=ctx, **masked)
 
         selected = self.select_engines(assessment_vitals)
         outputs = [self.ENGINE_MAP[name](assessment_vitals) for name in selected]
@@ -1288,7 +1317,11 @@ class ObserveClinicalEngine:
         )
         bypass = hard_rule_fired or syndrome_fired
 
+        fault_notes: List[str] = []
         if bypass and candidate_regime.value in ("warning", "critical"):
+            # A real emergency in the valid channels — skip dwell, escalate now.
+            # (Reachable while unassessable: e.g. a NaN SpO2 alongside a genuine
+            # CRITICAL_O2-equivalent HR/RR reading.)
             escalation = policy.current_regime.value in ("stable", "caution")
             final_regime = candidate_regime
             policy.current_regime = final_regime
@@ -1299,41 +1332,29 @@ class ObserveClinicalEngine:
                 policy.last_escalation_time = vitals.timestamp
             reason = "hard-rule" if hard_rule_fired else "dangerous-syndrome"
             all_triggered_bypass_note = [f"CLINICAL_SAFETY_BYPASS: {reason} trigger skipped dwell confirmation"]
+        elif unassessable:
+            # Fault path, no valid-channel emergency. FREEZE the policy — do not
+            # call policy.evaluate with masked data (review round 2: it corrupted
+            # or stalled the real-signal dwell/lock state). Report a floor that is
+            # at least WARNING and never below the tracked regime; page at most
+            # once per cooldown window on a genuine cross-up from a calm state.
+            final_regime = _max_severity(candidate_regime, OperationalRegime.WARNING, policy.current_regime)
+            crossed_up = _REGIME_SEVERITY[policy.current_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
+            last_paged = self._patient_fault_paged.get(vitals.patient_id)
+            cooled = last_paged is None or (vitals.timestamp - last_paged).total_seconds() >= ESCALATION_LOCK_SECONDS
+            escalation = crossed_up and cooled
+            if escalation:
+                self._patient_fault_paged[vitals.patient_id] = vitals.timestamp
+            all_triggered_bypass_note = []
         else:
             final_regime, escalation = policy.evaluate(candidate_regime, vitals.timestamp)
             all_triggered_bypass_note = []
 
-        fault_notes: List[str] = []
         if unassessable:
-            # Overlay (review findings 1-4): a fault forces AT LEAST WARNING and
-            # never lets the result fall below the patient's tracked regime — but
-            # it must not fabricate a NEW escalation unless the patient genuinely
-            # crossed up from a calm state, and it respects the escalation
-            # cooldown so a flapping sensor cannot page-storm.
-            forced = _max_severity(final_regime, OperationalRegime.WARNING, prior_regime)
-            crossed_up = (
-                _REGIME_SEVERITY[forced] >= _REGIME_SEVERITY[OperationalRegime.WARNING]
-                and _REGIME_SEVERITY[prior_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
-            )
-            if forced is not final_regime:
-                final_regime = forced
-                policy.current_regime = forced
-                policy.pending_regime = None
-                policy.dwell_count = 0
-                # Keep risk_score consistent with the forced regime so a consumer
-                # ranking a ward by risk_score cannot sink an unassessable patient
-                # to the bottom (review finding 3). The valid-channel risk is kept
-                # if it is already higher.
-                _floor = REGIME_DISTRIBUTION_BANDS[-1][0]
-                for lb, shape in REGIME_DISTRIBUTION_BANDS:
-                    if max(shape, key=shape.get) == forced.value:
-                        _floor = lb
-                        break
-                fused_risk = max(fused_risk, _floor)
-            if crossed_up and not escalation and not _escalation_in_cooldown(policy, vitals.timestamp):
-                escalation = True
-                policy.escalation_locked = True
-                policy.last_escalation_time = vitals.timestamp
+            # Keep risk_score consistent with the reported regime so a consumer
+            # ranking a ward by risk_score cannot sink an unassessable patient to
+            # the bottom (review finding 3). Valid-channel risk is kept if higher.
+            fused_risk = max(fused_risk, REGIME_RISK_FLOOR[final_regime.value])
             fault_notes = [f"VALIDATION_FAULT: {f}" for f in faults]
 
         all_triggered = fault_notes + all_triggered_bypass_note + [r for o in outputs for r in o.triggered_rules]

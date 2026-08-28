@@ -35,6 +35,8 @@ from observe_consolidated import (
     ESCALATION_DWELL_THRESHOLD,
     ESCALATION_LOCK_SECONDS,
     VITALS_PHYSICAL_BOUNDS,
+    REGIME_RISK_FLOOR,
+    PEDIATRIC_NORMS,
 )
 
 
@@ -210,6 +212,60 @@ class T2b_ValidationFaultOverlayIsSafe(unittest.TestCase):
         self.assertEqual(validate_vitals(make_vitals(heart_rate=300.0)), [])
         self.assertTrue(validate_vitals(make_vitals(heart_rate=999.0)))
 
+    # ---- review round 2 ----
+
+    def test_risk_floor_is_applied_on_hold_calls_not_just_the_change_call(self):
+        # Finding: the floor was only applied when the regime changed; on a
+        # subsequent hold call regime=WARNING but risk_score fell back to ~0.05.
+        engine = ObserveClinicalEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        first = engine.evaluate(make_vitals(patient_id="hold", oxygen_saturation=float("nan"), timestamp=t0))
+        held = engine.evaluate(make_vitals(patient_id="hold", oxygen_saturation=float("nan"),
+                                           timestamp=t0 + timedelta(seconds=10)))
+        self.assertEqual(held.regime, OperationalRegime.WARNING)
+        self.assertGreaterEqual(held.risk_score, first.risk_score)
+        self.assertGreaterEqual(held.risk_score, 0.50)
+
+    def test_sustained_fault_does_not_corrupt_or_lock_the_escalation_policy(self):
+        # Finding: the overlay wiped pending/dwell and armed a 300s lock every
+        # call, so a real gradual CRITICAL could never accumulate dwell.
+        engine = ObserveClinicalEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for i in range(4):
+            engine.evaluate(make_vitals(patient_id="frozen", oxygen_saturation=float("nan"),
+                                        timestamp=t0 + timedelta(seconds=30 * i)))
+        policy = engine._patient_policies["frozen"]
+        self.assertEqual(policy.current_regime, OperationalRegime.STABLE)  # not bumped
+        self.assertFalse(policy.escalation_locked)                          # not locked
+        self.assertEqual(policy.dwell_count, 0)
+
+    def test_transient_fault_does_not_permanently_bump_the_tracked_regime(self):
+        # Finding: a one-reading fault bumped policy.current_regime to WARNING,
+        # so a later genuine WARNING->CRITICAL yielded escalation=False.
+        engine = ObserveClinicalEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        engine.evaluate(make_vitals(patient_id="tr", oxygen_saturation=float("nan"), timestamp=t0))
+        self.assertEqual(engine._patient_policies["tr"].current_regime, OperationalRegime.STABLE)
+        crash = engine.evaluate(make_vitals(patient_id="tr", oxygen_saturation=76.0, heart_rate=188.0,
+                                            respiratory_rate=62.0, temperature=39.7,
+                                            timestamp=t0 + timedelta(seconds=120)))
+        self.assertEqual(crash.regime, OperationalRegime.CRITICAL)
+        self.assertTrue(crash.escalation_required)  # the real CRITICAL still pages
+
+    def test_masked_channel_does_not_inject_a_synthetic_improving_trend(self):
+        # Finding: masking O2 to 98 while previous_o2=90 fabricated a +8 %/min
+        # uptrend that cancelled real deterioration.
+        engine = ObserveClinicalEngine()
+        verdict = engine.evaluate(make_vitals(
+            patient_id="trend", oxygen_saturation=float("nan"), heart_rate=155.0,
+            context={"age_months": 24, "previous_o2": 90, "previous_hr": 120,
+                     "history_o2": [90, 89, 88, 90, 89], "time_delta_seconds": 60},
+        ))
+        # no fabricated O2-improvement rule; the real HR climb still surfaces
+        self.assertFalse(any("O2_MOMENTUM" in r and "+" in r for r in verdict.triggered_rules),
+                         msg=verdict.triggered_rules)
+        self.assertTrue(any("HR_MOMENTUM" in r for r in verdict.triggered_rules), msg=verdict.triggered_rules)
+
 
 def _severity(regime: OperationalRegime) -> int:
     return {"stable": 0, "caution": 1, "warning": 2, "critical": 3}[regime.value]
@@ -337,10 +393,31 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         self.assertEqual(PARAMETER_SET["drift_critical_floor"], DRIFT_CRITICAL_FLOOR)
         self.assertEqual(PARAMETER_SET["escalation_dwell_threshold"], ESCALATION_DWELL_THRESHOLD)
         self.assertEqual(PARAMETER_SET["escalation_lock_seconds"], ESCALATION_LOCK_SECONDS)
+        self.assertEqual(PARAMETER_SET["regime_risk_floor"], REGIME_RISK_FLOOR)
         self.assertEqual(
             {k: list(v) for k, v in VITALS_PHYSICAL_BOUNDS.items()},
             PARAMETER_SET["vitals_physical_bounds"],
         )
+
+    def test_manifest_is_a_snapshot_immune_to_runtime_mutation(self):
+        # Review round 2 finding 5: PARAMETER_SET aliased mutable module dicts, so
+        # a runtime mutation shifted the effective config while the version stamp
+        # stayed byte-identical. It must be a deep copy, and drift must be visible.
+        self.assertIsNot(PARAMETER_SET["pediatric_norms"], PEDIATRIC_NORMS)
+        original = PEDIATRIC_NORMS["child"]["hr_high"]
+        try:
+            PEDIATRIC_NORMS["child"]["hr_high"] = original + 99
+            self.assertNotEqual(PARAMETER_SET["pediatric_norms"]["child"]["hr_high"],
+                                PEDIATRIC_NORMS["child"]["hr_high"])
+        finally:
+            PEDIATRIC_NORMS["child"]["hr_high"] = original
+
+    def test_regime_risk_floor_covers_every_regime(self):
+        self.assertEqual(set(REGIME_RISK_FLOOR), {r.value for r in OperationalRegime})
+        # monotone with severity
+        self.assertLess(REGIME_RISK_FLOOR["stable"], REGIME_RISK_FLOOR["caution"])
+        self.assertLess(REGIME_RISK_FLOOR["caution"], REGIME_RISK_FLOOR["warning"])
+        self.assertLess(REGIME_RISK_FLOOR["warning"], REGIME_RISK_FLOOR["critical"])
 
     def test_engine_uses_the_declared_escalation_constants(self):
         # Review finding 5: EscalationPolicy(dwell_threshold=5) would carry the

@@ -148,9 +148,11 @@ jobs:
         run: |
           # The repo-root canonical engine (observe_consolidated.py) and its
           # OBSERVE-owned tests live outside sentinel_os/ and are stdlib-only
-          # (no Redis/Postgres/TLS). pytest.ini pins the collection to the two
-          # root test files. This is a real gate — not `|| true`.
-          python -m pytest -v --tb=short
+          # (no Redis/Postgres/TLS). The two test files are named explicitly —
+          # NO repo-root pytest.ini/pyproject, so the vendored `pytest .` run
+          # above (working-directory: sentinel_os) keeps its own rootdir and
+          # default import mode. This is a real gate — not `|| true`.
+          python -m pytest test_observe_consolidated.py test_observe_invariants.py -v --tb=short
 
       - name: Lint (ruff)
         if: always()

@@ -37,11 +37,15 @@ full detail; this is the skim version.
     the risk floor uses an explicit `REGIME_RISK_FLOOR` map applied every
     call; fault-escalation dedup moved to engine-level per-patient state;
     `PARAMETER_SET` is a `deepcopy` snapshot.
-  - `test_observe_invariants.py` grew 23 → 39 tests (fault-overlay safety
-    incl. policy-freeze / no-permanent-bump / trend-masking, fingerprint
-    persistence, manifest snapshot + constant wiring, `REGIME_RISK_FLOOR`
-    coverage, root ↔ `sentinel_os/` byte-sync guard). Full: 115 root pass,
-    152 vendored observe/perceive pass.
+  - A **third review round**: the fault path is now fully frozen on the
+    bypass branch too (it was still writing `policy.current_regime` from a
+    masked-data distribution); `_patient_entropy` is no longer overwritten
+    by a fault reading (it drives heavy-engine selection); and the
+    repo-root `pytest.ini` was removed — it was silently changing the
+    vendored `sentinel_os` CI suite's rootdir/import-mode. The root suite
+    is now named explicitly in the CI step instead.
+  - `test_observe_invariants.py` grew 23 → 41 tests. Full: 117 root pass,
+    152 vendored observe/perceive pass, ruff clean.
 
 ## 2026-08-27
 

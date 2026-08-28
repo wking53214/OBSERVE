@@ -1297,7 +1297,11 @@ class ObserveClinicalEngine:
         outputs = [self.ENGINE_MAP[name](assessment_vitals) for name in selected]
 
         fused_risk, entropy, regime_probs, rationale = BayesianFusion.fuse(outputs)
-        self._patient_entropy[vitals.patient_id] = entropy
+        if not unassessable:
+            # Carried state that drives heavy-engine selection next reading —
+            # entropy computed on masked fault data is not the real disagreement
+            # signal, so it must not overwrite it (review round 3).
+            self._patient_entropy[vitals.patient_id] = entropy
 
         max_regime_name = max(regime_probs, key=regime_probs.get)
         candidate_regime = OperationalRegime(max_regime_name)
@@ -1318,10 +1322,31 @@ class ObserveClinicalEngine:
         bypass = hard_rule_fired or syndrome_fired
 
         fault_notes: List[str] = []
-        if bypass and candidate_regime.value in ("warning", "critical"):
-            # A real emergency in the valid channels — skip dwell, escalate now.
-            # (Reachable while unassessable: e.g. a NaN SpO2 alongside a genuine
-            # CRITICAL_O2-equivalent HR/RR reading.)
+        if unassessable:
+            # ANY validation fault => the EscalationPolicy is FROZEN for this
+            # reading: current_regime / pending / dwell / lock are never mutated
+            # (review rounds 2-3 — masked data corrupted or stalled the
+            # real-signal state, on both the plain and the bypass path). We still
+            # report a floor of at least WARNING that never drops below the
+            # tracked regime, and we still page — but through engine-level
+            # per-patient dedup, not the policy lock. A genuine valid-channel
+            # emergency (bypass) escalates regardless of the calm/cross-up test.
+            final_regime = _max_severity(candidate_regime, OperationalRegime.WARNING, policy.current_regime)
+            crossed_up = _REGIME_SEVERITY[policy.current_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
+            last_paged = self._patient_fault_paged.get(vitals.patient_id)
+            cooled = last_paged is None or (vitals.timestamp - last_paged).total_seconds() >= ESCALATION_LOCK_SECONDS
+            escalation = (crossed_up or bypass) and cooled
+            if escalation:
+                self._patient_fault_paged[vitals.patient_id] = vitals.timestamp
+            if bypass:
+                reason = "hard-rule" if hard_rule_fired else "dangerous-syndrome"
+                all_triggered_bypass_note = [
+                    f"CLINICAL_SAFETY_BYPASS: {reason} on a valid channel during a sensor fault"
+                ]
+            else:
+                all_triggered_bypass_note = []
+        elif bypass and candidate_regime.value in ("warning", "critical"):
+            # A real emergency in fully-valid channels — skip dwell, escalate now.
             escalation = policy.current_regime.value in ("stable", "caution")
             final_regime = candidate_regime
             policy.current_regime = final_regime
@@ -1332,20 +1357,6 @@ class ObserveClinicalEngine:
                 policy.last_escalation_time = vitals.timestamp
             reason = "hard-rule" if hard_rule_fired else "dangerous-syndrome"
             all_triggered_bypass_note = [f"CLINICAL_SAFETY_BYPASS: {reason} trigger skipped dwell confirmation"]
-        elif unassessable:
-            # Fault path, no valid-channel emergency. FREEZE the policy — do not
-            # call policy.evaluate with masked data (review round 2: it corrupted
-            # or stalled the real-signal dwell/lock state). Report a floor that is
-            # at least WARNING and never below the tracked regime; page at most
-            # once per cooldown window on a genuine cross-up from a calm state.
-            final_regime = _max_severity(candidate_regime, OperationalRegime.WARNING, policy.current_regime)
-            crossed_up = _REGIME_SEVERITY[policy.current_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
-            last_paged = self._patient_fault_paged.get(vitals.patient_id)
-            cooled = last_paged is None or (vitals.timestamp - last_paged).total_seconds() >= ESCALATION_LOCK_SECONDS
-            escalation = crossed_up and cooled
-            if escalation:
-                self._patient_fault_paged[vitals.patient_id] = vitals.timestamp
-            all_triggered_bypass_note = []
         else:
             final_regime, escalation = policy.evaluate(candidate_regime, vitals.timestamp)
             all_triggered_bypass_note = []

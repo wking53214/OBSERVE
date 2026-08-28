@@ -252,6 +252,29 @@ class T2b_ValidationFaultOverlayIsSafe(unittest.TestCase):
         self.assertEqual(crash.regime, OperationalRegime.CRITICAL)
         self.assertTrue(crash.escalation_required)  # the real CRITICAL still pages
 
+    def test_bypass_during_a_fault_does_not_mutate_the_tracked_regime(self):
+        # Review round 3: NaN SpO2 + real HR=210 fires the hard-rule bypass; the
+        # masked distribution resolves to WARNING and the old code wrote
+        # policy.current_regime=WARNING, suppressing a later genuine CRITICAL.
+        engine = ObserveClinicalEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        engine.evaluate(make_vitals(patient_id="bpf", oxygen_saturation=float("nan"),
+                                    heart_rate=210.0, timestamp=t0))
+        self.assertEqual(engine._patient_policies["bpf"].current_regime, OperationalRegime.STABLE)
+        recovered = engine.evaluate(make_vitals(patient_id="bpf", oxygen_saturation=75.0,
+                                                heart_rate=150.0, respiratory_rate=45.0,
+                                                timestamp=t0 + timedelta(seconds=600)))
+        self.assertEqual(recovered.regime, OperationalRegime.CRITICAL)
+        self.assertTrue(recovered.escalation_required)
+
+    def test_fault_reading_does_not_overwrite_carried_entropy(self):
+        # Review round 3: entropy from masked (agreeing) engines was stored and
+        # then demoted the next real reading to the light engine set.
+        engine = ObserveClinicalEngine()
+        engine._patient_entropy["ent"] = 1.5  # prior genuine disagreement
+        engine.evaluate(make_vitals(patient_id="ent", oxygen_saturation=float("nan")))
+        self.assertEqual(engine._patient_entropy["ent"], 1.5)
+
     def test_masked_channel_does_not_inject_a_synthetic_improving_trend(self):
         # Finding: masking O2 to 98 while previous_o2=90 fabricated a +8 %/min
         # uptrend that cancelled real deterioration.

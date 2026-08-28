@@ -3,6 +3,78 @@
 Dated, human-readable summary of notable changes. Git history has the
 full detail; this is the skim version.
 
+## 2026-08-28
+
+- **Resilience-fix review round.** Code review of the 2026-08-27 change
+  found the validation gate was too blunt. Reworked:
+  - A faulted channel is now **masked** to a non-alerting value and the
+    remaining channels are still assessed — a `NaN` SpO2 no longer
+    suppresses a real `HR=210`.
+  - The fault is overlaid as a **WARNING floor that never downgrades**
+    the patient's tracked regime (a sensor dropout on a CRITICAL patient
+    stays CRITICAL), routes escalation through the 300 s cooldown (no
+    page-storm on a flapping lead), and floors `risk_score` to match the
+    forced regime (an unassessable patient can't be sorted to the bottom
+    of a risk-ranked ward).
+  - `VITALS_PHYSICAL_BOUNDS` widened to sensor-plausibility only —
+    clinically extreme but real values (profound hypothermia ~20 °C,
+    infant SVT ~300 bpm) are assessed, not rejected.
+  - `compute_decision_fingerprint()` is now **called by `evaluate()`** and
+    stored on the verdict and in the audit entry (it was defined but
+    unwired). New `FusedVerdict` fields: `decision_fingerprint`,
+    `unassessable`.
+  - `EscalationPolicy` is constructed with the declared
+    `ESCALATION_*` constants explicitly; the `PARAMETER_SET` scope note
+    now states what the version does and does not attest.
+  - A **second review round** found the overlay still fed masked data
+    through the stateful `EscalationPolicy` (corrupting/stalling the
+    real-signal dwell state), masked delta-channels injected a synthetic
+    improving trend, the risk floor was skipped on hold calls, a transient
+    fault permanently bumped the tracked regime, and `PARAMETER_SET`
+    aliased mutable module dicts. Reworked: on a fault with no
+    valid-channel emergency the policy is **frozen** (not evaluated with
+    masked data); faulted channels also drop their trend-context keys;
+    the risk floor uses an explicit `REGIME_RISK_FLOOR` map applied every
+    call; fault-escalation dedup moved to engine-level per-patient state;
+    `PARAMETER_SET` is a `deepcopy` snapshot.
+  - A **third review round**: the fault path is now fully frozen on the
+    bypass branch too (it was still writing `policy.current_regime` from a
+    masked-data distribution); `_patient_entropy` is no longer overwritten
+    by a fault reading (it drives heavy-engine selection); and the
+    repo-root `pytest.ini` was removed — it was silently changing the
+    vendored `sentinel_os` CI suite's rootdir/import-mode. The root suite
+    is now named explicitly in the CI step instead.
+  - `test_observe_invariants.py` grew 23 → 41 tests. Full: 117 root pass,
+    152 vendored observe/perceive pass, ruff clean.
+
+## 2026-08-27
+
+- **Resilience-candidate assessment + findings fixed** — the "URE /
+  IntegratedResilienceOrchestrator" candidate was investigated and
+  **rejected** (another, weaker implementation of capabilities OBSERVE
+  already has; see `RESILIENCE_INTEGRATION_ASSESSMENT.md`). Three fixes
+  the investigation surfaced were applied:
+  - **Canonical source adopted.** `observe_consolidated.py` is now an
+    OBSERVE-owned file at the repo root (was only a vendored copy under
+    `sentinel_os/`). The flattened, non-parsing
+    `observe_clinical_risk_source.py` is retired to `.broken`.
+  - **Input validation restored (T-2/T-6).** The consolidated engine did
+    NO vital validation — a `NaN`/out-of-range vital fused to a confident
+    `STABLE`. `validate_vitals` + `VITALS_PHYSICAL_BOUNDS` ported back
+    from the retired source; `evaluate()` now returns a `WARNING` verdict
+    carrying `validation_faults` (never `STABLE`) and audits the
+    rejection.
+  - **Parameter-set provenance (I-3).** Calibration constants are hoisted
+    to a named surface and declared in `PARAMETER_SET`;
+    `PARAMETER_SET_VERSION` (its SHA-256) is stamped on every
+    `FusedVerdict` and folded into every audit entry.
+    `compute_decision_fingerprint()` gives a deterministic, wall-clock-free
+    decision hash for replay / drift detection.
+  - New `test_observe_invariants.py` — 23 property tests (OBSERVE's first
+    repo-owned invariant suite) locking out the candidate's failure modes.
+    Full: 99 passed (76 existing + 23 new); vendored `sentinel_os` suite
+    still 82 passed.
+
 ## 2026-07-24
 
 - **C2 dimension 4: statistical outcome-equity** — the fourth C2

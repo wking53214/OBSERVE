@@ -3,6 +3,26 @@
 Dated, human-readable summary of notable changes. Git history has the
 full detail; this is the skim version.
 
+## 2026-08-28 (follow-up, after PR #1)
+
+- **`PARAMETER_SET_VERSION` scope stated honestly.** It attests the named
+  module-level calibration constants. It does **not** attest the
+  `score += X` risk weights inside the adapter methods, nor the branch
+  logic in `ObserveClinicalEngine.evaluate` / `EscalationPolicy` /
+  `regime_distribution` / `validate_vitals` — those are attested by the
+  source-control revision that produced the build. (An earlier draft of
+  this follow-up folded an `inspect.getsource` digest of three classes
+  into the version; reverted — it produced a *different* version for
+  byte-identical code in a frozen/`.pyc` deployment vs a source checkout,
+  which would report phantom drift on every cross-build fingerprint
+  replay. Hoisting the genuine tunable weights into named constants is a
+  separate deferred follow-up; ~half the adapter literals are structural,
+  not tunable, and would overclaim if put in a *parameter* manifest.)
+- **`observe_clinical_risk_source.py.broken` deleted.** The flattened,
+  non-parsing nominal source (retired to `.broken` in PR #1) is gone —
+  nothing imported it; content is in git history.
+- Root suite 117 pass; vendored observe/perceive 152 pass.
+
 ## 2026-08-28
 
 - **Resilience-fix review round.** Code review of the 2026-08-27 change

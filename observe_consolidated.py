@@ -243,10 +243,16 @@ def validate_vitals(vitals: "VitalsSnapshot") -> List[str]:
 #   * Covered: the module-level constants below. The engine constructs
 #     EscalationPolicy with these exact values (see _get_policy), so the stamp
 #     describes the effective config, not just a default.
-#   * NOT covered: adapter-internal score increments (`score += 0.3` inside
-#     individual RiskAdapters), and any caller that constructs EscalationPolicy /
-#     calls regime_distribution() with non-default arguments. Hoisting the
-#     adapter weights is a known follow-up.
+#   * NOT covered in-process: the `score += X` risk weights inside the
+#     RiskAdapters / RiskAdaptersPhysiological methods, and the branch logic in
+#     ObserveClinicalEngine.evaluate / EscalationPolicy / regime_distribution /
+#     validate_vitals. Those are attested by the source-control revision that
+#     produced the build (record it alongside the verdict). Hoisting the genuine
+#     tunable weights into named constants is a deferred, deliberately-scoped
+#     follow-up (roughly half the adapter literals are structural, not tunable —
+#     putting those in a *parameter* manifest would itself overclaim).
+#   * NOT covered: any caller that constructs EscalationPolicy or calls
+#     regime_distribution() with non-default arguments (the engine does not).
 # ============================================================================
 # copy.deepcopy so PARAMETER_SET is an immutable SNAPSHOT of the calibration as
 # of import — not live aliases of the module dicts. A runtime mutation of

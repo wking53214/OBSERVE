@@ -10,10 +10,8 @@ Run: python3 -m pytest test_observe_invariants.py -v
 """
 
 import hashlib
-import math
 import pathlib
 import unittest
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from observe_consolidated import (

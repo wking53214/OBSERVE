@@ -94,6 +94,8 @@ class FusedVerdict:
     # RESILIENCE_INTEGRATION_ASSESSMENT.md finding I-3.
     decision_fingerprint: str = ""  # compute_decision_fingerprint(vitals, verdict); also stored
     # in the audit entry so a replay has a persisted baseline to diff against.
+    predecessor_state_commitment: str = ""  # previous sealed verdict-state commitment; allows continuity checks.
+    state_commitment: str = ""  # cryptographic identity of this verdict state, bound to predecessor if present.
     validation_faults: List[str] = field(default_factory=list)  # non-empty => a channel was unassessable
     unassessable: bool = False  # True iff >=1 vital channel failed sensor-plausibility validation.
     # The verdict is then a partial assessment of the VALID channels with a WARNING
@@ -302,6 +304,47 @@ def compute_decision_fingerprint(vitals: "VitalsSnapshot", verdict: "FusedVerdic
         "parameter_set_version": verdict.parameter_set_version,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _normalize_commitment_value(value: Any) -> Any:
+    """Convert non-JSON-native values into a canonical, deterministic form."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "__nan__"
+        if math.isinf(value):
+            return "__inf__" if value > 0 else "__neg_inf__"
+        return value
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (list, tuple)):
+        return [_normalize_commitment_value(v) for v in value]
+    if isinstance(value, set):
+        return sorted((_normalize_commitment_value(v) for v in value), key=lambda x: _canonical_json(x))
+    if isinstance(value, dict):
+        return {str(k): _normalize_commitment_value(v) for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))}
+    return str(value)
+
+
+def compute_state_commitment(payload: Dict[str, Any], predecessor_state_commitment: str = "", scope: str = "clinical_state") -> str:
+    """Deterministic state continuity commitment.
+
+    This is intentionally narrow: it binds the exact serialized decision state to
+    its predecessor commitment when present, without claiming underlying truth or
+    authority. It strengthens the durable evidence boundary by making state
+    continuity verifiable while preserving OBSERVE's evidence-first semantics.
+    """
+    canonical = {
+        "scope": scope,
+        "payload": _normalize_commitment_value(payload),
+        "predecessor_state_commitment": predecessor_state_commitment,
+    }
+    return hashlib.sha256(_canonical_json(canonical).encode("utf-8")).hexdigest()
 
 
 def get_age_group(age_months: Optional[int]) -> str:
@@ -1218,6 +1261,7 @@ class ObserveClinicalEngine:
         self._max_tracked_patients = max_tracked_patients
         self._patient_policies: "OrderedDict[str, EscalationPolicy]" = OrderedDict()
         self._patient_entropy: Dict[str, float] = {}
+        self._patient_state_commitments: Dict[str, str] = {}
         # Last time a page fired for THIS patient purely because of a
         # sensor-validation fault. Deduplicates fault escalations (a flapping
         # lead) without touching the EscalationPolicy lock that the real-signal
@@ -1231,6 +1275,7 @@ class ObserveClinicalEngine:
         while len(self._patient_policies) > self._max_tracked_patients:
             evicted_id, _ = self._patient_policies.popitem(last=False)  # drop LRU
             self._patient_entropy.pop(evicted_id, None)
+            self._patient_state_commitments.pop(evicted_id, None)
             self._patient_fault_paged.pop(evicted_id, None)
 
     def _get_policy(self, patient_id: str) -> EscalationPolicy:
@@ -1393,6 +1438,26 @@ class ObserveClinicalEngine:
             unassessable=unassessable,
         )
         verdict.decision_fingerprint = compute_decision_fingerprint(vitals, verdict)
+        verdict.predecessor_state_commitment = self._patient_state_commitments.get(vitals.patient_id, "")
+        state_payload = {
+            "patient_id": vitals.patient_id,
+            "timestamp": vitals.timestamp.isoformat(),
+            "decision_fingerprint": verdict.decision_fingerprint,
+            "risk_score": round(fused_risk, 9),
+            "regime": final_regime.value,
+            "confidence": round(avg_confidence, 9),
+            "entropy": round(entropy, 9),
+            "parameter_set_version": PARAMETER_SET_VERSION,
+            "validation_faults": sorted(faults),
+            "unassessable": bool(unassessable),
+            "selected_engines": selected,
+        }
+        verdict.state_commitment = compute_state_commitment(
+            state_payload,
+            predecessor_state_commitment=verdict.predecessor_state_commitment,
+            scope="clinical_verdict",
+        )
+        self._patient_state_commitments[vitals.patient_id] = verdict.state_commitment
 
         audit_hash = self.audit_ledger.append(
             vitals.patient_id, "clinical_assessment",
@@ -1401,6 +1466,8 @@ class ObserveClinicalEngine:
                 "selected_engines": selected,
                 "parameter_set_version": PARAMETER_SET_VERSION,
                 "decision_fingerprint": verdict.decision_fingerprint,
+                "predecessor_state_commitment": verdict.predecessor_state_commitment,
+                "state_commitment": verdict.state_commitment,
                 "validation_faults": list(faults),
                 "outputs": [{"engine": o.engine_name, "risk": o.risk_score, "confidence": o.confidence, "rules": o.triggered_rules} for o in outputs],
                 "verdict": {"risk_score": fused_risk, "regime": final_regime.value, "escalation_required": escalation, "entropy": entropy, "unassessable": unassessable},

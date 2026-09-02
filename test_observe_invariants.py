@@ -23,6 +23,7 @@ from observe_consolidated import (
     regime_distribution,
     validate_vitals,
     compute_decision_fingerprint,
+    compute_state_commitment,
     PARAMETER_SET,
     PARAMETER_SET_VERSION,
     _canonical_json,
@@ -52,6 +53,32 @@ def make_vitals(**overrides) -> VitalsSnapshot:
     )
     defaults.update(overrides)
     return VitalsSnapshot(**defaults)
+
+
+class StateContinuityBoundary(unittest.TestCase):
+    """Narrow continuity checks at the evidence boundary."""
+
+    def test_state_commitment_is_deterministic(self):
+        payload = {"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}
+        self.assertEqual(
+            compute_state_commitment(payload),
+            compute_state_commitment({"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}),
+        )
+
+    def test_state_commitment_binds_to_predecessor(self):
+        payload = {"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}
+        self.assertNotEqual(
+            compute_state_commitment(payload, predecessor_state_commitment="prev-1"),
+            compute_state_commitment(payload, predecessor_state_commitment="prev-2"),
+        )
+
+    def test_engine_binds_each_verdict_to_the_previous_state(self):
+        engine = ObserveClinicalEngine()
+        first = engine.evaluate(make_vitals(patient_id="P-CHAIN", oxygen_saturation=97.0, heart_rate=100.0))
+        second = engine.evaluate(make_vitals(patient_id="P-CHAIN", oxygen_saturation=88.0, heart_rate=170.0))
+        self.assertNotEqual(first.state_commitment, second.state_commitment)
+        self.assertEqual(second.predecessor_state_commitment, first.state_commitment)
+        self.assertTrue(engine.audit_ledger.verify_integrity())
 
 
 class I1_EntropyInputIsAValidDistribution(unittest.TestCase):

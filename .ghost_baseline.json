@@ -13,7 +13,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.006914+00:00",
+    "first_seen": "2026-09-03T04:07:53.790746+00:00",
     "id": "ghost-e69003189c31",
     "layer": "mechanical",
     "severity": "minor",
@@ -34,7 +34,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007021+00:00",
+    "first_seen": "2026-09-03T04:07:53.790934+00:00",
     "id": "ghost-54faa5ec7dbf",
     "layer": "mechanical",
     "severity": "minor",
@@ -55,7 +55,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007033+00:00",
+    "first_seen": "2026-09-03T04:07:53.790946+00:00",
     "id": "ghost-3d7587e472aa",
     "layer": "mechanical",
     "severity": "minor",
@@ -76,7 +76,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007041+00:00",
+    "first_seen": "2026-09-03T04:07:53.790954+00:00",
     "id": "ghost-dad2072b7414",
     "layer": "mechanical",
     "severity": "minor",
@@ -97,7 +97,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007048+00:00",
+    "first_seen": "2026-09-03T04:07:53.790961+00:00",
     "id": "ghost-54368d4b53e9",
     "layer": "mechanical",
     "severity": "minor",
@@ -118,7 +118,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007054+00:00",
+    "first_seen": "2026-09-03T04:07:53.790968+00:00",
     "id": "ghost-9f46c48381f7",
     "layer": "mechanical",
     "severity": "minor",
@@ -139,7 +139,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007061+00:00",
+    "first_seen": "2026-09-03T04:07:53.790975+00:00",
     "id": "ghost-e1c92408fdaf",
     "layer": "mechanical",
     "severity": "minor",
@@ -160,7 +160,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007070+00:00",
+    "first_seen": "2026-09-03T04:07:53.790984+00:00",
     "id": "ghost-743a4d9cd521",
     "layer": "mechanical",
     "severity": "minor",
@@ -181,7 +181,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.007080+00:00",
+    "first_seen": "2026-09-03T04:07:53.790995+00:00",
     "id": "ghost-fbda53417bb6",
     "layer": "mechanical",
     "severity": "minor",
@@ -202,7 +202,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.014270+00:00",
+    "first_seen": "2026-09-03T04:07:53.798345+00:00",
     "id": "ghost-8c0c040ab3b8",
     "layer": "mechanical",
     "severity": "minor",
@@ -223,7 +223,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.031307+00:00",
+    "first_seen": "2026-09-03T04:07:53.817393+00:00",
     "id": "ghost-ffe9eee41055",
     "layer": "mechanical",
     "severity": "minor",
@@ -247,7 +247,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.125997+00:00",
+    "first_seen": "2026-09-03T04:07:53.919126+00:00",
     "id": "ghost-c2c6c25ea8bc",
     "layer": "mechanical",
     "severity": "major",
@@ -270,7 +270,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.126060+00:00",
+    "first_seen": "2026-09-03T04:07:53.919184+00:00",
     "id": "ghost-ecc2e4fa007a",
     "layer": "mechanical",
     "severity": "minor",
@@ -293,7 +293,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.139292+00:00",
+    "first_seen": "2026-09-03T04:07:53.934790+00:00",
     "id": "ghost-eb95f10ed8fd",
     "layer": "mechanical",
     "severity": "minor",
@@ -317,7 +317,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.141891+00:00",
+    "first_seen": "2026-09-03T04:07:53.937208+00:00",
     "id": "ghost-6210c693907e",
     "layer": "mechanical",
     "severity": "major",
@@ -341,7 +341,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.145940+00:00",
+    "first_seen": "2026-09-03T04:07:53.941232+00:00",
     "id": "ghost-5124a70254be",
     "layer": "mechanical",
     "severity": "major",
@@ -364,7 +364,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.147182+00:00",
+    "first_seen": "2026-09-03T04:07:53.942385+00:00",
     "id": "ghost-de4fa5e3e15f",
     "layer": "mechanical",
     "severity": "minor",
@@ -387,7 +387,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.163980+00:00",
+    "first_seen": "2026-09-03T04:07:53.961414+00:00",
     "id": "ghost-9844028da09e",
     "layer": "mechanical",
     "severity": "minor",
@@ -411,7 +411,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.164011+00:00",
+    "first_seen": "2026-09-03T04:07:53.961441+00:00",
     "id": "ghost-e0bec9d89bf0",
     "layer": "mechanical",
     "severity": "major",
@@ -434,7 +434,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.164918+00:00",
+    "first_seen": "2026-09-03T04:07:53.962307+00:00",
     "id": "ghost-f9092bc0bffb",
     "layer": "mechanical",
     "severity": "minor",
@@ -457,7 +457,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.164932+00:00",
+    "first_seen": "2026-09-03T04:07:53.962320+00:00",
     "id": "ghost-965378b71903",
     "layer": "mechanical",
     "severity": "minor",
@@ -480,7 +480,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.166674+00:00",
+    "first_seen": "2026-09-03T04:07:53.964195+00:00",
     "id": "ghost-191d3eaeb6f0",
     "layer": "mechanical",
     "severity": "minor",
@@ -505,7 +505,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.166690+00:00",
+    "first_seen": "2026-09-03T04:07:53.964213+00:00",
     "id": "ghost-6e0fc72277a1",
     "layer": "mechanical",
     "severity": "major",
@@ -529,7 +529,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.166701+00:00",
+    "first_seen": "2026-09-03T04:07:53.964224+00:00",
     "id": "ghost-03e361151da3",
     "layer": "mechanical",
     "severity": "major",
@@ -552,7 +552,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.166710+00:00",
+    "first_seen": "2026-09-03T04:07:53.964233+00:00",
     "id": "ghost-a2b59e78205b",
     "layer": "mechanical",
     "severity": "minor",
@@ -575,7 +575,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.168455+00:00",
+    "first_seen": "2026-09-03T04:07:53.966375+00:00",
     "id": "ghost-7d8cc72f7182",
     "layer": "mechanical",
     "severity": "minor",
@@ -598,7 +598,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.168468+00:00",
+    "first_seen": "2026-09-03T04:07:53.966403+00:00",
     "id": "ghost-2e1f21fdb927",
     "layer": "mechanical",
     "severity": "minor",
@@ -621,7 +621,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.168477+00:00",
+    "first_seen": "2026-09-03T04:07:53.966432+00:00",
     "id": "ghost-fde85be537ce",
     "layer": "mechanical",
     "severity": "minor",
@@ -645,7 +645,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.169879+00:00",
+    "first_seen": "2026-09-03T04:07:53.969229+00:00",
     "id": "ghost-062b614df604",
     "layer": "mechanical",
     "severity": "major",
@@ -668,7 +668,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.169892+00:00",
+    "first_seen": "2026-09-03T04:07:53.969278+00:00",
     "id": "ghost-e7033e574a3c",
     "layer": "mechanical",
     "severity": "minor",
@@ -691,7 +691,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.172925+00:00",
+    "first_seen": "2026-09-03T04:07:53.973606+00:00",
     "id": "ghost-21dd78b50cc3",
     "layer": "mechanical",
     "severity": "minor",
@@ -714,7 +714,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.175264+00:00",
+    "first_seen": "2026-09-03T04:07:53.976888+00:00",
     "id": "ghost-c64fcbb480dc",
     "layer": "mechanical",
     "severity": "minor",
@@ -737,7 +737,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.180014+00:00",
+    "first_seen": "2026-09-03T04:07:53.985021+00:00",
     "id": "ghost-f8f2536f47c3",
     "layer": "mechanical",
     "severity": "minor",
@@ -760,7 +760,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.193381+00:00",
+    "first_seen": "2026-09-03T04:07:54.003370+00:00",
     "id": "ghost-638c6aa560e6",
     "layer": "mechanical",
     "severity": "minor",
@@ -783,7 +783,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.204615+00:00",
+    "first_seen": "2026-09-03T04:07:54.017277+00:00",
     "id": "ghost-c2cf4f5f7c33",
     "layer": "mechanical",
     "severity": "minor",
@@ -806,7 +806,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.204641+00:00",
+    "first_seen": "2026-09-03T04:07:54.017322+00:00",
     "id": "ghost-3556cfa128cf",
     "layer": "mechanical",
     "severity": "minor",
@@ -829,7 +829,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.207013+00:00",
+    "first_seen": "2026-09-03T04:07:54.021911+00:00",
     "id": "ghost-0a352c563911",
     "layer": "mechanical",
     "severity": "minor",
@@ -852,7 +852,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.208629+00:00",
+    "first_seen": "2026-09-03T04:07:54.024994+00:00",
     "id": "ghost-11fe853d4725",
     "layer": "mechanical",
     "severity": "minor",
@@ -875,7 +875,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.208925+00:00",
+    "first_seen": "2026-09-03T04:07:54.025777+00:00",
     "id": "ghost-36e6c2b1aae6",
     "layer": "mechanical",
     "severity": "minor",
@@ -898,7 +898,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.212450+00:00",
+    "first_seen": "2026-09-03T04:07:54.031629+00:00",
     "id": "ghost-baa4b385b550",
     "layer": "mechanical",
     "severity": "minor",
@@ -921,7 +921,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.222864+00:00",
+    "first_seen": "2026-09-03T04:07:54.044861+00:00",
     "id": "ghost-7bc3768af727",
     "layer": "mechanical",
     "severity": "minor",
@@ -945,7 +945,7 @@
       ],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.226244+00:00",
+    "first_seen": "2026-09-03T04:07:54.048688+00:00",
     "id": "ghost-837aeccafbe0",
     "layer": "mechanical",
     "severity": "major",
@@ -966,7 +966,7 @@
       "related_files": [],
       "snippet": null
     },
-    "first_seen": "2026-09-03T03:54:32.282676+00:00",
+    "first_seen": "2026-09-03T04:07:54.105697+00:00",
     "id": "ghost-50e12f8fc64c",
     "layer": "mechanical",
     "severity": "minor",

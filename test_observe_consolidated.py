@@ -547,8 +547,13 @@ class TestEngineIntegration(unittest.TestCase):
         v1 = engine.evaluate(v)
         v2 = engine.evaluate(v)
         v3 = engine.evaluate(v)
-        # Should remain stable across repeated low-risk readings (no thrashing)
+        # Should remain stable across repeated low-risk readings (no thrashing).
+        # All three are asserted: checking only the first and last left the
+        # middle reading free to thrash, which is the exact failure this test
+        # exists to catch. Confirmed by mutation: an engine that returned
+        # CRITICAL on the second reading still passed the old version.
         self.assertEqual(v1.regime, OperationalRegime.STABLE)
+        self.assertEqual(v2.regime, OperationalRegime.STABLE)
         self.assertEqual(v3.regime, OperationalRegime.STABLE)
 
 

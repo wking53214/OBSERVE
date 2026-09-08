@@ -1,0 +1,12 @@
+OBSERVE
+Copyright 2026 William King
+
+This repository vendors files copied from three other repositories by the
+same author, all licensed under the Apache License 2.0:
+
+  sentinel_os       https://github.com/wking53214/sentinel_os
+  GSA-815           https://github.com/wking53214/GSA-815
+  observe-perceive  https://github.com/wking53214/observe-perceive
+
+Per-file status is recorded in VENDORED.md; the upstream commits this tree was
+last synced from are recorded in UPSTREAM.md.

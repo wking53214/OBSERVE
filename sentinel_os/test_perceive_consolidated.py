@@ -27,11 +27,12 @@ from perceive_consolidated import (
     DataExportPolicy,
     EmergencyOverridePolicy,
     Signer,
-    Proposal,
     GovernanceNode,
     ConsensusDecider,
     DGKGateway,
     DGKAwareVerdict,
+    PolicyEnforcementConfig,
+    GovernanceState,
 )
 
 
@@ -165,11 +166,14 @@ class TestCitadelGate(unittest.TestCase):
         out = PolicyGates.citadel(req)
         self.assertFalse(out.approved)
 
-    def test_hedging_language_rejected(self):
+    def test_clinical_hedging_not_blocked(self):
+        # FIX(WS2f): differential-diagnosis language ("might be septic") is legitimate
+        # clinical justification and must NOT be rejected. Clarity is enforced by the
+        # length + matching-context checks, not by banning probabilistic phrasing.
         req = PolicyRequest("REQ-1", "escalate_patient", "P001", "DR-001",
-                             {"justification": "Patient might maybe be deteriorating", "severity": "high"})
+                             {"justification": "Patient might be septic, escalating now", "severity": "high"})
         out = PolicyGates.citadel(req)
-        self.assertFalse(out.approved)
+        self.assertTrue(out.approved)
 
     def test_missing_required_context_rejected(self):
         req = PolicyRequest("REQ-1", "escalate_patient", "P001", "DR-001",
@@ -418,7 +422,9 @@ class TestPerceiveKernelIntegration(unittest.TestCase):
                              {"justification": "Patient showing rapid deterioration", "severity": "high"})
         verdict = self.kernel.evaluate_request(req)
         self.assertTrue(verdict.approved)
-        self.assertEqual(verdict.applied_gates, ["boundary_gate", "invariant_validator", "sentinel"])
+        # WS2a: escalate_patient now also runs the (advisory-by-default) escalation rate gate.
+        self.assertEqual(verdict.applied_gates,
+                         ["boundary_gate", "invariant_validator", "sentinel", "escalation_rate_policy"])
         self.assertIsNone(verdict.consensus_result)  # no DGK gateway configured
 
     def test_missing_manifest_rejected(self):
@@ -433,13 +439,16 @@ class TestPerceiveKernelIntegration(unittest.TestCase):
                              {"justification": "Adjusting threshold per clinical review", "rule_id": "RULE-42",
                               "changes": {"threshold": 0.6}})
         verdict = self.kernel.evaluate_request(req)
-        self.assertEqual(set(verdict.applied_gates), {"boundary_gate", "fortress", "citadel", "invariant_validator"})
+        # WS2a: modify_rule now also runs the (advisory-by-default) rule-modification gate.
+        self.assertEqual(set(verdict.applied_gates),
+                         {"boundary_gate", "fortress", "citadel", "invariant_validator", "rule_modification_policy"})
 
     def test_export_data_gate_selection(self):
         req = PolicyRequest("REQ-1", "export_data", "P001", "DR-001",
                              {"justification": "Quarterly compliance export", "export_type": "synthetic_only"})
         verdict = self.kernel.evaluate_request(req)
-        self.assertEqual(set(verdict.applied_gates), {"boundary_gate", "sentinel"})
+        # WS2a: export_data now also runs the (advisory-by-default) data-export gate.
+        self.assertEqual(set(verdict.applied_gates), {"boundary_gate", "sentinel", "data_export_policy"})
 
     def test_emergency_override_gate_selection(self):
         req = PolicyRequest("REQ-1", "emergency_override", "P001", "DR-001", {
@@ -595,6 +604,110 @@ class TestDGKAwareVerdict(unittest.TestCase):
         v_with_consensus = DGKAwareVerdict("REQ-2", True, 0.9, consensus_result={"consensus_size": 3})
         self.assertFalse(v_no_consensus.is_consensus_decision)
         self.assertTrue(v_with_consensus.is_consensus_decision)
+
+
+# ============================================================================
+# NEW (WS2a): wired governance — advisory default + enforcement-ON blocking
+# ============================================================================
+
+def _kernel(enforcement=None):
+    k = PerceiveGovernanceKernel(enforcement=enforcement)
+    k.register_manifest(PolicyManifest("m", "1.0.0", datetime.now(timezone.utc),
+                                       policies={"escalation": {"max_daily": 10}}))
+    return k
+
+
+class TestGovernanceState(unittest.TestCase):
+    def test_escalation_window_counts(self):
+        gs = GovernanceState()
+        ref = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        from datetime import timedelta
+        gs.record_escalation("P1", ref - timedelta(minutes=10))
+        gs.record_escalation("P1", ref - timedelta(hours=2))
+        day, hour, mins = gs.escalation_window_counts("P1", ref)
+        self.assertEqual(day, 2)
+        self.assertEqual(hour, 1)
+        self.assertEqual(mins, 10)
+
+    def test_no_history_returns_large_gap(self):
+        gs = GovernanceState()
+        ref = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        day, hour, mins = gs.escalation_window_counts("UNKNOWN", ref)
+        self.assertEqual((day, hour), (0, 0))
+        self.assertGreater(mins, 10 ** 6)
+
+
+class TestAdvisoryGovernanceDefault(unittest.TestCase):
+    """Default (advisory) mode must not flip any baseline verdict."""
+
+    def setUp(self):
+        self.ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.kernel = _kernel()  # all enforcement flags default False
+
+    def test_repeated_escalations_all_approved_in_advisory(self):
+        from datetime import timedelta
+        approvals = []
+        for i in range(6):
+            req = PolicyRequest(f"E{i}", "escalate_patient", "P1", "DR",
+                                {"severity": "warning"}, timestamp=self.ts + timedelta(minutes=i))
+            approvals.append(self.kernel.evaluate_request(req).approved)
+        self.assertTrue(all(approvals))  # advisory: never blocks
+
+    def test_advisory_note_present_when_limit_would_trip(self):
+        # Two escalations at the same instant: the 2nd would trip cooldown, but advisory approves.
+        req = PolicyRequest("E0", "escalate_patient", "P9", "DR", {"severity": "warning"}, timestamp=self.ts)
+        self.kernel.evaluate_request(req)
+        req2 = PolicyRequest("E1", "escalate_patient", "P9", "DR", {"severity": "warning"}, timestamp=self.ts)
+        v2 = self.kernel.evaluate_request(req2)
+        self.assertTrue(v2.approved)
+
+
+class TestEnforcementOnBlocks(unittest.TestCase):
+    """With enforcement enabled, the wired policies must block on violation."""
+
+    def setUp(self):
+        self.ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_escalation_cooldown_blocks_when_enforced(self):
+        k = _kernel(PolicyEnforcementConfig(enforce_escalation_limits=True))
+        r1 = PolicyRequest("E0", "escalate_patient", "P1", "DR", {"severity": "warning"}, timestamp=self.ts)
+        self.assertTrue(k.evaluate_request(r1).approved)
+        r2 = PolicyRequest("E1", "escalate_patient", "P1", "DR", {"severity": "warning"}, timestamp=self.ts)
+        self.assertFalse(k.evaluate_request(r2).approved)  # cooldown trips
+
+    def test_pii_export_without_consent_blocks_when_enforced(self):
+        k = _kernel(PolicyEnforcementConfig(enforce_export_controls=True))
+        req = PolicyRequest("X1", "export_data", "P1", "DR",
+                            {"justification": "Research extract", "export_type": "pii_included"},
+                            timestamp=self.ts)
+        v = k.evaluate_request(req)
+        self.assertFalse(v.approved)
+
+    def test_consented_encrypted_pii_export_approved_when_enforced(self):
+        k = _kernel(PolicyEnforcementConfig(enforce_export_controls=True))
+        req = PolicyRequest("X2", "export_data", "P1", "DR",
+                            {"justification": "Research extract", "export_type": "pii_included",
+                             "has_consent": True, "will_encrypt": True},
+                            timestamp=self.ts)
+        self.assertTrue(k.evaluate_request(req).approved)
+
+    def test_rule_modification_without_approvals_blocks_when_enforced(self):
+        k = _kernel(PolicyEnforcementConfig(enforce_rule_modification=True))
+        req = PolicyRequest("R1", "modify_rule", "P1", "DR",
+                            {"justification": "Tighten threshold per review", "rule_id": "RULE-1",
+                             "rule_type": "safety_critical", "approval_count": 0},
+                            timestamp=self.ts)
+        self.assertFalse(k.evaluate_request(req).approved)
+
+    def test_emergency_override_never_rate_limited(self):
+        # Critical life-safety path must not carry the escalation rate gate even when enforced.
+        k = _kernel(PolicyEnforcementConfig(enforce_escalation_limits=True))
+        ctx = {"emergency_reason": "Critical desaturation", "override_type": "patient_safety",
+               "physician_approved": True, "can_notify_stakeholders": True, "escalated_to_physician": True}
+        for i in range(5):
+            v = k.evaluate_request(PolicyRequest(f"O{i}", "emergency_override", "P1", "DR", ctx, timestamp=self.ts))
+            self.assertTrue(v.approved)
+            self.assertNotIn("escalation_rate_policy", v.applied_gates)
 
 
 if __name__ == "__main__":

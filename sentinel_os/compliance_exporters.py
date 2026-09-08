@@ -21,6 +21,7 @@ import csv
 import io
 import json
 import hashlib
+import os
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
@@ -41,12 +42,36 @@ def deidentify_timestamp(iso_ts: str) -> str:
         return "REDACTED"
 
 
-def pseudonymize_patient_id(patient_id: str, salt: str = "OBSERVE_SALT_V1") -> str:
+def _resolve_deid_salt(salt: Optional[str]) -> str:
+    """Resolve the de-identification salt from the argument or the OBSERVE_DEID_SALT
+    environment variable, and FAIL LOUD if neither is present.
+
+    FIX(WS2d / red-team R6): the salt was previously a hardcoded source constant
+    ("OBSERVE_SALT_V1"). With a public salt and a low-entropy ID space, an attacker
+    rebuilds the pseudonym->ID map by brute force (a rainbow table) and reverses the
+    "non-reversible" pseudonyms. The salt must be a secret held by the data controller,
+    injected at runtime, never committed to source. A guessable default is worse than
+    an error, so we refuse to proceed without one.
+    """
+    resolved = salt if salt is not None else os.environ.get("OBSERVE_DEID_SALT")
+    if not resolved:
+        raise RuntimeError(
+            "De-identification salt required: pass salt= or set the OBSERVE_DEID_SALT "
+            "environment variable. Refusing to pseudonymize with a guessable default "
+            "(it would make pseudonyms reversible)."
+        )
+    return resolved
+
+
+def pseudonymize_patient_id(patient_id: str, salt: Optional[str] = None) -> str:
     """
     Replace a raw patient_id with a stable, non-reversible pseudonym.
-    Same patient -> same pseudonym (enables longitudinal analysis without PII).
+    Same patient + same salt -> same pseudonym (enables longitudinal analysis
+    without PII). The salt is a runtime secret (see _resolve_deid_salt); reversibility
+    of the pseudonym depends entirely on the salt remaining secret.
     """
-    digest = hashlib.sha256(f"{salt}:{patient_id}".encode()).hexdigest()
+    resolved_salt = _resolve_deid_salt(salt)
+    digest = hashlib.sha256(f"{resolved_salt}:{patient_id}".encode()).hexdigest()
     return f"PT-{digest[:12]}"
 
 
@@ -58,12 +83,14 @@ class HIPAAExporter:
     """De-identified clinical event log from the OBSERVE audit ledger."""
 
     @staticmethod
-    def export_csv(observe_entries: List[Dict[str, Any]]) -> str:
+    def export_csv(observe_entries: List[Dict[str, Any]], salt: Optional[str] = None) -> str:
         """
         observe_entries: list of OBSERVE audit entries (dicts with patient_id,
         timestamp, action, data, immutable_hash).
+        salt: de-identification secret (arg or OBSERVE_DEID_SALT env); required.
         Returns CSV text. No raw PII: patient_id pseudonymized, timestamp coarsened.
         """
+        resolved_salt = _resolve_deid_salt(salt)  # fail loud before emitting any rows
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=[
             "pseudonym", "date_hour", "action", "risk_score", "regime",
@@ -74,7 +101,7 @@ class HIPAAExporter:
         for e in observe_entries:
             verdict = (e.get("data") or {}).get("verdict", {})
             writer.writerow({
-                "pseudonym": pseudonymize_patient_id(e.get("patient_id", "UNKNOWN")),
+                "pseudonym": pseudonymize_patient_id(e.get("patient_id", "UNKNOWN"), salt=resolved_salt),
                 "date_hour": deidentify_timestamp(e.get("timestamp", "")),
                 "action": e.get("action", ""),
                 "risk_score": round(verdict.get("risk_score", 0.0), 3),
@@ -114,7 +141,7 @@ class FDAExporter:
         lines = [
             "FDA 510(k) SOFTWARE VALIDATION REPORT",
             "=" * 50,
-            f"Software: OBSERVE Clinical AI",
+            "Software: OBSERVE Clinical AI",
             f"Version: {software_version}",
             f"Report generated: {datetime.now(timezone.utc).isoformat()}",
             "",
@@ -142,8 +169,15 @@ class FDAExporter:
             "DETERMINISM ATTESTATION",
             "-" * 50,
             "All risk engines are pure functions of recorded telemetry + context.",
-            "Given identical inputs, the system produces identical outputs and the",
-            "same audit hash. No randomness in the decision path.",
+            "Given identical recorded inputs, the system produces identical decision",
+            "outputs (risk, regime, escalation) and an identical reproducible",
+            "decision_fingerprint (SHA256 of the wall-clock-free decision payload).",
+            "No randomness in the decision path.",
+            "",
+            "NOTE: the chained audit hash (immutable_hash) is NOT reproducible across",
+            "runs by design — it additionally binds insertion timestamp and ledger",
+            "position for tamper-evidence. Use decision_fingerprint for decision",
+            "replay; use immutable_hash for tamper detection.",
             "",
             "TRACEABILITY",
             "-" * 50,
@@ -227,14 +261,16 @@ class GDPRExporter:
             "DATA MINIMIZATION / EXPORT CONTROLS",
             "-" * 50,
             f"  Permitted export modes in use: {', '.join(export_types_used)}",
-            "  PII export requires explicit consent + encryption (enforced by",
-            "  PERCEIVE DataExportPolicy). Default exports are de-identified.",
+            "  PERCEIVE DataExportPolicy gates PII export on consent + encryption.",
+            "  Enforcement is operator-configurable (PolicyEnforcementConfig); it must",
+            "  be ENABLED in production. Default exports are de-identified.",
             "",
             "DATA SUBJECT RIGHTS",
             "-" * 50,
             "  Access/erasure requests are serviceable via patient_id lookup against",
-            "  the audit ledgers. Pseudonymization is reversible only by the",
-            "  controller holding the salt.",
+            "  the audit ledgers. Pseudonyms are reversible only by the controller",
+            "  holding the de-identification salt, which is a runtime secret",
+            "  (OBSERVE_DEID_SALT) and is never committed to source.",
         ]
         return "\n".join(lines)
 
@@ -307,10 +343,18 @@ if __name__ == "__main__":
     perceive_entries = system.export_perceive_audit()
     audits = system.verify_all_audits()
 
+    # De-id salt is a runtime secret. In production set OBSERVE_DEID_SALT. For this
+    # demo we fall back to an obvious non-production value and say so out loud.
+    demo_salt = os.environ.get("OBSERVE_DEID_SALT")
+    if not demo_salt:
+        demo_salt = "DEMO_SALT_NOT_FOR_PRODUCTION"
+        print("WARNING: OBSERVE_DEID_SALT not set; using a demo salt. "
+              "Pseudonyms in this output are NOT securely de-identified.\n")
+
     print("=" * 70)
     print("HIPAA — De-identified Clinical Event Log")
     print("=" * 70)
-    print(HIPAAExporter.export_csv(observe_entries))
+    print(HIPAAExporter.export_csv(observe_entries, salt=demo_salt))
 
     print("=" * 70)
     print("FDA — 510(k) Validation Report")

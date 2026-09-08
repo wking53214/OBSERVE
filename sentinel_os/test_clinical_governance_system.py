@@ -14,8 +14,6 @@ from datetime import datetime, timezone, timedelta
 
 from observe_consolidated import VitalsSnapshot
 from clinical_governance_system import (
-    ClinicalGovernanceSystem,
-    ClinicalDecision,
     build_single_hospital_system,
     build_multi_hospital_system,
 )
@@ -82,10 +80,20 @@ class TestEscalationTypeSelection(unittest.TestCase):
         # which do NOT include micropatch.
         # Septic-shock pattern lands as critical, so to get a clean warning we need an
         # elevated-but-not-critical fused risk. We drive it via a hard-rule O2 warning.
-        d = self.system.process_vitals(vitals(hr=120, o2=86.0, rr=30, temp=37.5, age=24, force_heavy=True))
-        if d.escalation_required and d.regime == "warning":
-            self.assertNotIn("micropatch", d.applied_gates)
-            self.assertIn("boundary_gate", d.applied_gates)
+        #
+        # The previous input (hr=120, o2=86.0, rr=30, age=24, force_heavy=True)
+        # produced regime "stable" with no escalation, and the assertions sat
+        # behind `if d.escalation_required and d.regime == "warning"`, so this
+        # test had never asserted anything. Measured by deleting the guard:
+        # it failed with "regime=stable esc=False". The input below was found
+        # by scanning the engine for one that actually escalates at WARNING,
+        # and the regime is asserted first so the gate assertions cannot go
+        # dark again if the thresholds move.
+        d = self.system.process_vitals(vitals(hr=100, o2=84.0, rr=20, temp=37.5, age=6, force_heavy=False))
+        self.assertEqual(d.regime, "warning")
+        self.assertTrue(d.escalation_required)
+        self.assertNotIn("micropatch", d.applied_gates)
+        self.assertIn("boundary_gate", d.applied_gates)
 
 
 # ============================================================================
@@ -159,6 +167,41 @@ class TestAuditIntegrity(unittest.TestCase):
         self.assertIn("patient_id", as_dict)
         self.assertIn("observe_audit_hash", as_dict)
         self.assertIn("action", as_dict)
+
+
+class TestGovernanceFailOpen(unittest.TestCase):
+    """A governance crash must not suppress a clinical escalation (fail-open, flagged)."""
+
+    def test_governance_exception_fails_open_for_escalation(self):
+        system = build_single_hospital_system()
+
+        def _boom(_request):
+            raise RuntimeError("simulated PERCEIVE failure")
+
+        system.perceive.evaluate_request = _boom  # inject failure
+
+        # A critical case that escalates in OBSERVE, then hits the broken governance layer.
+        crit = VitalsSnapshot("P1", datetime.now(timezone.utc), 168, 83.0, 46, 39.5,
+                              context={"age_months": 12, "force_heavy": True})
+        decision = system.process_vitals(crit)
+
+        self.assertTrue(decision.escalation_required)
+        self.assertEqual(decision.action, "escalate_approved_fallback")
+        self.assertTrue(decision.governance_approved)            # failed open
+        self.assertEqual(decision.governance_confidence, 0.0)    # but with zero confidence
+        self.assertTrue(any("GOVERNANCE_FAILURE_FALLBACK" in v for v in decision.governance_violations))
+
+    def test_non_escalation_never_reaches_governance(self):
+        system = build_single_hospital_system()
+
+        def _boom(_request):
+            raise RuntimeError("should not be called")
+
+        system.perceive.evaluate_request = _boom
+        stable = VitalsSnapshot("P2", datetime.now(timezone.utc), 110, 98.0, 24, 37.0,
+                                context={"age_months": 24})
+        decision = system.process_vitals(stable)  # must not raise
+        self.assertEqual(decision.action, "continue_monitoring")
 
 
 if __name__ == "__main__":

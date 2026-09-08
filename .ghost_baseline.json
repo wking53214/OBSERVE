@@ -16810,5 +16810,3230 @@
     "severity": "minor",
     "status": "suppressed",
     "summary": "'sentinel_worker_verification_report_v1.md' claims 8 test(s), but at least 1107 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "dead_code",
+    "confidence": null,
+    "detail": "No ast.Name, ast.Attribute, or string-subscript-key node anywhere in the scanned files resolves to this identifier. Scope limit: getattr-by-string and decorator-based registration are still not traced, so this can false-positive on names only reached that way -- confirm before deleting.",
+    "detector": "dead_code",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/governance_contracts.py",
+      "line_end": null,
+      "line_start": null,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.062758+00:00",
+    "id": "ghost-a775de034d46",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'GovernanceDecision' is defined but never referenced anywhere in the scanned set"
+  },
+  {
+    "category": "dead_code",
+    "confidence": null,
+    "detail": "No ast.Name, ast.Attribute, or string-subscript-key node anywhere in the scanned files resolves to this identifier. Scope limit: getattr-by-string and decorator-based registration are still not traced, so this can false-positive on names only reached that way -- confirm before deleting.",
+    "detector": "dead_code",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/governance_contracts.py",
+      "line_end": null,
+      "line_start": null,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.064467+00:00",
+    "id": "ghost-08572e684590",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'GovernanceRequest' is defined but never referenced anywhere in the scanned set"
+  },
+  {
+    "category": "dead_code",
+    "confidence": null,
+    "detail": "No ast.Name, ast.Attribute, or string-subscript-key node anywhere in the scanned files resolves to this identifier. Scope limit: getattr-by-string and decorator-based registration are still not traced, so this can false-positive on names only reached that way -- confirm before deleting.",
+    "detector": "dead_code",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/governance_contracts.py",
+      "line_end": null,
+      "line_start": null,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.064519+00:00",
+    "id": "ghost-5b301de8a4b4",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'ConservationDecision' is defined but never referenced anywhere in the scanned set"
+  },
+  {
+    "category": "dead_code",
+    "confidence": null,
+    "detail": "No ast.Name, ast.Attribute, or string-subscript-key node anywhere in the scanned files resolves to this identifier. Scope limit: getattr-by-string and decorator-based registration are still not traced, so this can false-positive on names only reached that way -- confirm before deleting.",
+    "detector": "dead_code",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/governance_contracts.py",
+      "line_end": null,
+      "line_start": null,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.064578+00:00",
+    "id": "ghost-0c8e82a815e9",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'OutcomeContext' is defined but never referenced anywhere in the scanned set"
+  },
+  {
+    "category": "complexity",
+    "confidence": null,
+    "detail": "Line-count proxy for the 'Long Method' smell, not true cyclomatic complexity -- a long function that's mostly a flat sequence of simple statements is a weaker signal than a short function with deep branching. Treat as a prompt to look, not a verdict.",
+    "detector": "long_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/clinical_governance_system.py",
+      "line_end": 246,
+      "line_start": 154,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.393379+00:00",
+    "id": "ghost-597198bd865d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'process_vitals' spans 92 lines (threshold 80)"
+  },
+  {
+    "category": "complexity",
+    "confidence": null,
+    "detail": "Line-count proxy for the 'Long Method' smell, not true cyclomatic complexity -- a long function that's mostly a flat sequence of simple statements is a weaker signal than a short function with deep branching. Treat as a prompt to look, not a verdict.",
+    "detector": "long_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 1343,
+      "line_start": 1234,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.507480+00:00",
+    "id": "ghost-8a800565a284",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'evaluate' spans 109 lines (threshold 80)"
+  },
+  {
+    "category": "complexity",
+    "confidence": null,
+    "detail": "Line-count proxy for the 'Long Method' smell, not true cyclomatic complexity -- a long function that's mostly a flat sequence of simple statements is a weaker signal than a short function with deep branching. Treat as a prompt to look, not a verdict.",
+    "detector": "long_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 1122,
+      "line_start": 980,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:17.538119+00:00",
+    "id": "ghost-2fdf807b4582",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'evaluate_request' spans 142 lines (threshold 80)"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 360,
+      "line_start": 350,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.152987+00:00",
+    "id": "ghost-5a0b5737a13c",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:350:get_age_group, observe_consolidated.py:247:get_age_group"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 741,
+      "line_start": 735,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153053+00:00",
+    "id": "ghost-2479ef030dfe",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:735:_has_physiological_telemetry, observe_consolidated.py:629:_has_physiological_telemetry"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 443,
+      "line_start": 395,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153109+00:00",
+    "id": "ghost-b5164affbac4",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:395:heuristic, observe_consolidated.py:292:heuristic"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 487,
+      "line_start": 446,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153160+00:00",
+    "id": "ghost-632e2709be39",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:446:bayesian, observe_consolidated.py:343:bayesian"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 554,
+      "line_start": 490,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153209+00:00",
+    "id": "ghost-fdf1be2467dd",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:490:trajectory, observe_consolidated.py:387:trajectory"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 659,
+      "line_start": 604,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153257+00:00",
+    "id": "ghost-5510af7648b8",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:604:behavioral_vaccine, observe_consolidated.py:501:behavioral_vaccine"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 715,
+      "line_start": 662,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153303+00:00",
+    "id": "ghost-950022f33046",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:662:adversarial, observe_consolidated.py:559:adversarial"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 779,
+      "line_start": 771,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153351+00:00",
+    "id": "ghost-081ab0f41fef",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:771:_topology_risk, observe_consolidated.py:665:_topology_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 790,
+      "line_start": 782,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153399+00:00",
+    "id": "ghost-8e96a30e8dbd",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:782:_capacity_risk, observe_consolidated.py:676:_capacity_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 802,
+      "line_start": 793,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153444+00:00",
+    "id": "ghost-961d8e287359",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:793:_resource_risk, observe_consolidated.py:687:_resource_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 812,
+      "line_start": 805,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153490+00:00",
+    "id": "ghost-b89bbaa873f3",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:805:_integrity_risk, observe_consolidated.py:699:_integrity_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 822,
+      "line_start": 815,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153579+00:00",
+    "id": "ghost-641736988ae0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:815:_phase_risk, observe_consolidated.py:709:_phase_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 831,
+      "line_start": 825,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153629+00:00",
+    "id": "ghost-8ce828d3f139",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:825:_instability_risk, observe_consolidated.py:719:_instability_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 881,
+      "line_start": 834,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153675+00:00",
+    "id": "ghost-1eadd2f678b6",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:834:physiological_reserve, observe_consolidated.py:728:physiological_reserve"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 945,
+      "line_start": 892,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153733+00:00",
+    "id": "ghost-fe2609e9ee69",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:892:fuse, observe_consolidated.py:786:fuse"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 995,
+      "line_start": 964,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153782+00:00",
+    "id": "ghost-fc577c6af05d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:964:evaluate, observe_consolidated.py:858:evaluate"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1019,
+      "line_start": 1007,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/ascent_compute_module.py",
+        "/home/wking53214/OBSERVE/sentinel_os/drive_safety_module.py",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153859+00:00",
+    "id": "ghost-eb0111e306a9",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "4 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1007:append, ascent_compute_module.py:571:append, drive_safety_module.py:592:append, observe_consolidated.py:901:append"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1032,
+      "line_start": 1021,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/ascent_compute_module.py",
+        "/home/wking53214/OBSERVE/sentinel_os/drive_safety_module.py",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.153947+00:00",
+    "id": "ghost-c19bf55d9fdb",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "4 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1021:verify_integrity, ascent_compute_module.py:585:verify_integrity, drive_safety_module.py:606:verify_integrity, observe_consolidated.py:915:verify_integrity"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1084,
+      "line_start": 1070,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154058+00:00",
+    "id": "ghost-9054cee585d4",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1070:mark_failed_and_requeue, observe_consolidated.py:964:mark_failed_and_requeue"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1095,
+      "line_start": 1086,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154113+00:00",
+    "id": "ghost-d0424e90a200",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1086:complete, observe_consolidated.py:980:complete"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1108,
+      "line_start": 1101,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154160+00:00",
+    "id": "ghost-ebbb7f620b5e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1101:export_summary, observe_consolidated.py:995:export_summary"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1157,
+      "line_start": 1132,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154206+00:00",
+    "id": "ghost-27750e7092d4",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1132:_worker_loop, observe_consolidated.py:1026:_worker_loop"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1167,
+      "line_start": 1159,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154254+00:00",
+    "id": "ghost-561bfcec90cb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1159:stop, observe_consolidated.py:1053:stop"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1193,
+      "line_start": 1182,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154299+00:00",
+    "id": "ghost-051242b8fb70",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1182:store, observe_consolidated.py:1076:store"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1213,
+      "line_start": 1199,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154344+00:00",
+    "id": "ghost-03165b261d63",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1199:reconcile, observe_consolidated.py:1093:reconcile"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/observe_consolidated.py",
+      "line_end": 1226,
+      "line_start": 1219,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.154389+00:00",
+    "id": "ghost-5bdd29886078",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): observe_consolidated.py:1219:_evict_expired, observe_consolidated.py:1113:_evict_expired"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/drive_safety_module.py",
+      "line_end": 126,
+      "line_start": 106,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.162075+00:00",
+    "id": "ghost-cd83666e1a89",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): drive_safety_module.py:106:regime_distribution, observe_consolidated.py:260:regime_distribution"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/drive_safety_module.py",
+      "line_end": 549,
+      "line_start": 542,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.162130+00:00",
+    "id": "ghost-1c7657302c8e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): drive_safety_module.py:542:__init__, observe_consolidated.py:849:__init__"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 39,
+      "line_start": 28,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.163946+00:00",
+    "id": "ghost-37ecdfb6ec82",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:28:make_vitals, test_observe_consolidated.py:27:make_vitals"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 140,
+      "line_start": 134,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164003+00:00",
+    "id": "ghost-c80cac9d9492",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:134:test_debug_info_populated_not_in_triggered_rules, test_observe_consolidated.py:133:test_debug_info_populated_not_in_triggered_rules"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 153,
+      "line_start": 147,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164059+00:00",
+    "id": "ghost-3e6912486b95",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:147:test_continuous_likelihood_not_step, test_observe_consolidated.py:146:test_continuous_likelihood_not_step"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 176,
+      "line_start": 168,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164117+00:00",
+    "id": "ghost-e63c53e98066",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:168:test_per_minute_threshold_realistic, test_observe_consolidated.py:167:test_per_minute_threshold_realistic"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 188,
+      "line_start": 178,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164173+00:00",
+    "id": "ghost-aa1c13532d1d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:178:test_no_name_error_with_partial_history, test_observe_consolidated.py:177:test_no_name_error_with_partial_history"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 199,
+      "line_start": 190,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164235+00:00",
+    "id": "ghost-650d6d96d6cb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:190:test_multi_trend_deterioration, test_observe_consolidated.py:189:test_multi_trend_deterioration"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 211,
+      "line_start": 201,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164296+00:00",
+    "id": "ghost-0c273dcb8647",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:201:test_regime_distribution_reflects_high_risk, test_observe_consolidated.py:200:test_regime_distribution_reflects_high_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 235,
+      "line_start": 225,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164353+00:00",
+    "id": "ghost-8e29a3b3a5a9",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:225:test_zero_baseline_not_treated_as_missing, test_observe_consolidated.py:224:test_zero_baseline_not_treated_as_missing"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 244,
+      "line_start": 237,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164408+00:00",
+    "id": "ghost-c575adb327dc",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:237:test_drift_detected_with_shifted_baseline, test_observe_consolidated.py:236:test_drift_detected_with_shifted_baseline"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 253,
+      "line_start": 246,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164463+00:00",
+    "id": "ghost-2c57b34c0bfa",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:246:test_critical_floor_present, test_observe_consolidated.py:245:test_critical_floor_present"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 294,
+      "line_start": 288,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164537+00:00",
+    "id": "ghost-339bcdf2e01a",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:288:test_dangerous_pattern_suppresses_benign_reduction, test_observe_consolidated.py:287:test_dangerous_pattern_suppresses_benign_reduction"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 303,
+      "line_start": 296,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164611+00:00",
+    "id": "ghost-841a7cabf091",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:296:test_base_risk_computed_independently, test_observe_consolidated.py:295:test_base_risk_computed_independently"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 349,
+      "line_start": 342,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164669+00:00",
+    "id": "ghost-8eee727ea1c0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:342:test_time_aware_rate_threshold, test_observe_consolidated.py:341:test_time_aware_rate_threshold"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 384,
+      "line_start": 377,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164735+00:00",
+    "id": "ghost-6aa9271f60bd",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:377:test_fusion_weights_by_confidence, test_observe_consolidated.py:376:test_fusion_weights_by_confidence"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 406,
+      "line_start": 396,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164791+00:00",
+    "id": "ghost-655defdc6604",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:396:test_dwell_requires_consecutive_confirmation, test_observe_consolidated.py:395:test_dwell_requires_consecutive_confirmation"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 422,
+      "line_start": 408,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164847+00:00",
+    "id": "ghost-339632b2a3e0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:408:test_dwell_resets_on_disagreement, test_observe_consolidated.py:407:test_dwell_resets_on_disagreement"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 435,
+      "line_start": 424,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164904+00:00",
+    "id": "ghost-ae17cdea3e07",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:424:test_escalation_lock_prevents_immediate_re_escalation, test_observe_consolidated.py:423:test_escalation_lock_prevents_immediate_re_escalation"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 458,
+      "line_start": 450,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.164960+00:00",
+    "id": "ghost-e644f4cd20a3",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:450:test_tamper_detection, test_observe_consolidated.py:449:test_tamper_detection"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 467,
+      "line_start": 460,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165017+00:00",
+    "id": "ghost-ad7c391a7c84",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:460:test_query_patient, test_observe_consolidated.py:459:test_query_patient"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 507,
+      "line_start": 501,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165075+00:00",
+    "id": "ghost-3034293198c8",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:501:test_export_all_is_deep_copy, test_observe_consolidated.py:500:test_export_all_is_deep_copy"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 535,
+      "line_start": 529,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165132+00:00",
+    "id": "ghost-d1263fb5d364",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:529:test_critical_o2_bypasses_dwell_immediately, test_observe_consolidated.py:528:test_critical_o2_bypasses_dwell_immediately"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 557,
+      "line_start": 544,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165188+00:00",
+    "id": "ghost-63d2fd87350e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:544:test_borderline_case_respects_dwell, test_observe_consolidated.py:543:test_borderline_case_respects_dwell"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 569,
+      "line_start": 563,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165243+00:00",
+    "id": "ghost-a37c453dc51b",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:563:test_abstains_without_rich_telemetry, test_observe_consolidated.py:563:test_abstains_without_rich_telemetry"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 579,
+      "line_start": 571,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165302+00:00",
+    "id": "ghost-14f3c9ebc336",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:571:test_healthy_physiology_low_risk, test_observe_consolidated.py:571:test_healthy_physiology_low_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 595,
+      "line_start": 581,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165388+00:00",
+    "id": "ghost-ca27198cab8a",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:581:test_critical_physiology_is_critical_dominant, test_observe_consolidated.py:581:test_critical_physiology_is_critical_dominant"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 606,
+      "line_start": 597,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165470+00:00",
+    "id": "ghost-744a483823b7",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:597:test_absent_axes_do_not_dilute, test_observe_consolidated.py:597:test_absent_axes_do_not_dilute"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 619,
+      "line_start": 608,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165574+00:00",
+    "id": "ghost-be6d2776f1e0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:608:test_confidence_scales_with_axes_present, test_observe_consolidated.py:608:test_confidence_scales_with_axes_present"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 627,
+      "line_start": 621,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165653+00:00",
+    "id": "ghost-eb752bec1281",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:621:test_instability_axis_from_hr_history_alone, test_observe_consolidated.py:621:test_instability_axis_from_hr_history_alone"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 646,
+      "line_start": 633,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py",
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165726+00:00",
+    "id": "ghost-9026cd8f6d2f",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "4 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:633:test_no_cross_patient_lock_suppression, test_observe_consolidated.py:648:test_same_patient_lock_still_applies, test_observe_consolidated.py:633:test_no_cross_patient_lock_suppression, test_observe_consolidated.py:648:test_same_patient_lock_still_applies"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 667,
+      "line_start": 661,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165786+00:00",
+    "id": "ghost-21b60ce920ca",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:661:test_independent_entropy_tracking, test_observe_consolidated.py:661:test_independent_entropy_tracking"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 681,
+      "line_start": 669,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.165995+00:00",
+    "id": "ghost-ea80d276235c",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:669:test_bounded_eviction_lru, test_observe_consolidated.py:669:test_bounded_eviction_lru"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 699,
+      "line_start": 683,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166057+00:00",
+    "id": "ghost-0cae4fc855e1",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:683:test_recently_assessed_patient_survives_eviction, test_observe_consolidated.py:683:test_recently_assessed_patient_survives_eviction"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 721,
+      "line_start": 710,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166113+00:00",
+    "id": "ghost-85999cc21ccf",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:710:test_abstainers_excluded_from_fusion, test_observe_consolidated.py:710:test_abstainers_excluded_from_fusion"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 734,
+      "line_start": 723,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166168+00:00",
+    "id": "ghost-1790d3b6ee0f",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:723:test_syndrome_floor_pins_risk, test_observe_consolidated.py:723:test_syndrome_floor_pins_risk"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 744,
+      "line_start": 736,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166223+00:00",
+    "id": "ghost-e641f272ae65",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:736:test_no_syndrome_no_floor, test_observe_consolidated.py:736:test_no_syndrome_no_floor"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 754,
+      "line_start": 746,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166280+00:00",
+    "id": "ghost-7ed9e4b23065",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:746:test_all_abstained_degenerate_fallback, test_observe_consolidated.py:746:test_all_abstained_degenerate_fallback"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 765,
+      "line_start": 756,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166336+00:00",
+    "id": "ghost-096004ecb127",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_observe_consolidated.py:756:test_septic_shock_bypasses_dwell_on_first_reading, test_observe_consolidated.py:756:test_septic_shock_bypasses_dwell_on_first_reading"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match, not textual diff -- this is the 'copy-pasted then renamed' shape specifically. Confirm these are actually solving the same problem before merging; some structural matches are coincidental (e.g. two unrelated simple validators).",
+    "detector": "near_duplicate_function",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 269,
+      "line_start": 260,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.166393+00:00",
+    "id": "ghost-a3d486a8cab8",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "2 functions share identical AST structure (names/literals differ, control flow and shape don't): test_perceive_consolidated.py:260:test_patient_safety_with_full_context_approved, test_perceive_consolidated.py:271:test_patient_safety_without_physician_escalation_rejected"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/capacity_planning.py",
+      "line_end": 231,
+      "line_start": 231,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/capacity_planning.py:232-232",
+        "/home/wking53214/OBSERVE/sentinel_os/capacity_planning.py:233-233"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.745661+00:00",
+    "id": "ghost-fd323c1c34bd",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'report' repeats the same single statement 3 times (lines 231-231, 232-232, 233-233): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py",
+      "line_end": 93,
+      "line_start": 93,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py:94-94"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.964992+00:00",
+    "id": "ghost-17181720af98",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'step' repeats the same single statement 2 times (lines 93-93, 94-94): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py",
+      "line_end": 96,
+      "line_start": 96,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py:112-112"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.965153+00:00",
+    "id": "ghost-5974eee51e34",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'step' repeats the same single statement 2 times (lines 96-96, 112-112): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py",
+      "line_end": 105,
+      "line_start": 105,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py:106-106"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.965223+00:00",
+    "id": "ghost-92c03365c1c9",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'step' repeats the same single statement 2 times (lines 105-105, 106-106): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py",
+      "line_end": 110,
+      "line_start": 110,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/kalman_trajectory.py:111-111"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:19.965284+00:00",
+    "id": "ghost-8c3c0da3875d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'step' repeats the same single statement 2 times (lines 110-110, 111-111): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 211,
+      "line_start": 211,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:220-220"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.022730+00:00",
+    "id": "ghost-a6971e0afe3e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'sanitize_context' repeats the same single statement 2 times (lines 211-211, 220-220): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 310,
+      "line_start": 310,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:325-325"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.025051+00:00",
+    "id": "ghost-c3bd1cb54ef5",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'heuristic' repeats the same single statement 2 times (lines 310-310, 325-325): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 314,
+      "line_start": 314,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:317-317",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:321-321"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.025148+00:00",
+    "id": "ghost-19d529ec08b8",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'heuristic' repeats the same single statement 3 times (lines 314-314, 317-317, 321-321): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 355,
+      "line_start": 355,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:356-356"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.026007+00:00",
+    "id": "ghost-dece906e9577",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'bayesian' repeats the same single statement 2 times (lines 355-355, 356-356): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 368,
+      "line_start": 368,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:372-372"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.026086+00:00",
+    "id": "ghost-9a553b2c7262",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'bayesian' repeats the same single statement 2 times (lines 368-368, 372-372): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 409,
+      "line_start": 409,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:430-430"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.027730+00:00",
+    "id": "ghost-aaf0960bd69b",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'trajectory' repeats the same single statement 2 times (lines 409-409, 430-430): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 410,
+      "line_start": 410,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:416-416",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:425-425",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:431-431"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.027843+00:00",
+    "id": "ghost-62c4d469e63d",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'trajectory' repeats the same single statement 4 times (lines 410-410, 416-416, 425-425, 431-431): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 411,
+      "line_start": 411,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:420-420",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:432-432"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.027930+00:00",
+    "id": "ghost-c6182f866124",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'trajectory' repeats the same single statement 3 times (lines 411-411, 420-420, 432-432): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 417,
+      "line_start": 417,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:426-426"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.027988+00:00",
+    "id": "ghost-3e13168bb4e0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'trajectory' repeats the same single statement 2 times (lines 417-417, 426-426): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 476,
+      "line_start": 476,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:485-485"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.029711+00:00",
+    "id": "ghost-d6984e451049",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'drift' repeats the same single statement 2 times (lines 476-476, 485-485): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 477,
+      "line_start": 477,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:486-486"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.029789+00:00",
+    "id": "ghost-045ea071cc53",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'drift' repeats the same single statement 2 times (lines 477-477, 486-486): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 479,
+      "line_start": 479,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:488-488"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.029849+00:00",
+    "id": "ghost-10521856f441",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'drift' repeats the same single statement 2 times (lines 479-479, 488-488): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 524,
+      "line_start": 522,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:527-529",
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:532-534"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.031222+00:00",
+    "id": "ghost-256017c41ef8",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'behavioral_vaccine' repeats the same 3-statement block 3 times (lines 522-524, 527-529, 532-534): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 544,
+      "line_start": 544,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:547-547"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.031324+00:00",
+    "id": "ghost-10f6133eaba1",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'behavioral_vaccine' repeats the same single statement 2 times (lines 544-544, 547-547): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 714,
+      "line_start": 714,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:715-715"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.034195+00:00",
+    "id": "ghost-8ff14ad44f56",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'_phase_risk' repeats the same single statement 2 times (lines 714-714, 715-715): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py",
+      "line_end": 812,
+      "line_start": 812,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/observe_consolidated.py:830-830"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.036876+00:00",
+    "id": "ghost-7345966c8ba2",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'fuse' repeats the same single statement 2 times (lines 812-812, 830-830): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 158,
+      "line_start": 158,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:162-162"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.081239+00:00",
+    "id": "ghost-773279a35de2",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'can_escalate' repeats the same single statement 2 times (lines 158-158, 162-162): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 159,
+      "line_start": 159,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:163-163",
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:167-167"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.081429+00:00",
+    "id": "ghost-971d5a9d10ab",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'can_escalate' repeats the same single statement 3 times (lines 159-159, 163-163, 167-167): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 193,
+      "line_start": 193,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:195-195"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.082039+00:00",
+    "id": "ghost-e838ed37b47e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'can_modify' repeats the same single statement 2 times (lines 193-193, 195-195): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 194,
+      "line_start": 194,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:196-196"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.082156+00:00",
+    "id": "ghost-3f0039b30762",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'can_modify' repeats the same single statement 2 times (lines 194-194, 196-196): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 221,
+      "line_start": 221,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:223-223",
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:225-225"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.082529+00:00",
+    "id": "ghost-c6de628aff33",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'can_export' repeats the same single statement 3 times (lines 221-221, 223-223, 225-225): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 252,
+      "line_start": 252,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:256-256"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.083326+00:00",
+    "id": "ghost-25e3bffbdb2f",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'can_override' repeats the same single statement 2 times (lines 252-252, 256-256): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 424,
+      "line_start": 424,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:436-436"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.086213+00:00",
+    "id": "ghost-7a889dfd08cb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'sentinel' repeats the same single statement 2 times (lines 424-424, 436-436): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 833,
+      "line_start": 833,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:834-834"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.090216+00:00",
+    "id": "ghost-a28e60947c64",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'__init__' repeats the same single statement 2 times (lines 833-833, 834-834): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py",
+      "line_end": 845,
+      "line_start": 845,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/perceive_consolidated.py:846-846"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.090757+00:00",
+    "id": "ghost-0715ad441c96",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'escalation_window_counts' repeats the same single statement 2 times (lines 845-845, 846-846): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/reserve_control.py",
+      "line_end": 95,
+      "line_start": 95,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/reserve_control.py:106-106"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.218306+00:00",
+    "id": "ghost-96c9f787060f",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'modulate' repeats the same single statement 2 times (lines 95-95, 106-106): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_clinical_governance_system.py",
+      "line_end": 58,
+      "line_start": 58,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_clinical_governance_system.py:59-59"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.498365+00:00",
+    "id": "ghost-def9783113fb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_decision_links_both_audit_hashes' repeats the same single statement 2 times (lines 58-58, 59-59): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_clinical_governance_system.py",
+      "line_end": 160,
+      "line_start": 160,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_clinical_governance_system.py:161-161"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.500936+00:00",
+    "id": "ghost-16d6d4becbc7",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_both_chains_valid_after_mixed_traffic' repeats the same single statement 2 times (lines 160-160, 161-161): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_compliance_exporters.py",
+      "line_end": 250,
+      "line_start": 250,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_compliance_exporters.py:251-251"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.511725+00:00",
+    "id": "ghost-f8f1f2134ac3",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_summary_reports_both_chains' repeats the same single statement 2 times (lines 250-250, 251-251): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 118,
+      "line_start": 118,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:119-119"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.553782+00:00",
+    "id": "ghost-969fe3bbf6bf",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_age_adjusted_thresholds_differ' repeats the same single statement 2 times (lines 118-118, 119-119): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 120,
+      "line_start": 120,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:121-121"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.554025+00:00",
+    "id": "ghost-573dba6d97fb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_age_adjusted_thresholds_differ' repeats the same single statement 2 times (lines 120-120, 121-121): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 293,
+      "line_start": 293,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:294-294"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.557471+00:00",
+    "id": "ghost-0e3ccb4462fb",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_dangerous_pattern_suppresses_benign_reduction' repeats the same single statement 2 times (lines 293-293, 294-294): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 400,
+      "line_start": 400,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:404-404"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.559552+00:00",
+    "id": "ghost-31dbd750ec41",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_dwell_requires_consecutive_confirmation' repeats the same single statement 2 times (lines 400-400, 404-404): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 428,
+      "line_start": 428,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:433-433"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.560085+00:00",
+    "id": "ghost-d8058cc474b0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_escalation_lock_prevents_immediate_re_escalation' repeats the same single statement 2 times (lines 428-428, 433-433): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 692,
+      "line_start": 692,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:695-695"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.565282+00:00",
+    "id": "ghost-bec2490dce81",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_recently_assessed_patient_survives_eviction' repeats the same single statement 2 times (lines 692-692, 695-695): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py",
+      "line_end": 828,
+      "line_start": 828,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_observe_consolidated.py:829-829"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.569287+00:00",
+    "id": "ghost-65dc763d9fd9",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_fingerprint_changes_with_inputs' repeats the same single statement 2 times (lines 828-828, 829-829): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 360,
+      "line_start": 360,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:361-361"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.591675+00:00",
+    "id": "ghost-ce6f15dddf91",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_versioning' repeats the same single statement 2 times (lines 360-360, 361-361): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 519,
+      "line_start": 519,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:520-520",
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:521-521"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.597784+00:00",
+    "id": "ghost-ee09bb0dc828",
+    "layer": "mechanical",
+    "severity": "major",
+    "status": "suppressed",
+    "summary": "'test_quorum_with_one_dissenter' repeats the same single statement 3 times (lines 519-519, 520-520, 521-521): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 625,
+      "line_start": 625,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:626-626"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.601070+00:00",
+    "id": "ghost-75321d21340d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_escalation_window_counts' repeats the same single statement 2 times (lines 625-625, 626-626): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 658,
+      "line_start": 658,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:660-660"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.602638+00:00",
+    "id": "ghost-c8b63ebf574d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_advisory_note_present_when_limit_would_trip' repeats the same single statement 2 times (lines 658-658, 660-660): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 673,
+      "line_start": 673,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:675-675"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.603181+00:00",
+    "id": "ghost-88c81c5313c8",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_escalation_cooldown_blocks_when_enforced' repeats the same single statement 2 times (lines 673-673, 675-675): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py",
+      "line_end": 674,
+      "line_start": 674,
+      "related_files": [
+        "/home/wking53214/OBSERVE/sentinel_os/test_perceive_consolidated.py:676-676"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.603288+00:00",
+    "id": "ghost-38a207779844",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_escalation_cooldown_blocks_when_enforced' repeats the same single statement 2 times (lines 674-674, 676-676): same shape, names/literals differ"
+  },
+  {
+    "category": "duplication",
+    "confidence": null,
+    "detail": "Structural fingerprint match within one function, not a whole-function match (near_duplicate_function's detection is blind to this shape). Typical real cause: several branches each hand-build the same kind of object or perform the same sequence of calls -- worth a single shared helper if the branches really are doing the same thing, not just a coincidental resemblance.",
+    "detector": "intra_function_duplicate_block",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/test_observe_consolidated.py",
+      "line_end": 692,
+      "line_start": 692,
+      "related_files": [
+        "/home/wking53214/OBSERVE/test_observe_consolidated.py:695-695"
+      ],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:20.905875+00:00",
+    "id": "ghost-ef8cd4257cda",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'test_recently_assessed_patient_survives_eviction' repeats the same single statement 2 times (lines 692-692, 695-695): same shape, names/literals differ"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/CONTRIBUTING.md",
+      "line_end": 178,
+      "line_start": 178,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.722634+00:00",
+    "id": "ghost-854edac2141e",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'CONTRIBUTING.md' claims 110 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/docs/CHANGELOG.md",
+      "line_end": 67,
+      "line_start": 67,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.725504+00:00",
+    "id": "ghost-ca5216eefa63",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'CHANGELOG.md' claims 41 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/docs/sentinel-os-status-v1.md",
+      "line_end": 18,
+      "line_start": 18,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.726592+00:00",
+    "id": "ghost-7fabf8235ab3",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'sentinel-os-status-v1.md' claims 270 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/APPLY-1.md",
+      "line_end": 17,
+      "line_start": 17,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.726758+00:00",
+    "id": "ghost-f58804658eac",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'APPLY-1.md' claims 24 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/APPLY-c2-finding-2-correlation-mitigation.md",
+      "line_end": 32,
+      "line_start": 32,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.727176+00:00",
+    "id": "ghost-f16127aff39d",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'APPLY-c2-finding-2-correlation-mitigation.md' claims 10 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/APPLY-ledger-boot-and-ci-gates.md",
+      "line_end": 35,
+      "line_start": 35,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.727762+00:00",
+    "id": "ghost-0bec5f6691a1",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'APPLY-ledger-boot-and-ci-gates.md' claims 386 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/APPLY.md",
+      "line_end": 17,
+      "line_start": 17,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.728883+00:00",
+    "id": "ghost-bd67c26beed0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'APPLY.md' claims 24 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/APPLY_v1.md",
+      "line_end": 20,
+      "line_start": 20,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.729361+00:00",
+    "id": "ghost-c6be73e63917",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'APPLY_v1.md' claims 27 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/DELIVERABLE_MANIFEST.md",
+      "line_end": 130,
+      "line_start": 130,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.731184+00:00",
+    "id": "ghost-c23bbb6ec992",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'DELIVERABLE_MANIFEST.md' claims 77 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/DGK_LIGHT_INTEGRATION.md",
+      "line_end": 197,
+      "line_start": 197,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.731703+00:00",
+    "id": "ghost-dc9e4058faba",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'DGK_LIGHT_INTEGRATION.md' claims 18 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/FINAL_STATUS.md",
+      "line_end": 270,
+      "line_start": 270,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.732703+00:00",
+    "id": "ghost-553dffb81c0a",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'FINAL_STATUS.md' claims 77 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/PHASE_4_COMPLETE.md",
+      "line_end": 187,
+      "line_start": 187,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.733865+00:00",
+    "id": "ghost-10eb760d5281",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'PHASE_4_COMPLETE.md' claims 59 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/PRESENTATION_GUIDE.md",
+      "line_end": 54,
+      "line_start": 54,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.734466+00:00",
+    "id": "ghost-0fb79a3edfa9",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'PRESENTATION_GUIDE.md' claims 77 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/README_CONSOLIDATED.md",
+      "line_end": 31,
+      "line_start": 31,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.735077+00:00",
+    "id": "ghost-c97b7e2f39ad",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'README_CONSOLIDATED.md' claims 186 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/START_HERE.md",
+      "line_end": 67,
+      "line_start": 67,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.735756+00:00",
+    "id": "ghost-72307f826fd1",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'START_HERE.md' claims 77 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/START_HERE.md",
+      "line_end": 104,
+      "line_start": 104,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.735861+00:00",
+    "id": "ghost-091cacc99b04",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'START_HERE.md' claims 35 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/roadster_breakers_verification_report_v1.md",
+      "line_end": 22,
+      "line_start": 22,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.739183+00:00",
+    "id": "ghost-86392671e22b",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'roadster_breakers_verification_report_v1.md' claims 7 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/roadster_breakers_verification_report_v1.md",
+      "line_end": 58,
+      "line_start": 58,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.739741+00:00",
+    "id": "ghost-9fb4e7b58ed1",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'roadster_breakers_verification_report_v1.md' claims 16 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/roadster_breakers_verification_report_v1.md",
+      "line_end": 59,
+      "line_start": 59,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.740023+00:00",
+    "id": "ghost-f4a7edda0156",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'roadster_breakers_verification_report_v1.md' claims 6 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/roadster_breakers_verification_report_v1.md",
+      "line_end": 92,
+      "line_start": 92,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.740447+00:00",
+    "id": "ghost-86e9f3f2ad6f",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'roadster_breakers_verification_report_v1.md' claims 4 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
+  },
+  {
+    "category": "doc_drift",
+    "confidence": null,
+    "detail": "actual is a static AST lower bound (functions named test_*, counted directly, no pytest run) -- the true collected count can only be higher (pytest.mark.parametrize expands one function into several cases), never lower, so this can only under-flag, not over-flag. Confirm by running the real suite and update the claim, or remove the specific number if it will keep going stale.",
+    "detector": "doc_test_count_drift",
+    "disposition": null,
+    "disposition_note": "",
+    "evidence": {
+      "file": "/home/wking53214/OBSERVE/sentinel_os/sentinel_worker_verification_report_v1.md",
+      "line_end": 6,
+      "line_start": 6,
+      "related_files": [],
+      "snippet": null
+    },
+    "first_seen": "2026-09-08T03:47:21.740804+00:00",
+    "id": "ghost-64a9965cc2b0",
+    "layer": "mechanical",
+    "severity": "minor",
+    "status": "suppressed",
+    "summary": "'sentinel_worker_verification_report_v1.md' claims 8 test(s), but at least 1131 test_* function(s) exist in the scanned .py files -- this claim is stale"
   }
 ]

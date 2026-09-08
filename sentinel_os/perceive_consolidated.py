@@ -26,6 +26,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
+from governance_contracts import compute_state_commitment
+
 logger = logging.getLogger("PERCEIVE")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -65,6 +67,11 @@ class PolicyRequest:
     subject_id: str
     actor_id: str
     context: Dict[str, Any] = field(default_factory=dict)
+    timestamp: Optional[datetime] = None  # FIX(WS2a): caller-supplied reference time for
+    # rate-limit windows. The clinical pipeline passes vitals.timestamp, making the derived
+    # escalation counts a pure function of recorded inputs (deterministic). Falls back to
+    # wall-clock only when a caller omits it (e.g. ad-hoc admin requests).
+    state_commitment: str = ""
 
 
 @dataclass
@@ -88,7 +95,11 @@ class PolicyVerdict:
     policy_version: str
     provenance: Provenance
     audit_hash: str
+    state_commitment: str = ""
     consensus_result: Optional[Dict[str, Any]] = None  # populated if DGK multi-node consensus ran
+    # What the advisory-mode gates would have refused. The verdict is still
+    # `approved`; this is the record that a check ran and was not enforced.
+    advisory_violations: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -275,6 +286,16 @@ class GovernanceInvariants:
 class PolicyGates:
     """All 6 policy gate adapters, consolidated."""
 
+    # The request types admitted at the door. A class attribute rather than a
+    # literal inside boundary_gate so a test can READ it: while it lived in the
+    # function body the only way to check it against GovernanceRequestType was
+    # to copy the five strings into the test, which is not a check of the
+    # invariant but a second place for it to drift.
+    VALID_REQUEST_TYPES = frozenset({
+        "escalate_patient", "modify_rule", "export_data",
+        "emergency_override", "approve_decision",
+    })
+
     @staticmethod
     def boundary_gate(request: PolicyRequest) -> PolicyOutput:
         """Validates inbound requests are well-formed and of known type."""
@@ -287,8 +308,13 @@ class PolicyGates:
         if not request.actor_id:
             violations.append("Missing actor_id")
 
-        valid_types = {"escalate_patient", "modify_rule", "export_data", "emergency_override"}
-        if request.request_type not in valid_types:
+        # Must stay in step with _select_gates below and with
+        # GovernanceRequestType in governance_contracts. A type accepted here
+        # but unknown to _select_gates gets only the boundary gate -- an
+        # approval that skipped every real check. A type declared in the
+        # shared contract but missing here is refused at the door, which is
+        # the safer failure but still a gap.
+        if request.request_type not in PolicyGates.VALID_REQUEST_TYPES:
             violations.append(f"Unknown request_type: {request.request_type}")
 
         approved = len(violations) == 0
@@ -311,15 +337,25 @@ class PolicyGates:
         if request.request_type == "emergency_override" and not context.get("emergency_reason"):
             violations.append("Emergency override requires explicit reason")
 
-        if "maybe" in justification.lower() or "might" in justification.lower():
-            violations.append("Request lacks clarity (hedging language detected)")
+        # FIX(WS2f / red-team): removed the substring "maybe"/"might" hedging rejection.
+        # Clinical justifications routinely use differential-diagnosis language ("patient
+        # might be septic", "possible sepsis"), and substring matching also caught words
+        # like "mighty". It blocked legitimate escalations. Clarity is enforced by the
+        # length + matching-context checks below, not by banning probabilistic phrasing.
 
         request_type = request.request_type
         has_matching_context = (
             (request_type == "escalate_patient" and "severity" in context) or
             (request_type == "modify_rule" and "rule_id" in context) or
             (request_type == "export_data" and "export_type" in context) or
-            (request_type == "emergency_override" and "emergency_reason" in context)
+            (request_type == "emergency_override" and "emergency_reason" in context) or
+            # An approval must name who made it. An approval decision with no
+            # reviewer attached is not a human approval -- it is an automated
+            # pass wearing one's clothes, and that is exactly the substitution
+            # this gate should refuse.
+            (request_type == "approve_decision"
+             and isinstance(context.get("reviewer"), str)
+             and bool(context.get("reviewer", "").strip()))
         )
         if not has_matching_context and request_type != "unknown":
             violations.append(f"Request type '{request_type}' missing required context")
@@ -515,12 +551,17 @@ class ManifestRegistry:
 
     @staticmethod
     def _compute_hash(manifest: PolicyManifest) -> str:
+        # FIX(WS2b / red-team R5): hash the full policy CONTENT, not just version +
+        # policy_count + created_at. Previously two manifests with the same version and
+        # key count but different threshold values (e.g. max_daily 10 vs 99999) produced
+        # an identical hash — silently defeating the tamper-evidence the versioning exists
+        # for. The policies dict is now part of the digest.
         payload = {
             "version": manifest.version,
-            "policy_count": len(manifest.policies),
+            "policies": manifest.policies,
             "created_at": manifest.created_at.isoformat(),
         }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
     def get_manifest(self, version: Optional[str] = None) -> Optional[PolicyManifest]:
         if version is None:
@@ -756,6 +797,62 @@ class DGKAwareVerdict:
 
 
 # ============================================================================
+# WIRED GOVERNANCE: enforcement config + deterministic rate-limit state (WS2a)
+# ============================================================================
+
+@dataclass
+class PolicyEnforcementConfig:
+    """Whether the wired governance policies BLOCK (enforce) or only ADVISE.
+
+    The rich policy classes (EscalationPolicy / DataExportPolicy /
+    RuleModificationPolicy) were previously unit-tested but never invoked by any
+    gate. They are now wired in as real gates. To honor "opt-in, default OFF so
+    baseline behavior is unchanged," every flag defaults to advisory: the gate still
+    runs and records what it WOULD decide, but approves so no existing verdict flips.
+    Operators enable each when ready:
+      - escalation limits are patient-safety-sensitive (could defer a WARNING-level
+        escalation) and need clinical-governance sign-off before enabling;
+      - export + rule-modification controls are safe to enable in production.
+    Critical / emergency_override escalations are NEVER rate-limited (life-safety).
+    """
+    enforce_escalation_limits: bool = False
+    enforce_export_controls: bool = False
+    enforce_rule_modification: bool = False
+
+
+class GovernanceState:
+    """Minimal, deterministic, auditable state backing the rate-limited gates.
+
+    The only state is approval history; window counts are derived against a
+    caller-supplied reference time (PolicyRequest.timestamp), so identical recorded
+    requests yield identical limit decisions. History is recorded only AFTER a request
+    is approved, so a request never counts against itself.
+    """
+
+    def __init__(self) -> None:
+        self._escalations: Dict[str, List[datetime]] = {}   # subject_id -> approved escalation times
+        self._rule_mods: Dict[str, List[datetime]] = {}     # rule_type  -> approved modification times
+
+    def record_escalation(self, subject_id: str, ts: datetime) -> None:
+        self._escalations.setdefault(subject_id, []).append(ts)
+
+    def record_rule_modification(self, rule_type: str, ts: datetime) -> None:
+        self._rule_mods.setdefault(rule_type, []).append(ts)
+
+    def escalation_window_counts(self, subject_id: str, ref: datetime) -> Tuple[int, int, int]:
+        """Return (escalations_today, escalations_this_hour, minutes_since_last)."""
+        hist = [t for t in self._escalations.get(subject_id, []) if t <= ref]
+        day = sum(1 for t in hist if (ref - t).total_seconds() < 86400)
+        hour = sum(1 for t in hist if (ref - t).total_seconds() < 3600)
+        mins_since = int(min((ref - t).total_seconds() for t in hist) / 60.0) if hist else 10 ** 9
+        return day, hour, mins_since
+
+    def hours_since_last_rule_mod(self, rule_type: str, ref: datetime) -> int:
+        hist = [t for t in self._rule_mods.get(rule_type, []) if t <= ref]
+        return int(min((ref - t).total_seconds() for t in hist) / 3600.0) if hist else 10 ** 9
+
+
+# ============================================================================
 # PERCEIVE KERNEL (MAIN ORCHESTRATOR)
 # ============================================================================
 
@@ -771,11 +868,18 @@ class PerceiveGovernanceKernel:
         "micropatch": PolicyGates.micropatch,
     }
 
-    def __init__(self, dgk_gateway: Optional[DGKGateway] = None):
+    # Stateful policy gates evaluated by the kernel (need config + gov_state + ref time),
+    # kept out of the static GATE_MAP. They participate in unanimous consensus and audit.
+    POLICY_GATES = {"escalation_rate_policy", "data_export_policy", "rule_modification_policy"}
+
+    def __init__(self, dgk_gateway: Optional[DGKGateway] = None,
+                 enforcement: Optional[PolicyEnforcementConfig] = None):
         self.manifest_registry = ManifestRegistry()
         self.event_store = EventStore()
         self.audit_ledger = ImmutableAuditLedger()
         self.dgk_gateway = dgk_gateway  # Optional multi-node consensus for critical decisions
+        self.enforcement = enforcement or PolicyEnforcementConfig()  # WS2a: default advisory
+        self.gov_state = GovernanceState()  # WS2a: deterministic rate-limit history
         logger.info("PERCEIVE Governance Kernel initialized")
 
     def register_manifest(self, manifest: PolicyManifest) -> None:
@@ -787,15 +891,91 @@ class PerceiveGovernanceKernel:
         gates = ["boundary_gate"]  # always evaluated
 
         if request.request_type == "escalate_patient":
-            gates.extend(["invariant_validator", "sentinel"])
+            # WS2a: escalation_rate_policy wires EscalationPolicy (per-hour/day/cooldown).
+            gates.extend(["invariant_validator", "sentinel", "escalation_rate_policy"])
         elif request.request_type == "modify_rule":
-            gates.extend(["fortress", "citadel", "invariant_validator"])
+            # WS2a: rule_modification_policy wires RuleModificationPolicy (approvals + locks).
+            gates.extend(["fortress", "citadel", "invariant_validator", "rule_modification_policy"])
         elif request.request_type == "export_data":
-            gates.extend(["sentinel"])
+            # WS2a: data_export_policy wires DataExportPolicy (consent/audit-log/encryption).
+            gates.extend(["sentinel", "data_export_policy"])
         elif request.request_type == "emergency_override":
+            # Life-safety path: NEVER rate-limited. No escalation_rate_policy here by design.
             gates.extend(["micropatch", "sentinel"])
+        elif request.request_type == "approve_decision":
+            # A named person recording a decision about an artifact (the
+            # innovation_os approval path). citadel checks the reviewer
+            # actually gave a substantive rationale rather than a rubber
+            # stamp; invariant_validator checks the governance invariants
+            # still hold; sentinel catches anomalous approval behaviour such
+            # as an implausible volume of sign-offs.
+            #
+            # Deliberately NOT here: escalation_rate_policy, because an
+            # approval is not an escalation and rate-limiting a reviewer's
+            # throughput would be a different policy decision than the one
+            # that gate implements; and micropatch, which is the emergency
+            # override path and has nothing to do with routine review.
+            gates.extend(["citadel", "invariant_validator", "sentinel"])
 
         return list(dict.fromkeys(gates))
+
+    # ------------------------------------------------------------------
+    # Stateful policy gates (WS2a). Each wraps a previously-dead rich policy.
+    # In advisory mode (enforcement flag off) the gate still evaluates and records
+    # what it WOULD decide, but approves so no baseline verdict flips.
+    # ------------------------------------------------------------------
+    def _advisory_output(self, gate_name: str, ok: bool, enforced: bool,
+                         violations: List[str], kind: str) -> PolicyOutput:
+        approved = ok or not enforced
+        if ok:
+            notes: List[str] = []
+        elif enforced:
+            notes = violations
+        else:
+            notes = [f"ADVISORY (enforcement off): {v}" for v in violations]
+        return PolicyOutput(
+            gate_name=gate_name, approved=approved,
+            confidence=0.9 if approved else 0.85, violation_details=notes,
+            timestamp=datetime.now(timezone.utc),
+            provenance=Provenance("system", gate_name, kind),
+        )
+
+    def _escalation_rate_gate(self, request: PolicyRequest, ref: datetime) -> PolicyOutput:
+        day, hour, mins = self.gov_state.escalation_window_counts(request.subject_id, ref)
+        ok, violations = EscalationPolicy.can_escalate(
+            current_risk_tier=request.context.get("severity", "warning"),
+            escalations_today=day, escalations_this_hour=hour,
+            minutes_since_last_escalation=mins,
+        )
+        return self._advisory_output("escalation_rate_policy", ok,
+                                     self.enforcement.enforce_escalation_limits,
+                                     violations, "escalation_rate_limit")
+
+    def _export_gate(self, request: PolicyRequest) -> PolicyOutput:
+        ctx = request.context
+        # will_audit_log defaults True: the kernel writes an immutable ledger entry for
+        # every decision, so export IS audit-logged by construction. Consent + encryption
+        # are caller-asserted and default to the safe (most restrictive) values.
+        ok, violations = DataExportPolicy.can_export(
+            export_type=ctx.get("export_type", "aggregate_only"),
+            has_consent=ctx.get("has_consent", False),
+            will_audit_log=ctx.get("will_audit_log", True),
+            will_encrypt=ctx.get("will_encrypt", False),
+        )
+        return self._advisory_output("data_export_policy", ok,
+                                     self.enforcement.enforce_export_controls,
+                                     violations, "data_export")
+
+    def _rule_modification_gate(self, request: PolicyRequest, ref: datetime) -> PolicyOutput:
+        rule_type = request.context.get("rule_type", "non_critical")
+        ok, violations = RuleModificationPolicy.can_modify(
+            rule_type=rule_type,
+            approval_count=request.context.get("approval_count", 0),
+            hours_since_last_modification=self.gov_state.hours_since_last_rule_mod(rule_type, ref),
+        )
+        return self._advisory_output("rule_modification_policy", ok,
+                                     self.enforcement.enforce_rule_modification,
+                                     violations, "rule_modification")
 
     def evaluate_request(self, request: PolicyRequest) -> PolicyVerdict:
         """Main evaluation loop: gates → consensus → DGK (if critical) → audit."""
@@ -814,14 +994,24 @@ class PerceiveGovernanceKernel:
         gates_to_evaluate = self._select_gates(request)
         logger.info(f"Selected gates: {gates_to_evaluate}")
 
+        # WS2a: reference time for rate-limit windows. Caller-supplied (clinical pipeline
+        # passes vitals.timestamp) -> deterministic; wall-clock only as a fallback.
+        ref_time = request.timestamp or datetime.now(timezone.utc)
+
         policy_outputs = []
         for gate_name in gates_to_evaluate:
-            gate_fn = self.GATE_MAP.get(gate_name)
-            if gate_fn is None:
-                logger.warning(f"Gate not found: {gate_name}")
-                continue
             try:
-                output = gate_fn(request)
+                if gate_name in self.GATE_MAP:
+                    output = self.GATE_MAP[gate_name](request)
+                elif gate_name == "escalation_rate_policy":
+                    output = self._escalation_rate_gate(request, ref_time)
+                elif gate_name == "data_export_policy":
+                    output = self._export_gate(request)
+                elif gate_name == "rule_modification_policy":
+                    output = self._rule_modification_gate(request, ref_time)
+                else:
+                    logger.warning(f"Gate not found: {gate_name}")
+                    continue
                 policy_outputs.append(output)
                 logger.info(f"{gate_name}: approved={output.approved}, confidence={output.confidence:.2f}")
             except Exception as e:
@@ -834,6 +1024,25 @@ class PerceiveGovernanceKernel:
                 ))
 
         approved, confidence, violations = ConsensusEngine.evaluate(policy_outputs)
+
+        # Gates in advisory mode (PolicyEnforcementConfig, the default) record
+        # what they would have refused and approve anyway. Until now that
+        # record lived only in this kernel's audit ledger: the verdict said
+        # approved with no violations, so nothing downstream could tell an
+        # export that cleared the consent check from one that was waved
+        # through. Surface it on the verdict, and say what turns it on.
+        advisory_violations = [
+            f"{o.gate_name}: {d}"
+            for o in policy_outputs if o.approved
+            for d in o.violation_details
+        ]
+        if advisory_violations:
+            logger.warning(
+                f"Request {request.request_id}: {len(advisory_violations)} advisory "
+                f"violation(s) recorded but NOT enforced -- verdict stays approved. "
+                f"Set the matching PolicyEnforcementConfig.enforce_* flag to make "
+                f"them block: {advisory_violations}"
+            )
 
         # Optional: DGK multi-node consensus for critical decisions
         consensus_result = None
@@ -851,6 +1060,15 @@ class PerceiveGovernanceKernel:
                 approved = False
                 violations.append(f"DGK_CONSENSUS_FAILED: {e}")
 
+        # WS2a: record history only AFTER final approval, so a request never counts
+        # against itself and the NEXT request sees it. Deterministic on ref_time.
+        if approved:
+            if request.request_type == "escalate_patient":
+                self.gov_state.record_escalation(request.subject_id, ref_time)
+            elif request.request_type == "modify_rule":
+                self.gov_state.record_rule_modification(
+                    request.context.get("rule_type", "non_critical"), ref_time)
+
         provenance = Provenance(
             actor_id=request.actor_id, policy_id=manifest.version,
             justification=f"Consensus of {len(gates_to_evaluate)} gates" + (" + DGK multi-node" if consensus_result else ""),
@@ -861,6 +1079,19 @@ class PerceiveGovernanceKernel:
             "gate_count": len(gates_to_evaluate),
             "dgk_consensus": consensus_result,
         }
+        decision_state_commitment = compute_state_commitment(
+            parent_commitment=request.state_commitment,
+            state={
+                "request": asdict(request),
+                "decision": final_verdict_dict,
+                "provenance": {
+                    "actor_id": provenance.actor_id,
+                    "policy_id": provenance.policy_id,
+                    "justification": provenance.justification,
+                },
+            },
+        )
+        final_verdict_dict["state_commitment"] = decision_state_commitment
 
         audit_entry = self.audit_ledger.append_decision(
             request_snapshot=asdict(request),
@@ -883,6 +1114,8 @@ class PerceiveGovernanceKernel:
             violations=violations, applied_gates=gates_to_evaluate,
             policy_version=manifest.version, provenance=provenance,
             audit_hash=audit_entry.immutable_hash, consensus_result=consensus_result,
+            state_commitment=decision_state_commitment,
+            advisory_violations=advisory_violations,
         )
 
         logger.info(f"Verdict: approved={approved}, confidence={confidence:.2f}, audit_hash={audit_entry.immutable_hash[:16]}")

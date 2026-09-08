@@ -95,7 +95,9 @@ class TestFullPipelineCriticalCase(unittest.TestCase):
         perceive_verdict = self.perceive.evaluate_request(request)
 
         self.assertTrue(perceive_verdict.approved)
-        self.assertEqual(perceive_verdict.applied_gates, ["boundary_gate", "invariant_validator", "sentinel"])
+        # WS2a: escalate_patient now also runs the (advisory-by-default) escalation rate gate.
+        self.assertEqual(perceive_verdict.applied_gates,
+                         ["boundary_gate", "invariant_validator", "sentinel", "escalation_rate_policy"])
 
         # Both audit trails independently verify
         self.assertTrue(self.observe.audit_ledger.verify_integrity())
@@ -152,7 +154,8 @@ class TestFullPipelineDwellThenEscalation(unittest.TestCase):
             context={"age_months": 24, "force_heavy": True},
         )
 
-        v1 = self.observe.evaluate(vitals)
+        # First reading primes the dwell state; only the second is examined.
+        self.observe.evaluate(vitals)
         v2 = self.observe.evaluate(vitals)
 
         # Verify the heuristic-only score is indeed below the hard-rule bypass threshold

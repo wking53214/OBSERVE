@@ -21,6 +21,7 @@ from observe_consolidated import (
     get_age_group,
     ImmutableAuditLedger,
     ProvisionalStore,
+    validate_vitals,
 )
 
 
@@ -548,10 +549,9 @@ class TestEngineIntegration(unittest.TestCase):
         v2 = engine.evaluate(v)
         v3 = engine.evaluate(v)
         # Should remain stable across repeated low-risk readings (no thrashing).
-        # All three are asserted: checking only the first and last left the
-        # middle reading free to thrash, which is the exact failure this test
-        # exists to catch. Confirmed by mutation: an engine that returned
-        # CRITICAL on the second reading still passed the old version.
+        # All three are asserted: checking only the first and last lets the
+        # middle reading thrash unobserved, which is the exact failure this
+        # test exists to rule out.
         self.assertEqual(v1.regime, OperationalRegime.STABLE)
         self.assertEqual(v2.regime, OperationalRegime.STABLE)
         self.assertEqual(v3.regime, OperationalRegime.STABLE)
@@ -763,6 +763,94 @@ class TestFusionAbstentionAndSyndrome(unittest.TestCase):
         self.assertIn(verdict.regime, (OperationalRegime.WARNING, OperationalRegime.CRITICAL))
         self.assertTrue(any("DANGEROUS_PATTERN" in r or "CLINICAL_SAFETY_BYPASS" in r
                             for r in verdict.triggered_rules))
+
+
+# ============================================================================
+# NEW (WS2): data-integrity validation, reproducible fingerprint, behavioral gating
+# ============================================================================
+
+class TestVitalsValidation(unittest.TestCase):
+    """Red-team R1/R2: non-finite or impossible vitals must NOT score as 'stable'."""
+
+    def test_validate_flags_nan(self):
+        v = make_vitals(oxygen_saturation=float("nan"))
+        faults = validate_vitals(v)
+        self.assertTrue(any("oxygen_saturation" in f for f in faults))
+
+    def test_validate_flags_inf_and_out_of_range(self):
+        self.assertTrue(validate_vitals(make_vitals(respiratory_rate=float("inf"))))
+        self.assertTrue(validate_vitals(make_vitals(oxygen_saturation=120.0)))   # >100 impossible
+        self.assertTrue(validate_vitals(make_vitals(temperature=1000.0)))
+        self.assertTrue(validate_vitals(make_vitals(heart_rate=-50)))
+
+    def test_validate_passes_normal_vitals(self):
+        self.assertEqual(validate_vitals(make_vitals()), [])
+
+    def test_nan_evaluation_warns_and_escalates_not_stable(self):
+        engine = ObserveClinicalEngine()
+        verdict = engine.evaluate(make_vitals(oxygen_saturation=float("nan")))
+        self.assertNotEqual(verdict.regime, OperationalRegime.STABLE)
+        self.assertEqual(verdict.regime, OperationalRegime.WARNING)
+        self.assertTrue(verdict.escalation_required)
+        self.assertTrue(any("DATA_INTEGRITY_FAULT" in r for r in verdict.triggered_rules))
+
+    def test_fault_is_audited_and_chain_valid(self):
+        engine = ObserveClinicalEngine()
+        engine.evaluate(make_vitals(heart_rate=float("inf")))
+        self.assertEqual(len(engine.audit_ledger.entries), 1)
+        self.assertTrue(engine.audit_ledger.verify_integrity())
+
+
+class TestDecisionFingerprint(unittest.TestCase):
+    """WS2c: reproducible decision fingerprint, distinct from the chained audit hash."""
+
+    def test_fingerprint_reproducible_across_instances(self):
+        fixed_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        def mk():
+            return make_vitals(patient_id="PF", timestamp=fixed_ts, heart_rate=168,
+                               oxygen_saturation=83.0, respiratory_rate=46, temperature=39.5,
+                               context={"age_months": 12, "force_heavy": True})
+        a = ObserveClinicalEngine().evaluate(mk())
+        b = ObserveClinicalEngine().evaluate(mk())
+        self.assertNotEqual(a.decision_fingerprint, "")
+        self.assertEqual(a.decision_fingerprint, b.decision_fingerprint)
+
+    def test_audit_hash_not_equal_across_instances(self):
+        # The chained ledger hash binds wall-clock + position; it is intentionally NOT reproducible.
+        def mk():
+            return make_vitals(patient_id="PF2", oxygen_saturation=84.0,
+                               context={"age_months": 12, "force_heavy": True})
+        a = ObserveClinicalEngine().evaluate(mk())
+        b = ObserveClinicalEngine().evaluate(mk())
+        self.assertNotEqual(a.audit_hash, b.audit_hash)
+
+    def test_fingerprint_changes_with_inputs(self):
+        a = ObserveClinicalEngine().evaluate(make_vitals(patient_id="PF3", oxygen_saturation=97.0))
+        b = ObserveClinicalEngine().evaluate(make_vitals(patient_id="PF3", oxygen_saturation=84.0))
+        self.assertNotEqual(a.decision_fingerprint, b.decision_fingerprint)
+
+
+class TestBehavioralGatingWidened(unittest.TestCase):
+    """WS2e / red-team R3: behavioral engine must run on severe RR or high temp."""
+
+    def test_behavioral_selected_on_high_rr(self):
+        engine = ObserveClinicalEngine()
+        # borderline O2/HR but severe tachypnea
+        v = make_vitals(patient_id="PG1", heart_rate=139, oxygen_saturation=93.0,
+                        respiratory_rate=55, temperature=37.5, context={"age_months": 24})
+        self.assertIn("behavioral", engine.select_engines(v))
+
+    def test_behavioral_selected_on_high_temp(self):
+        engine = ObserveClinicalEngine()
+        v = make_vitals(patient_id="PG2", heart_rate=120, oxygen_saturation=95.0,
+                        respiratory_rate=20, temperature=39.5, context={"age_months": 24})
+        self.assertIn("behavioral", engine.select_engines(v))
+
+    def test_behavioral_not_selected_when_all_normal(self):
+        engine = ObserveClinicalEngine()
+        v = make_vitals(patient_id="PG3", heart_rate=110, oxygen_saturation=98.0,
+                        respiratory_rate=24, temperature=37.0, context={"age_months": 24})
+        self.assertNotIn("behavioral", engine.select_engines(v))
 
 
 if __name__ == "__main__":

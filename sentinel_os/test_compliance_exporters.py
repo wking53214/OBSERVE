@@ -69,17 +69,17 @@ class TestDeidentification(unittest.TestCase):
         self.assertEqual(deidentify_timestamp("not-a-timestamp"), "REDACTED")
 
     def test_pseudonym_stable(self):
-        a = pseudonymize_patient_id("PATIENT-001")
-        b = pseudonymize_patient_id("PATIENT-001")
+        a = pseudonymize_patient_id("PATIENT-001", salt="UNIT_TEST_SALT")
+        b = pseudonymize_patient_id("PATIENT-001", salt="UNIT_TEST_SALT")
         self.assertEqual(a, b)  # same input -> same pseudonym
 
     def test_pseudonym_differs_per_patient(self):
-        self.assertNotEqual(pseudonymize_patient_id("PATIENT-001"),
-                            pseudonymize_patient_id("PATIENT-002"))
+        self.assertNotEqual(pseudonymize_patient_id("PATIENT-001", salt="UNIT_TEST_SALT"),
+                            pseudonymize_patient_id("PATIENT-002", salt="UNIT_TEST_SALT"))
 
     def test_pseudonym_does_not_contain_raw_id(self):
         raw = "PATIENT-SECRET-001"
-        pseudo = pseudonymize_patient_id(raw)
+        pseudo = pseudonymize_patient_id(raw, salt="UNIT_TEST_SALT")
         self.assertNotIn(raw, pseudo)
         self.assertNotIn("SECRET", pseudo)
 
@@ -88,6 +88,33 @@ class TestDeidentification(unittest.TestCase):
             pseudonymize_patient_id("PATIENT-001", salt="SALT_A"),
             pseudonymize_patient_id("PATIENT-001", salt="SALT_B"),
         )
+
+    def test_missing_salt_raises(self):
+        # FIX(WS2d): with no salt arg and no OBSERVE_DEID_SALT env, refuse to proceed.
+        import os as _os
+        saved = _os.environ.pop("OBSERVE_DEID_SALT", None)
+        try:
+            with self.assertRaises(RuntimeError):
+                pseudonymize_patient_id("PATIENT-001")
+            with self.assertRaises(RuntimeError):
+                HIPAAExporter.export_csv([])
+        finally:
+            if saved is not None:
+                _os.environ["OBSERVE_DEID_SALT"] = saved
+
+    def test_salt_from_environment(self):
+        # FIX(WS2d): salt may be supplied via OBSERVE_DEID_SALT instead of the arg.
+        import os as _os
+        saved = _os.environ.get("OBSERVE_DEID_SALT")
+        _os.environ["OBSERVE_DEID_SALT"] = "ENV_SALT"
+        try:
+            self.assertEqual(pseudonymize_patient_id("PATIENT-001"),
+                             pseudonymize_patient_id("PATIENT-001", salt="ENV_SALT"))
+        finally:
+            if saved is None:
+                _os.environ.pop("OBSERVE_DEID_SALT", None)
+            else:
+                _os.environ["OBSERVE_DEID_SALT"] = saved
 
 
 # ============================================================================
@@ -98,7 +125,7 @@ class TestHIPAAExporter(unittest.TestCase):
 
     def test_no_raw_pii_in_output(self):
         _, observe_entries, _, _ = build_traffic()
-        csv_text = HIPAAExporter.export_csv(observe_entries)
+        csv_text = HIPAAExporter.export_csv(observe_entries, salt="UNIT_TEST_SALT")
         # Raw patient IDs must NOT appear anywhere in the export
         self.assertNotIn("PATIENT-SECRET-001", csv_text)
         self.assertNotIn("PATIENT-SECRET-002", csv_text)
@@ -106,12 +133,12 @@ class TestHIPAAExporter(unittest.TestCase):
 
     def test_pseudonyms_present(self):
         _, observe_entries, _, _ = build_traffic()
-        csv_text = HIPAAExporter.export_csv(observe_entries)
+        csv_text = HIPAAExporter.export_csv(observe_entries, salt="UNIT_TEST_SALT")
         self.assertIn("PT-", csv_text)  # pseudonym prefix
 
     def test_csv_well_formed_with_expected_columns(self):
         _, observe_entries, _, _ = build_traffic()
-        csv_text = HIPAAExporter.export_csv(observe_entries)
+        csv_text = HIPAAExporter.export_csv(observe_entries, salt="UNIT_TEST_SALT")
         reader = csv.DictReader(io.StringIO(csv_text))
         rows = list(reader)
         self.assertEqual(len(rows), len(observe_entries))
@@ -120,7 +147,7 @@ class TestHIPAAExporter(unittest.TestCase):
 
     def test_timestamps_coarsened_in_output(self):
         _, observe_entries, _, _ = build_traffic()
-        csv_text = HIPAAExporter.export_csv(observe_entries)
+        csv_text = HIPAAExporter.export_csv(observe_entries, salt="UNIT_TEST_SALT")
         reader = csv.DictReader(io.StringIO(csv_text))
         for row in reader:
             # date_hour ends in ":00" (no sub-hour precision)

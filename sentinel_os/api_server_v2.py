@@ -420,7 +420,7 @@ if __name__ == "__main__":
         kw["ssl_keyfile"] = os.environ["SSL_KEYFILE"]
     uvicorn.run(
         "api_server_v2:app",
-        host=os.getenv("INGRESS_HOST", "0.0.0.0"),
+        host=os.getenv("INGRESS_HOST", "0.0.0.0"),  # nosec B104 -- containerized deployment: must bind all interfaces to be reachable from outside the container (same justification as api_server_resilient.py)
         port=int(os.getenv("INGRESS_PORT", "8000")),
         workers=int(os.getenv("INGRESS_WORKERS", "1")),
         **kw,

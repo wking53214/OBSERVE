@@ -80,4 +80,4 @@ sentinel_os/ (nested, stale)   ──✗ not──►  wking53214/sentinel_os (L
 
 See `VENDORED.md` / `UPSTREAM.md` if present for the intended relationship.
 
-Apache-2.0.
+Proprietary. Copyright (c) 2026 William King. All rights reserved. See LICENSE.

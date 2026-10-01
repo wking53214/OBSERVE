@@ -2,7 +2,7 @@ OBSERVE
 Copyright 2026 William King
 
 This repository vendors files copied from three other repositories by the
-same author, all licensed under the Apache License 2.0:
+same author and owned by the same holder, so no third-party terms apply:
 
   sentinel_os       https://github.com/wking53214/sentinel_os
   GSA-815           https://github.com/wking53214/GSA-815

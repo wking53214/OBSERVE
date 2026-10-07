@@ -537,7 +537,7 @@ We recognize and celebrate our contributors! Every PR that's merged will be note
 
 ## License
 
-By contributing to Sentinel OS, you agree that your contributions will be licensed under the same license as the project. (Add your license here - MIT, Apache 2.0, etc.)
+By contributing to Sentinel OS, you agree that your contributions will be licensed under the same license as the project. That license is the Apache License 2.0 (see `LICENSE`).
 
 ---
 

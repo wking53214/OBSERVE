@@ -26,10 +26,53 @@ than adding to a file that doesn't currently run.
 from __future__ import annotations
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
-class ClinicalSignalValidator:
+class DomainSignalValidator:
+    """Requires a signal to carry its own anchors. Never strips uncertainty.
+
+    The same mechanism as the clinical validator below, with the marker set
+    supplied by the caller so other domains can reuse it. Ported from ZTGKT
+    (buried in the Graveyard 2026-10-10), where it was the generalization of
+    this class. A marker is a regex that must match somewhere in the text;
+    the only failures are markers that are absent.
+    """
+
+    def __init__(
+        self,
+        markers: Mapping[str, "re.Pattern[str]"],
+        failure_messages: Optional[Mapping[str, str]] = None,
+        profile_name: str = "domain",
+    ):
+        self.markers = dict(markers)
+        self.failure_messages = dict(failure_messages or {})
+        self.profile_name = profile_name
+        self.validation_log: List[Dict[str, Any]] = []
+
+    def _message(self, key: str) -> str:
+        return self.failure_messages.get(key, f"Missing required marker: {key}")
+
+    def validate_signal(self, signal_text: str) -> Tuple[bool, List[str]]:
+        """Check that every required marker is present."""
+        failures: List[str] = [
+            self._message(key)
+            for key, pattern in self.markers.items()
+            if not pattern.search(signal_text)
+        ]
+        is_valid = len(failures) == 0
+
+        self.validation_log.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal_sample": signal_text[:100],
+            "is_valid": is_valid,
+            "failures": failures,
+        })
+
+        return is_valid, failures
+
+
+class ClinicalSignalValidator(DomainSignalValidator):
     """Domain-specific validation for clinical signals.
 
     Opposite of linguistic polishing: this checks for the PRESENCE of
@@ -50,6 +93,12 @@ class ClinicalSignalValidator:
         ),
     }
 
+    _FAILURE_MESSAGES = {
+        "temporal_specificity": "Missing temporal specificity (when did this occur?)",
+        "numeric_value": "Missing quantitative values (vital signs, measurements)",
+        "clinical_context": "Missing clinical context (what patient/system?)",
+    }
+
     # Deliberately NOT penalized - see module docstring.
     HEDGING_IS_GOOD = re.compile(
         r"\b(may|might|could|possibly|uncertain|unclear|suggest)\b",
@@ -57,32 +106,11 @@ class ClinicalSignalValidator:
     )
 
     def __init__(self, profile_name: str = "clinical"):
-        self.profile_name = profile_name
-        self.validation_log: List[Dict[str, Any]] = []
-
-    def validate_signal(self, signal_text: str) -> Tuple[bool, List[str]]:
-        """Check if signal has minimum clinical coherence."""
-        failures: List[str] = []
-
-        if not self.REQUIRED_CLINICAL_MARKERS["temporal_specificity"].search(signal_text):
-            failures.append("Missing temporal specificity (when did this occur?)")
-
-        if not self.REQUIRED_CLINICAL_MARKERS["numeric_value"].search(signal_text):
-            failures.append("Missing quantitative values (vital signs, measurements)")
-
-        if not self.REQUIRED_CLINICAL_MARKERS["clinical_context"].search(signal_text):
-            failures.append("Missing clinical context (what patient/system?)")
-
-        is_valid = len(failures) == 0
-
-        self.validation_log.append({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "signal_sample": signal_text[:100],
-            "is_valid": is_valid,
-            "failures": failures,
-        })
-
-        return is_valid, failures
+        super().__init__(
+            self.REQUIRED_CLINICAL_MARKERS,
+            self._FAILURE_MESSAGES,
+            profile_name=profile_name,
+        )
 
 
 if __name__ == "__main__":

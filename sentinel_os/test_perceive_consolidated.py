@@ -489,16 +489,16 @@ class TestDGKSigning(unittest.TestCase):
     def test_sign_and_verify_roundtrip(self):
         key = secrets.token_bytes(32)
         payload = {"node_id": "n1", "decision": {"approved": True}, "timestamp": "2026-01-01T00:00:00+00:00"}
-        sig = Signer.sign(payload, key)
+        sig = Signer.sign(payload, key, "node-a")
         payload["_sig"] = sig
-        self.assertTrue(Signer.verify(payload, key))
+        self.assertTrue(Signer.verify(payload, key, "node-a"))
 
     def test_verify_fails_with_wrong_key(self):
         key = secrets.token_bytes(32)
         wrong_key = secrets.token_bytes(32)
         payload = {"node_id": "n1", "decision": {"approved": True}, "timestamp": "2026-01-01T00:00:00+00:00"}
-        payload["_sig"] = Signer.sign(payload, key)
-        self.assertFalse(Signer.verify(payload, wrong_key))
+        payload["_sig"] = Signer.sign(payload, key, "node-a")
+        self.assertFalse(Signer.verify(payload, wrong_key, "node-a"))
 
 
 class TestDGKConsensus(unittest.TestCase):

@@ -658,19 +658,31 @@ def _public_view(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class Signer:
-    """HMAC signing for multi-node proposals."""
+    """HMAC-SHA256 signing for multi-node proposals, under a caller-named key ID."""
+
+    ALGORITHM = "hmac-sha256"
 
     @staticmethod
-    def sign(payload: Dict[str, Any], key: bytes) -> str:
+    def _value(payload: Dict[str, Any], key: bytes) -> str:
         data = _canonical_json(_public_view(payload)).encode()
         return hmac.new(key, data, hashlib.sha256).hexdigest()
 
     @staticmethod
-    def verify(payload: Dict[str, Any], key: bytes) -> bool:
-        sig = payload.get("_sig")
-        if not isinstance(sig, str):
+    def sign(payload: Dict[str, Any], key: bytes, key_id: str) -> Dict[str, str]:
+        """The stack-wide signature block: algorithm, key ID and value together."""
+        if not key_id:
+            raise ValueError("Signer.sign needs a caller-named key_id")
+        return {"algorithm": Signer.ALGORITHM, "key_id": key_id, "value": Signer._value(payload, key)}
+
+    @staticmethod
+    def verify(payload: Dict[str, Any], key: bytes, key_id: str) -> bool:
+        block = payload.get("_sig")
+        if not isinstance(block, dict) or block.get("algorithm") != Signer.ALGORITHM:
             return False
-        return hmac.compare_digest(sig, Signer.sign(payload, key))
+        if block.get("key_id") != key_id:
+            return False
+        value = block.get("value")
+        return isinstance(value, str) and hmac.compare_digest(value, Signer._value(payload, key))
 
 
 @dataclass
@@ -679,11 +691,11 @@ class Proposal:
     node_id: str
     decision: Dict[str, Any]
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    signature: str = ""
+    signature: Any = None
 
-    def sign(self, key: bytes) -> None:
+    def sign(self, key: bytes, key_id: str) -> None:
         payload = {"node_id": self.node_id, "decision": self.decision, "timestamp": self.timestamp.isoformat()}
-        self.signature = Signer.sign(payload, key)
+        self.signature = Signer.sign(payload, key, key_id)
 
 
 def _l1_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -730,7 +742,7 @@ class ConsensusDecider:
             # payload["_sig"] and Signer.sign strips "_"-prefixed keys via _public_view,
             # so the reconstructed payload must carry the signature to compare against.
             payload = {"node_id": p.node_id, "decision": p.decision, "timestamp": p.timestamp.isoformat(), "_sig": p.signature}
-            if not Signer.verify(payload, key_map[p.node_id]):
+            if not Signer.verify(payload, key_map[p.node_id], p.node_id):
                 raise RuntimeError(f"Signature verification failed for {p.node_id}")
 
         clusters = _cluster_proposals(proposals)
@@ -761,7 +773,7 @@ class GovernanceNode:
 
     def propose(self, decision: Dict[str, Any]) -> Proposal:
         proposal = Proposal(node_id=self.node_id, decision=decision)
-        proposal.sign(self.key)
+        proposal.sign(self.key, self.node_id)
         return proposal
 
 

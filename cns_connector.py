@@ -36,7 +36,7 @@ __all__ = [
     "cns_available",
 ]
 
-INSTALL_HINT = "pip install 'cns @ git+https://github.com/wking53214/cns.git@v1.4.0'"
+INSTALL_HINT = "pip install 'cns @ git+https://github.com/wking53214/cns.git@v1.5.1'"
 
 _ALPHA = "alpha"
 _OMEGA = "omega"

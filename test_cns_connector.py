@@ -1,11 +1,19 @@
-"""OBSERVE's CNS connector: one gate per end, fail-closed, bound to content."""
+"""OBSERVE's CNS connector: one gate per end, fail-closed, bound to content.
+
+These skip where ``cns`` is not installed. CI installs requirements-cns.txt and sets OBSERVE_REQUIRE_CNS=1, so there
+they cannot skip.
+"""
 
 import importlib
+import os
 from datetime import datetime, timezone
 
 import pytest
 
-pytest.importorskip("cns.gate", reason="needs the pinned CNS package")
+if os.environ.get("OBSERVE_REQUIRE_CNS") == "1":  # CI: a missing cns is a failure, not a skip
+    import cns.gate  # noqa: F401
+else:
+    pytest.importorskip("cns.gate", reason="needs the pinned CNS package")
 
 import cns_connector  # noqa: E402
 from cns_connector import CnsNotInstalled, ObserveCnsGate, cns_available  # noqa: E402

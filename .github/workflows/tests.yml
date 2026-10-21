@@ -201,3 +201,30 @@ jobs:
           # swallowing everything including the two High findings this
           # fixed.
           bandit -r . -x ./Tests -ll
+
+  cns:
+    # The optional CNS connector (cns_connector.py), with requirements-cns.txt installed. OBSERVE_REQUIRE_CNS=1 turns
+    # a missing cns into a failure, so these tests cannot silently skip here. Light on purpose: the connector and
+    # observe_consolidated.py are stdlib-only, so this needs no Redis, Postgres or sudo.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest and the cns extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -r requirements-cns.txt
+
+      - name: Test the CNS connector with CNS present
+        env:
+          OBSERVE_REQUIRE_CNS: "1"
+        run: python -m pytest test_cns_connector.py test_cns_pin.py -q -rs

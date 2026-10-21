@@ -1,0 +1,2 @@
+# Optional: the CNS gate contract for cns_connector.py. Nothing in OBSERVE imports CNS otherwise.
+cns @ git+https://github.com/wking53214/CNS.git@v1.9.0

@@ -38,12 +38,16 @@ demonstration, not a turnkey product.
 """
 
 from __future__ import annotations
-import hashlib, json, logging, math, copy
-from collections import OrderedDict, deque
+import hashlib
+import json
+import logging
+import math
+import copy
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Any, Callable, Tuple
+from typing import Dict, List, Any, Tuple
 
 logger = logging.getLogger("SENTINEL")
 
@@ -219,7 +223,7 @@ class SecAdapters:
         t, score, danger = [], 0.0, []
         if a.failed_auth_rate > 20 and a.auth_geo_anomaly > 0.5:
             danger.append("CREDENTIAL_ACCESS")
-            t.append(f"DANGEROUS_PATTERN: credential_access (brute force then anomalous success)")
+            t.append("DANGEROUS_PATTERN: credential_access (brute force then anomalous success)")
             score = max(score, 0.85)
         if a.beaconing_score > 0.7:
             danger.append("C2_BEACONING")
@@ -607,9 +611,6 @@ class NetworkAdapters:
         # candidate "real objective": a quieter campaign that nonetheless has a payoff action
         quiet_objective = [c for c in campaigns if c is not loud and c.has_objective and c.noise < loud.noise * 0.6]
         t = []
-        # naive: respond to the single highest-risk (often loudest) incident
-        naive = max(c.max_risk for c in campaigns)
-        aware = naive
         if quiet_objective:
             q = max(quiet_objective, key=lambda c: c.max_risk)
             # The interactive adjustment: the quiet campaign's STRATEGIC priority

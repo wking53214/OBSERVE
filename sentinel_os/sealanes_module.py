@@ -41,12 +41,16 @@ intelligence or energy-economics product.
 """
 
 from __future__ import annotations
-import hashlib, json, logging, math, copy
-from collections import OrderedDict, deque
-from dataclasses import dataclass, field, asdict
+import hashlib
+import json
+import logging
+import math
+import copy
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Any, Callable, Tuple
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger("SEALANES")
 

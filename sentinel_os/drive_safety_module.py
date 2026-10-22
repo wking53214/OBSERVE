@@ -163,7 +163,6 @@ class DriveAdapters:
     def heuristic(state: VehicleState) -> RiskOutput:
         triggered: List[str] = []
         score = 0.0
-        norms = get_road_norms(state.context.get("road_type"))
         friction = state.context.get("friction_estimate")
         grip = _grip_limit_mps2(friction)
 
@@ -669,7 +668,8 @@ class DriveSafetyEngine:
         seen, ordered = set(), []
         for e in engines:
             if e not in seen:
-                seen.add(e); ordered.append(e)
+                seen.add(e)
+                ordered.append(e)
         return ordered
 
     def evaluate(self, state: VehicleState) -> FusedVerdict:
@@ -759,7 +759,7 @@ if __name__ == "__main__":
         lateral_accel_mps2=0.5, lane_offset_m=0.6,  # LANE_DRIFT (soft)
         lead_distance_m=120.0, lead_rel_speed_mps=0.0,
         context={"road_type": "highway", "friction_estimate": 0.85}))
-    print(f"\n=== Soft concern: mild speeding + lane drift ===")
+    print("\n=== Soft concern: mild speeding + lane drift ===")
     print(f"fused_risk={v2.risk_score:.3f} (caution band) -> committed regime={v2.regime.value} "
           f"(dwell holds a single low-grade frame)")
     print(f"engines={v2.active_engines}")

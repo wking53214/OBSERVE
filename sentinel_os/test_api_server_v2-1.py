@@ -325,7 +325,7 @@ def test_T10_ingress_never_imports_the_harness(tc):
     ingress, and the source itself."""
     import ast
 
-    import api_server_v2  # already imported by the fixture
+    import api_server_v2  # already imported by the fixture  # noqa: F401
 
     # 1) Live module table: importing the ingress must not have loaded any of
     #    the synchronous machinery into the process.

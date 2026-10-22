@@ -55,7 +55,10 @@ logger = logging.getLogger("SEALANES")
 # ============================================================================
 
 class OperationalRegime(Enum):
-    STABLE = "stable"; CAUTION = "caution"; WARNING = "warning"; CRITICAL = "critical"
+    STABLE = "stable"
+    CAUTION = "caution"
+    WARNING = "warning"
+    CRITICAL = "critical"
 
 
 @dataclass
@@ -95,7 +98,8 @@ def regime_distribution(risk_score: float, critical_floor: float = 0.01) -> Dict
     else:
         d = {"stable": 0.88, "caution": 0.08, "warning": 0.03, "critical": 0.01}
     if d["critical"] < critical_floor:
-        deficit = critical_floor - d["critical"]; d["critical"] = critical_floor
+        deficit = critical_floor - d["critical"]
+        d["critical"] = critical_floor
         d["stable"] = max(0.0, d["stable"] - deficit)
     return d
 
@@ -142,20 +146,27 @@ class LaneAdapters:
     def heuristic(s: ChokepointState) -> RiskOutput:
         t, score = [], 0.0
         if s.status == "closed":
-            t.append(f"HARD_RULE: chokepoint_closed ({s.name})"); score += 0.6
+            t.append(f"HARD_RULE: chokepoint_closed ({s.name})")
+            score += 0.6
         elif s.status == "restricted":
-            t.append(f"RESTRICTED_TRANSIT: {s.name}"); score += 0.3
+            t.append(f"RESTRICTED_TRANSIT: {s.name}")
+            score += 0.3
         if s.war_risk_premium_pct > 1.0:
-            t.append(f"HARD_RULE: war_risk_premium_spike ({s.war_risk_premium_pct:.2f}%)"); score += 0.5
+            t.append(f"HARD_RULE: war_risk_premium_spike ({s.war_risk_premium_pct:.2f}%)")
+            score += 0.5
         elif s.war_risk_premium_pct > 0.5:
-            t.append(f"ELEVATED_PREMIUM: {s.war_risk_premium_pct:.2f}%"); score += 0.2
+            t.append(f"ELEVATED_PREMIUM: {s.war_risk_premium_pct:.2f}%")
+            score += 0.2
         if s.recent_incidents >= 3:
-            t.append(f"HARD_RULE: incident_cluster ({s.recent_incidents} recent)"); score += 0.5
+            t.append(f"HARD_RULE: incident_cluster ({s.recent_incidents} recent)")
+            score += 0.5
         elif s.recent_incidents >= 1:
-            t.append(f"INCIDENT: {s.recent_incidents} recent"); score += 0.2
+            t.append(f"INCIDENT: {s.recent_incidents} recent")
+            score += 0.2
         util = s.throughput_current / s.throughput_capacity if s.throughput_capacity > 0 else 0.0
         if util > 0.95:
-            t.append(f"AT_CAPACITY: {util*100:.0f}%"); score += 0.2
+            t.append(f"AT_CAPACITY: {util*100:.0f}%")
+            score += 0.2
         return RiskOutput("heuristic", min(score, 1.0), 0.90,
                           regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
 
@@ -185,13 +196,15 @@ class LaneAdapters:
         vel = (series[-1] - series[-2]) / dt
         t, score, debug = [], 0.0, {"premium_vel": round(vel, 3)}
         if vel > 0.1:
-            t.append(f"ESCALATING_PREMIUM: +{vel:.2f}%/day"); score += 0.25
+            t.append(f"ESCALATING_PREMIUM: +{vel:.2f}%/day")
+            score += 0.25
             if len(series) >= 3:
                 vel_prev = (series[-2] - series[-3]) / dt
                 acc = (vel - vel_prev) / dt
                 debug["premium_accel"] = round(acc, 3)
                 if acc > 0 and vel > 0:
-                    t.append(f"ACCELERATING_ESCALATION: +{acc:.2f}%/day^2"); score += 0.3
+                    t.append(f"ACCELERATING_ESCALATION: +{acc:.2f}%/day^2")
+                    score += 0.3
         out = RiskOutput("trajectory", min(score, 1.0), 0.80,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
         out.debug_info = debug
@@ -225,12 +238,16 @@ class LaneAdapters:
             return RiskOutput("drift", 0.0, 0.3, {"stable": 1.0},
                               ["Insufficient history for drift detection"],
                               datetime.now(timezone.utc), abstained=True)
-        n = len(hist); xs = list(range(n)); mx = sum(xs)/n; my = sum(hist)/n
+        n = len(hist)
+        xs = list(range(n))
+        mx = sum(xs)/n
+        my = sum(hist)/n
         denom = sum((x-mx)**2 for x in xs) or 1.0
         slope = sum((xs[i]-mx)*(hist[i]-my) for i in range(n))/denom
         t, score = [], 0.0
         if slope > 0.01:
-            t.append(f"REGIONAL_DESTABILIZATION: tension +{slope:.3f}/period sustained"); score += 0.3
+            t.append(f"REGIONAL_DESTABILIZATION: tension +{slope:.3f}/period sustained")
+            score += 0.3
         if score < 0.01:
             return RiskOutput("drift", 0.0, 0.5, {"stable": 1.0},
                               ["No sustained drift"], datetime.now(timezone.utc), abstained=True)
@@ -244,10 +261,12 @@ class LaneAdapters:
         t, score = [], 0.0
         dark = s.context.get("dark_vessel_fraction")
         if dark is not None and dark > 0.15:
-            t.append(f"DARK_VESSELS: {dark*100:.0f}% transiting with AIS off"); score += 0.3
+            t.append(f"DARK_VESSELS: {dark*100:.0f}% transiting with AIS off")
+            score += 0.3
         spoof = s.context.get("ais_spoof_reports", 0)
         if spoof >= 3:
-            t.append(f"AIS_SPOOFING: {spoof} position-spoof reports"); score += 0.3
+            t.append(f"AIS_SPOOFING: {spoof} position-spoof reports")
+            score += 0.3
         if score < 0.01:
             return RiskOutput("adversarial", 0.0, 0.70, {"stable": 1.0},
                               ["No data-integrity anomaly"],
@@ -274,10 +293,12 @@ class LaneAdapters:
             out = RiskOutput("reserve", 0.0, 0.30, {"stable": 1.0},
                              ["Buffer at target; engine abstains"],
                              datetime.now(timezone.utc), abstained=True)
-            out.debug_info = debug; return out
+            out.debug_info = debug
+            return out
         out = RiskOutput("reserve", min(score, 1.0), 0.82,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
-        out.debug_info = debug; return out
+        out.debug_info = debug
+        return out
 
 
 # ============================================================================
@@ -303,10 +324,13 @@ class BayesianFusion:
 
 class EscalationPolicy:
     def __init__(self, dwell_threshold=2, lock_seconds=10.0):
-        self.dwell_threshold = dwell_threshold; self.lock_seconds = lock_seconds
+        self.dwell_threshold = dwell_threshold
+        self.lock_seconds = lock_seconds
         self.current_regime = OperationalRegime.STABLE
-        self.pending_regime = None; self.dwell_count = 0
-        self.escalation_locked = False; self.last_escalation_time = None
+        self.pending_regime = None
+        self.dwell_count = 0
+        self.escalation_locked = False
+        self.last_escalation_time = None
     def evaluate(self, new_regime, timestamp, reserve_factor=1.0):
         eff = max(1, math.ceil(self.dwell_threshold * max(0.05, reserve_factor)))
         if self.escalation_locked and self.last_escalation_time:
@@ -314,33 +338,45 @@ class EscalationPolicy:
                 return self.current_regime, False
             self.escalation_locked = False
         if new_regime == self.current_regime:
-            self.pending_regime = None; self.dwell_count = 0
+            self.pending_regime = None
+            self.dwell_count = 0
             return self.current_regime, False
         if new_regime == self.pending_regime:
             self.dwell_count += 1
         else:
-            self.pending_regime = new_regime; self.dwell_count = 1
+            self.pending_regime = new_regime
+            self.dwell_count = 1
         if self.dwell_count >= eff:
             esc = new_regime.value in ("warning", "critical") and self.current_regime.value in ("stable", "caution")
-            self.current_regime = new_regime; self.pending_regime = None; self.dwell_count = 0
+            self.current_regime = new_regime
+            self.pending_regime = None
+            self.dwell_count = 0
             if esc:
-                self.escalation_locked = True; self.last_escalation_time = timestamp
+                self.escalation_locked = True
+                self.last_escalation_time = timestamp
             return new_regime, esc
         return self.current_regime, False
 
 
 class ImmutableAuditLedger:
-    def __init__(self): self.entries = []; self.chain_head = "0" * 64
+    def __init__(self):
+        self.entries = []
+        self.chain_head = "0" * 64
     def append(self, eid, action, data):
         e = {"timestamp": datetime.now(timezone.utc).isoformat(), "entity_id": eid,
              "action": action, "data": copy.deepcopy(data), "previous_hash": self.chain_head}
         h = hashlib.sha256(json.dumps(e, sort_keys=True, default=str).encode()).hexdigest()
-        e["immutable_hash"] = h; self.entries.append(e); self.chain_head = h; return h
+        e["immutable_hash"] = h
+        self.entries.append(e)
+        self.chain_head = h
+        return h
     def verify_integrity(self):
         prev = "0" * 64
         for e in self.entries:
-            if e["previous_hash"] != prev: return False
-            tgt = copy.deepcopy(e); stored = tgt.pop("immutable_hash")
+            if e["previous_hash"] != prev:
+                return False
+            tgt = copy.deepcopy(e)
+            stored = tgt.pop("immutable_hash")
             if stored != hashlib.sha256(json.dumps(tgt, sort_keys=True, default=str).encode()).hexdigest():
                 return False
             prev = stored
@@ -359,20 +395,29 @@ class ChokepointEngine:
         "reserve": LaneAdapters.reserve,
     }
     def __init__(self, ledger): 
-        self.audit_ledger = ledger; self._policies = OrderedDict(); self._entropy = OrderedDict()
+        self.audit_ledger = ledger
+        self._policies = OrderedDict()
+        self._entropy = OrderedDict()
     def _get_policy(self, cid):
         if cid not in self._policies:
-            self._policies[cid] = EscalationPolicy(); self._entropy[cid] = 0.0
+            self._policies[cid] = EscalationPolicy()
+            self._entropy[cid] = 0.0
         return self._policies[cid]
     def select(self, s):
         eng = ["heuristic", "behavioral", "reserve"]
-        if self._entropy.get(s.name, 0.0) > 0.6 or s.context.get("force_heavy"): eng += ["bayesian", "drift"]
-        if s.context.get("premium_history"): eng.append("trajectory")
-        if s.context.get("tension_history"): eng.append("drift")
-        if s.context.get("dark_vessel_fraction") is not None or s.context.get("ais_spoof_reports"): eng.append("adversarial")
+        if self._entropy.get(s.name, 0.0) > 0.6 or s.context.get("force_heavy"):
+            eng += ["bayesian", "drift"]
+        if s.context.get("premium_history"):
+            eng.append("trajectory")
+        if s.context.get("tension_history"):
+            eng.append("drift")
+        if s.context.get("dark_vessel_fraction") is not None or s.context.get("ais_spoof_reports"):
+            eng.append("adversarial")
         seen, out = set(), []
         for e in eng:
-            if e not in seen: seen.add(e); out.append(e)
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
         return out
     def evaluate(self, s: ChokepointState) -> Verdict:
         policy = self._get_policy(s.name)
@@ -382,13 +427,19 @@ class ChokepointEngine:
         candidate = OperationalRegime(max(probs, key=probs.get))
         rf = 1.0
         for o in outputs:
-            if o.engine_name == "reserve" and "reserve_factor" in o.debug_info: rf = o.debug_info["reserve_factor"]
+            if o.engine_name == "reserve" and "reserve_factor" in o.debug_info:
+                rf = o.debug_info["reserve_factor"]
         active = [o for o in outputs if not o.abstained]
         det = any(r.startswith("HARD_RULE:") or r.startswith("DANGEROUS_PATTERN:") for o in active for r in o.triggered_rules)
         if det and candidate.value in ("warning", "critical"):
             esc = policy.current_regime.value in ("stable", "caution")
-            final = candidate; policy.current_regime = final; policy.pending_regime = None; policy.dwell_count = 0
-            if esc: policy.escalation_locked = True; policy.last_escalation_time = s.timestamp
+            final = candidate
+            policy.current_regime = final
+            policy.pending_regime = None
+            policy.dwell_count = 0
+            if esc:
+                policy.escalation_locked = True
+                policy.last_escalation_time = s.timestamp
         else:
             final, esc = policy.evaluate(candidate, s.timestamp, rf)
         rules = [r for o in outputs for r in o.triggered_rules]
@@ -582,7 +633,8 @@ class SeaLaneMonitor:
         "adaptive_adversary": FlowAdapters.adaptive_adversary,
     }
     def __init__(self, flows: List[CommodityFlow], cfg: NetworkConfig = NetworkConfig()):
-        self.flows = flows; self.cfg = cfg
+        self.flows = flows
+        self.cfg = cfg
         self.audit_ledger = ImmutableAuditLedger()
         self.chokepoint_engine = ChokepointEngine(self.audit_ledger)
         self.network_policy = EscalationPolicy()
@@ -597,7 +649,8 @@ class SeaLaneMonitor:
         # System buffer thinness modulates escalation (reused from compute probe).
         rf = 1.0
         for c in chokepoints:
-            dos = c.context.get("days_of_supply"); tgt = c.context.get("target_days_of_supply", 90.0)
+            dos = c.context.get("days_of_supply")
+            tgt = c.context.get("target_days_of_supply", 90.0)
             if dos is not None and tgt > 0:
                 rf = min(rf, max(0.0, min(1.0, dos / tgt)))
 
@@ -605,9 +658,13 @@ class SeaLaneMonitor:
         danger = any(r.startswith("DANGEROUS_PATTERN:") for o in active for r in o.triggered_rules)
         if danger and candidate.value in ("warning", "critical"):
             esc = self.network_policy.current_regime.value in ("stable", "caution")
-            final = candidate; self.network_policy.current_regime = final
-            self.network_policy.pending_regime = None; self.network_policy.dwell_count = 0
-            if esc: self.network_policy.escalation_locked = True; self.network_policy.last_escalation_time = timestamp
+            final = candidate
+            self.network_policy.current_regime = final
+            self.network_policy.pending_regime = None
+            self.network_policy.dwell_count = 0
+            if esc:
+                self.network_policy.escalation_locked = True
+                self.network_policy.last_escalation_time = timestamp
         else:
             final, esc = self.network_policy.evaluate(candidate, timestamp, rf)
 
@@ -671,25 +728,29 @@ if __name__ == "__main__":
             print(f"   - {r}")
 
     # 1. Calm world -> stable.
-    mon1 = SeaLaneMonitor(FLOWS); w = calm_world()
+    mon1 = SeaLaneMonitor(FLOWS)
+    w = calm_world()
     show("Calm seas", *mon1.evaluate(w, now))
 
     # 2. Hormuz CLOSED -> hard shortfall (no sea bypass for Gulf crude).
-    mon2 = SeaLaneMonitor(FLOWS); w2 = calm_world()
+    mon2 = SeaLaneMonitor(FLOWS)
+    w2 = calm_world()
     w2[0] = cp("Hormuz", "Persian_Gulf", status="closed", military_activity_index=0.8,
                war_risk_premium_pct=2.5, recent_incidents=4, controlling_actor="StateA",
                context={"days_of_supply": 90, "target_days_of_supply": 90})
     show("Hormuz closed (no maritime bypass)", *mon2.evaluate(w2, now))
 
     # 3. Bab-el-Mandeb + Suez disrupted (Red Sea) -> reroute via Cape (cascade, not shortfall).
-    mon3 = SeaLaneMonitor(FLOWS); w3 = calm_world()
+    mon3 = SeaLaneMonitor(FLOWS)
+    w3 = calm_world()
     w3[1] = cp("Bab_el_Mandeb", "Red_Sea", status="closed", recent_incidents=3,
                war_risk_premium_pct=1.2, military_activity_index=0.5, controlling_actor="StateA")
     show("Red Sea closed, reroute around the Cape", *mon3.evaluate(w3, now))
 
     # 4. [NEW-SHAPE] Hormuz AND Bab-el-Mandeb both stressed, SAME actor -> coordinated.
     #    Graded systemic signal, so shown across two frames to commit past dwell.
-    mon4 = SeaLaneMonitor(FLOWS); w4 = calm_world()
+    mon4 = SeaLaneMonitor(FLOWS)
+    w4 = calm_world()
     w4[0] = cp("Hormuz", "Persian_Gulf", status="restricted", diplomatic_tension_index=0.8,
                military_activity_index=0.7, war_risk_premium_pct=0.9, recent_incidents=1,
                controlling_actor="StateA", context={"days_of_supply": 90, "target_days_of_supply": 90})
@@ -700,7 +761,8 @@ if __name__ == "__main__":
     show("Coordinated adversary across two chokepoints (frame 2)", *mon4.evaluate(w4, now))
 
     # 5. Same coordinated pressure, but THIN strategic buffers -> escalates faster.
-    mon5 = SeaLaneMonitor(FLOWS); w5 = calm_world()
+    mon5 = SeaLaneMonitor(FLOWS)
+    w5 = calm_world()
     w5[0] = cp("Hormuz", "Persian_Gulf", status="restricted", diplomatic_tension_index=0.8,
                military_activity_index=0.7, war_risk_premium_pct=0.9, recent_incidents=1,
                controlling_actor="StateA", context={"days_of_supply": 25, "target_days_of_supply": 90})

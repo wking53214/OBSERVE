@@ -669,7 +669,8 @@ class DriveSafetyEngine:
         seen, ordered = set(), []
         for e in engines:
             if e not in seen:
-                seen.add(e); ordered.append(e)
+                seen.add(e)
+                ordered.append(e)
         return ordered
 
     def evaluate(self, state: VehicleState) -> FusedVerdict:

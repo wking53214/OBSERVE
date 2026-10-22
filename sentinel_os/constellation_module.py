@@ -153,28 +153,39 @@ class SatAdapters:
     def heuristic(s: SatelliteState) -> RiskOutput:
         t, score = [], 0.0
         if s.battery_soc < 0.10:
-            t.append(f"HARD_RULE: battery_critical ({s.battery_soc*100:.0f}%)"); score += 0.55
+            t.append(f"HARD_RULE: battery_critical ({s.battery_soc*100:.0f}%)")
+            score += 0.55
         elif s.battery_soc < 0.20:
-            t.append(f"LOW_BATTERY: {s.battery_soc*100:.0f}%"); score += 0.2
+            t.append(f"LOW_BATTERY: {s.battery_soc*100:.0f}%")
+            score += 0.2
         prop_frac = s.propellant_kg / s.propellant_capacity_kg if s.propellant_capacity_kg > 0 else 1.0
         if prop_frac < 0.02:
-            t.append(f"HARD_RULE: propellant_exhausted ({prop_frac*100:.1f}%)"); score += 0.5
+            t.append(f"HARD_RULE: propellant_exhausted ({prop_frac*100:.1f}%)")
+            score += 0.5
         elif prop_frac < 0.10:
-            t.append(f"LOW_PROPELLANT: {prop_frac*100:.0f}%"); score += 0.15
+            t.append(f"LOW_PROPELLANT: {prop_frac*100:.0f}%")
+            score += 0.15
         if s.temperature_c > 60 or s.temperature_c < -30:
-            t.append(f"HARD_RULE: thermal_limit ({s.temperature_c:.0f}C)"); score += 0.5
+            t.append(f"HARD_RULE: thermal_limit ({s.temperature_c:.0f}C)")
+            score += 0.5
         elif s.temperature_c > 50 or s.temperature_c < -20:
-            t.append(f"THERMAL_MARGIN: {s.temperature_c:.0f}C"); score += 0.15
+            t.append(f"THERMAL_MARGIN: {s.temperature_c:.0f}C")
+            score += 0.15
         if s.attitude_error_deg > 20:
-            t.append(f"HARD_RULE: attitude_lost ({s.attitude_error_deg:.0f} deg)"); score += 0.5
+            t.append(f"HARD_RULE: attitude_lost ({s.attitude_error_deg:.0f} deg)")
+            score += 0.5
         elif s.attitude_error_deg > 5:
-            t.append(f"ATTITUDE_DRIFT: {s.attitude_error_deg:.0f} deg"); score += 0.15
+            t.append(f"ATTITUDE_DRIFT: {s.attitude_error_deg:.0f} deg")
+            score += 0.15
         if s.reaction_wheel_momentum > 0.95:
-            t.append(f"HARD_RULE: wheel_saturated ({s.reaction_wheel_momentum*100:.0f}%)"); score += 0.5
+            t.append(f"HARD_RULE: wheel_saturated ({s.reaction_wheel_momentum*100:.0f}%)")
+            score += 0.5
         elif s.reaction_wheel_momentum > 0.80:
-            t.append(f"HIGH_MOMENTUM: {s.reaction_wheel_momentum*100:.0f}%"); score += 0.15
+            t.append(f"HIGH_MOMENTUM: {s.reaction_wheel_momentum*100:.0f}%")
+            score += 0.15
         if s.downlink_margin_db < 0:
-            t.append(f"LINK_LOST: {s.downlink_margin_db:.1f}dB"); score += 0.2
+            t.append(f"LINK_LOST: {s.downlink_margin_db:.1f}dB")
+            score += 0.2
         return RiskOutput("heuristic", min(score, 1.0), 0.90,
                           regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
 
@@ -206,13 +217,15 @@ class SatAdapters:
         vel = (series[-1] - series[-2]) / dt
         t, score, debug = [], 0.0, {"battery_vel": round(vel, 4)}
         if vel < -0.01:  # draining
-            t.append(f"BATTERY_DRAIN: {vel*100:.2f}%/s"); score += 0.25
+            t.append(f"BATTERY_DRAIN: {vel*100:.2f}%/s")
+            score += 0.25
             if len(series) >= 3:
                 vel_prev = (series[-2] - series[-3]) / dt
                 acc = (vel - vel_prev) / dt
                 debug["battery_accel"] = round(acc, 5)
                 if acc < 0 and vel < 0:  # draining faster and faster
-                    t.append(f"ACCELERATING_DRAIN: {acc*100:.3f}%/s^2"); score += 0.3
+                    t.append(f"ACCELERATING_DRAIN: {acc*100:.3f}%/s^2")
+                    score += 0.3
         out = RiskOutput("trajectory", min(score, 1.0), 0.80,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
         out.debug_info = debug
@@ -249,7 +262,10 @@ class SatAdapters:
             return RiskOutput("drift", 0.0, 0.3, {"stable": 1.0},
                               ["Insufficient history for drift detection"],
                               datetime.now(timezone.utc), abstained=True)
-        n = len(hist); xs = list(range(n)); mx = sum(xs)/n; my = sum(hist)/n
+        n = len(hist)
+        xs = list(range(n))
+        mx = sum(xs)/n
+        my = sum(hist)/n
         denom = sum((x-mx)**2 for x in xs) or 1.0
         slope = sum((xs[i]-mx)*(hist[i]-my) for i in range(n))/denom
         t, score = [], 0.0
@@ -275,9 +291,11 @@ class SatAdapters:
                 score += 0.35
         recent = s.context.get("recent_telemetry", [])
         if len(recent) >= 5 and len(set(recent[-5:])) == 1:
-            t.append(f"STUCK_TELEMETRY: {len(recent[-5:])} identical frames"); score += 0.3
+            t.append(f"STUCK_TELEMETRY: {len(recent[-5:])} identical frames")
+            score += 0.3
         if s.context.get("uplink_jamming_db") and s.context["uplink_jamming_db"] > 10:
-            t.append(f"UPLINK_JAMMING: {s.context['uplink_jamming_db']:.0f}dB above noise"); score += 0.3
+            t.append(f"UPLINK_JAMMING: {s.context['uplink_jamming_db']:.0f}dB above noise")
+            score += 0.3
         if score < 0.01:
             return RiskOutput("adversarial", 0.0, 0.70, {"stable": 1.0},
                               ["No telemetry-fault signature"],
@@ -335,10 +353,13 @@ class BayesianFusion:
 
 class EscalationPolicy:
     def __init__(self, dwell_threshold=2, lock_seconds=10.0):
-        self.dwell_threshold = dwell_threshold; self.lock_seconds = lock_seconds
+        self.dwell_threshold = dwell_threshold
+        self.lock_seconds = lock_seconds
         self.current_regime = OperationalRegime.STABLE
-        self.pending_regime = None; self.dwell_count = 0
-        self.escalation_locked = False; self.last_escalation_time = None
+        self.pending_regime = None
+        self.dwell_count = 0
+        self.escalation_locked = False
+        self.last_escalation_time = None
 
     def evaluate(self, new_regime, timestamp, reserve_factor=1.0):
         eff = max(1, math.ceil(self.dwell_threshold * max(0.05, reserve_factor)))
@@ -347,36 +368,45 @@ class EscalationPolicy:
                 return self.current_regime, False
             self.escalation_locked = False
         if new_regime == self.current_regime:
-            self.pending_regime = None; self.dwell_count = 0
+            self.pending_regime = None
+            self.dwell_count = 0
             return self.current_regime, False
         if new_regime == self.pending_regime:
             self.dwell_count += 1
         else:
-            self.pending_regime = new_regime; self.dwell_count = 1
+            self.pending_regime = new_regime
+            self.dwell_count = 1
         if self.dwell_count >= eff:
             esc = new_regime.value in ("warning", "critical") and self.current_regime.value in ("stable", "caution")
-            self.current_regime = new_regime; self.pending_regime = None; self.dwell_count = 0
+            self.current_regime = new_regime
+            self.pending_regime = None
+            self.dwell_count = 0
             if esc:
-                self.escalation_locked = True; self.last_escalation_time = timestamp
+                self.escalation_locked = True
+                self.last_escalation_time = timestamp
             return new_regime, esc
         return self.current_regime, False
 
 
 class ImmutableAuditLedger:
     def __init__(self):
-        self.entries = []; self.chain_head = "0" * 64
+        self.entries = []
+        self.chain_head = "0" * 64
     def append(self, entity_id, action, data):
         e = {"timestamp": datetime.now(timezone.utc).isoformat(), "entity_id": entity_id,
              "action": action, "data": copy.deepcopy(data), "previous_hash": self.chain_head}
         h = hashlib.sha256(json.dumps(e, sort_keys=True, default=str).encode()).hexdigest()
-        e["immutable_hash"] = h; self.entries.append(e); self.chain_head = h
+        e["immutable_hash"] = h
+        self.entries.append(e)
+        self.chain_head = h
         return h
     def verify_integrity(self):
         prev = "0" * 64
         for e in self.entries:
             if e["previous_hash"] != prev:
                 return False
-            tgt = copy.deepcopy(e); stored = tgt.pop("immutable_hash")
+            tgt = copy.deepcopy(e)
+            stored = tgt.pop("immutable_hash")
             if stored != hashlib.sha256(json.dumps(tgt, sort_keys=True, default=str).encode()).hexdigest():
                 return False
             prev = stored
@@ -403,11 +433,14 @@ class SatelliteHealthEngine:
 
     def _get_policy(self, sid):
         if sid not in self._policies:
-            self._policies[sid] = EscalationPolicy(); self._entropy[sid] = 0.0
-        self._policies.move_to_end(sid); 
-        if sid in self._entropy: self._entropy.move_to_end(sid)
+            self._policies[sid] = EscalationPolicy()
+            self._entropy[sid] = 0.0
+        self._policies.move_to_end(sid)
+        if sid in self._entropy:
+            self._entropy.move_to_end(sid)
         while len(self._policies) > self.max_tracked:
-            old, _ = self._policies.popitem(last=False); self._entropy.pop(old, None)
+            old, _ = self._policies.popitem(last=False)
+            self._entropy.pop(old, None)
         return self._policies[sid]
 
     def select_engines(self, s: SatelliteState) -> List[str]:
@@ -422,7 +455,9 @@ class SatelliteHealthEngine:
             eng.append("drift")
         seen, out = set(), []
         for e in eng:
-            if e not in seen: seen.add(e); out.append(e)
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
         return out
 
     def evaluate(self, s: SatelliteState) -> Verdict:
@@ -441,10 +476,13 @@ class SatelliteHealthEngine:
                   for o in active for r in o.triggered_rules)
         if det and candidate.value in ("warning", "critical"):
             esc = policy.current_regime.value in ("stable", "caution")
-            final = candidate; policy.current_regime = final
-            policy.pending_regime = None; policy.dwell_count = 0
+            final = candidate
+            policy.current_regime = final
+            policy.pending_regime = None
+            policy.dwell_count = 0
             if esc:
-                policy.escalation_locked = True; policy.last_escalation_time = s.timestamp
+                policy.escalation_locked = True
+                policy.last_escalation_time = s.timestamp
         else:
             final, esc = policy.evaluate(candidate, s.timestamp, rf)
         rules = [r for o in outputs for r in o.triggered_rules]
@@ -532,16 +570,20 @@ class FleetAdapters:
                 continue
             for nb in s.isl_neighbors:
                 if nb in alive:
-                    adj[s.sat_id].add(nb); adj.setdefault(nb, set()).add(s.sat_id)
+                    adj[s.sat_id].add(nb)
+                    adj.setdefault(nb, set()).add(s.sat_id)
         if not alive:
             return RiskOutput("mesh", 0.0, 0.8, {"stable": 1.0}, ["No live nodes"],
                               datetime.now(timezone.utc), abstained=True)
-        start = next(iter(alive)); seen = {start}; q = deque([start])
+        start = next(iter(alive))
+        seen = {start}
+        q = deque([start])
         while q:
             cur = q.popleft()
             for nb in adj.get(cur, ()):
                 if nb not in seen:
-                    seen.add(nb); q.append(nb)
+                    seen.add(nb)
+                    q.append(nb)
         if len(seen) < len(alive):
             unreachable = len(alive) - len(seen)
             t = [f"DANGEROUS_PATTERN: mesh_partition ({unreachable} of {len(alive)} nodes isolated)"]
@@ -648,10 +690,13 @@ class FleetMonitor:
         danger = any(r.startswith("DANGEROUS_PATTERN:") for o in active for r in o.triggered_rules)
         if danger and candidate.value in ("warning", "critical"):
             esc = self.fleet_policy.current_regime.value in ("stable", "caution")
-            final = candidate; self.fleet_policy.current_regime = final
-            self.fleet_policy.pending_regime = None; self.fleet_policy.dwell_count = 0
+            final = candidate
+            self.fleet_policy.current_regime = final
+            self.fleet_policy.pending_regime = None
+            self.fleet_policy.dwell_count = 0
             if esc:
-                self.fleet_policy.escalation_locked = True; self.fleet_policy.last_escalation_time = timestamp
+                self.fleet_policy.escalation_locked = True
+                self.fleet_policy.last_escalation_time = timestamp
         else:
             final, esc = self.fleet_policy.evaluate(candidate, timestamp)
 

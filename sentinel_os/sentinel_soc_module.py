@@ -52,7 +52,10 @@ logger = logging.getLogger("SENTINEL")
 # ============================================================================
 
 class OperationalRegime(Enum):
-    STABLE = "stable"; CAUTION = "caution"; WARNING = "warning"; CRITICAL = "critical"
+    STABLE = "stable"
+    CAUTION = "caution"
+    WARNING = "warning"
+    CRITICAL = "critical"
 
 
 @dataclass
@@ -92,7 +95,8 @@ def regime_distribution(risk_score: float, critical_floor: float = 0.01) -> Dict
     else:
         d = {"stable": 0.88, "caution": 0.08, "warning": 0.03, "critical": 0.01}
     if d["critical"] < critical_floor:
-        deficit = critical_floor - d["critical"]; d["critical"] = critical_floor
+        deficit = critical_floor - d["critical"]
+        d["critical"] = critical_floor
         d["stable"] = max(0.0, d["stable"] - deficit)
     return d
 
@@ -138,35 +142,46 @@ class SecAdapters:
     def heuristic(a: AssetState) -> RiskOutput:
         t, score = [], 0.0
         if a.ioc_matches >= 1:
-            t.append(f"HARD_RULE: known_bad_indicator ({a.ioc_matches} IOC hit)"); score += 0.55
+            t.append(f"HARD_RULE: known_bad_indicator ({a.ioc_matches} IOC hit)")
+            score += 0.55
         if a.file_modify_rate > 50.0:
-            t.append(f"HARD_RULE: mass_file_encryption ({a.file_modify_rate:.0f} files/s)"); score += 0.55
+            t.append(f"HARD_RULE: mass_file_encryption ({a.file_modify_rate:.0f} files/s)")
+            score += 0.55
         if a.beaconing_score > 0.90:
-            t.append(f"HARD_RULE: confirmed_c2_beaconing ({a.beaconing_score:.2f})"); score += 0.5
+            t.append(f"HARD_RULE: confirmed_c2_beaconing ({a.beaconing_score:.2f})")
+            score += 0.5
         if a.privilege_escalations >= 1 and a.role == "domain_controller":
-            t.append(f"HARD_RULE: privilege_escalation_on_DC ({a.privilege_escalations})"); score += 0.5
+            t.append(f"HARD_RULE: privilege_escalation_on_DC ({a.privilege_escalations})")
+            score += 0.5
         if a.failed_auth_rate > 30:
-            t.append(f"AUTH_BRUTE_FORCE: {a.failed_auth_rate:.0f} fails/min"); score += 0.2
+            t.append(f"AUTH_BRUTE_FORCE: {a.failed_auth_rate:.0f} fails/min")
+            score += 0.2
         nm = role_norms(a.role)
         if a.lateral_connections > max(10, nm["lateral"] * 3):
-            t.append(f"LATERAL_FANOUT: {a.lateral_connections} internal connections"); score += 0.2
+            t.append(f"LATERAL_FANOUT: {a.lateral_connections} internal connections")
+            score += 0.2
         if a.bytes_egress_mb > nm["egress_mb"] * 3:
-            t.append(f"HIGH_EGRESS: {a.bytes_egress_mb:.0f}MB ({a.bytes_egress_mb/nm['egress_mb']:.1f}x role norm)"); score += 0.2
+            t.append(f"HIGH_EGRESS: {a.bytes_egress_mb:.0f}MB ({a.bytes_egress_mb/nm['egress_mb']:.1f}x role norm)")
+            score += 0.2
         return RiskOutput("heuristic", min(score, 1.0), 0.90,
                           regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
 
     @staticmethod
     def bayesian(a: AssetState) -> RiskOutput:
         # UEBA-style: deviation from what this ROLE normally does.
-        nm = role_norms(a.role); t, score = [], 0.0
+        nm = role_norms(a.role)
+        t, score = [], 0.0
         eg_ratio = a.bytes_egress_mb / nm["egress_mb"] if nm["egress_mb"] > 0 else 0.0
         lat_ratio = a.lateral_connections / nm["lateral"] if nm["lateral"] > 0 else 0.0
         if eg_ratio > 2.0:
-            t.append(f"EGRESS_DEVIATION: {eg_ratio:.1f}x role baseline"); score += 0.25 * (1 - math.exp(-(eg_ratio - 2)))
+            t.append(f"EGRESS_DEVIATION: {eg_ratio:.1f}x role baseline")
+            score += 0.25 * (1 - math.exp(-(eg_ratio - 2)))
         if lat_ratio > 2.5:
-            t.append(f"LATERAL_DEVIATION: {lat_ratio:.1f}x role baseline"); score += 0.25 * (1 - math.exp(-(lat_ratio - 2.5)))
+            t.append(f"LATERAL_DEVIATION: {lat_ratio:.1f}x role baseline")
+            score += 0.25 * (1 - math.exp(-(lat_ratio - 2.5)))
         if a.auth_geo_anomaly > 0.6:
-            t.append(f"AUTH_GEO_ANOMALY: {a.auth_geo_anomaly:.2f} (impossible travel / new geo)"); score += 0.2
+            t.append(f"AUTH_GEO_ANOMALY: {a.auth_geo_anomaly:.2f} (impossible travel / new geo)")
+            score += 0.2
         out = RiskOutput("bayesian", min(score, 1.0), 0.85,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
         out.debug_info = {"egress_ratio": round(eg_ratio, 2), "lateral_ratio": round(lat_ratio, 2)}
@@ -184,12 +199,15 @@ class SecAdapters:
         vel = (series[-1] - series[-2]) / dt
         t, score, debug = [], 0.0, {"activity_vel": round(vel, 2)}
         if vel > 5.0:
-            t.append(f"ESCALATING_ACTIVITY: +{vel:.1f}/min"); score += 0.25
+            t.append(f"ESCALATING_ACTIVITY: +{vel:.1f}/min")
+            score += 0.25
             if len(series) >= 3:
-                vp = (series[-2] - series[-3]) / dt; acc = (vel - vp) / dt
+                vp = (series[-2] - series[-3]) / dt
+                acc = (vel - vp) / dt
                 debug["activity_accel"] = round(acc, 2)
                 if acc > 0 and vel > 0:
-                    t.append(f"ACCELERATING_INTRUSION: +{acc:.1f}/min^2"); score += 0.3
+                    t.append(f"ACCELERATING_INTRUSION: +{acc:.1f}/min^2")
+                    score += 0.3
         out = RiskOutput("trajectory", min(score, 1.0), 0.80,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
         out.debug_info = debug
@@ -237,7 +255,10 @@ class SecAdapters:
             return RiskOutput("drift", 0.0, 0.3, {"stable": 1.0},
                               ["Insufficient history for drift detection"],
                               datetime.now(timezone.utc), abstained=True)
-        n = len(hist); xs = list(range(n)); mx = sum(xs)/n; my = sum(hist)/n
+        n = len(hist)
+        xs = list(range(n))
+        mx = sum(xs)/n
+        my = sum(hist)/n
         denom = sum((x-mx)**2 for x in xs) or 1.0
         slope = sum((xs[i]-mx)*(hist[i]-my) for i in range(n))/denom
         t, score = [], 0.0
@@ -281,7 +302,8 @@ class SecAdapters:
     @staticmethod
     def reserve(a: AssetState) -> RiskOutput:
         # SOC response capacity for this asset's segment (analysts + containment slots).
-        cap = a.context.get("soc_capacity_remaining"); tot = a.context.get("soc_capacity_total", 10.0)
+        cap = a.context.get("soc_capacity_remaining")
+        tot = a.context.get("soc_capacity_total", 10.0)
         if cap is None:
             return RiskOutput("reserve", 0.0, 0.25, {"stable": 1.0},
                               ["No capacity telemetry; engine abstains"],
@@ -296,10 +318,12 @@ class SecAdapters:
             out = RiskOutput("reserve", 0.0, 0.30, {"stable": 1.0},
                              ["Full SOC capacity; engine abstains"],
                              datetime.now(timezone.utc), abstained=True)
-            out.debug_info = debug; return out
+            out.debug_info = debug
+            return out
         out = RiskOutput("reserve", min(score, 1.0), 0.80,
                          regime_distribution(min(score, 1.0)), t, datetime.now(timezone.utc))
-        out.debug_info = debug; return out
+        out.debug_info = debug
+        return out
 
 
 # ============================================================================
@@ -325,10 +349,13 @@ class BayesianFusion:
 
 class EscalationPolicy:
     def __init__(self, dwell_threshold=2, lock_seconds=30.0):
-        self.dwell_threshold = dwell_threshold; self.lock_seconds = lock_seconds
+        self.dwell_threshold = dwell_threshold
+        self.lock_seconds = lock_seconds
         self.current_regime = OperationalRegime.STABLE
-        self.pending_regime = None; self.dwell_count = 0
-        self.escalation_locked = False; self.last_escalation_time = None
+        self.pending_regime = None
+        self.dwell_count = 0
+        self.escalation_locked = False
+        self.last_escalation_time = None
     def evaluate(self, new_regime, timestamp, reserve_factor=1.0):
         eff = max(1, math.ceil(self.dwell_threshold * max(0.05, reserve_factor)))
         if self.escalation_locked and self.last_escalation_time:
@@ -336,33 +363,45 @@ class EscalationPolicy:
                 return self.current_regime, False
             self.escalation_locked = False
         if new_regime == self.current_regime:
-            self.pending_regime = None; self.dwell_count = 0
+            self.pending_regime = None
+            self.dwell_count = 0
             return self.current_regime, False
         if new_regime == self.pending_regime:
             self.dwell_count += 1
         else:
-            self.pending_regime = new_regime; self.dwell_count = 1
+            self.pending_regime = new_regime
+            self.dwell_count = 1
         if self.dwell_count >= eff:
             esc = new_regime.value in ("warning", "critical") and self.current_regime.value in ("stable", "caution")
-            self.current_regime = new_regime; self.pending_regime = None; self.dwell_count = 0
+            self.current_regime = new_regime
+            self.pending_regime = None
+            self.dwell_count = 0
             if esc:
-                self.escalation_locked = True; self.last_escalation_time = timestamp
+                self.escalation_locked = True
+                self.last_escalation_time = timestamp
             return new_regime, esc
         return self.current_regime, False
 
 
 class ImmutableAuditLedger:
-    def __init__(self): self.entries = []; self.chain_head = "0" * 64
+    def __init__(self):
+        self.entries = []
+        self.chain_head = "0" * 64
     def append(self, eid, action, data):
         e = {"timestamp": datetime.now(timezone.utc).isoformat(), "entity_id": eid,
              "action": action, "data": copy.deepcopy(data), "previous_hash": self.chain_head}
         h = hashlib.sha256(json.dumps(e, sort_keys=True, default=str).encode()).hexdigest()
-        e["immutable_hash"] = h; self.entries.append(e); self.chain_head = h; return h
+        e["immutable_hash"] = h
+        self.entries.append(e)
+        self.chain_head = h
+        return h
     def verify_integrity(self):
         prev = "0" * 64
         for e in self.entries:
-            if e["previous_hash"] != prev: return False
-            tgt = copy.deepcopy(e); stored = tgt.pop("immutable_hash")
+            if e["previous_hash"] != prev:
+                return False
+            tgt = copy.deepcopy(e)
+            stored = tgt.pop("immutable_hash")
             if stored != hashlib.sha256(json.dumps(tgt, sort_keys=True, default=str).encode()).hexdigest():
                 return False
             prev = stored
@@ -381,21 +420,30 @@ class AssetEngine:
         "reserve": SecAdapters.reserve,
     }
     def __init__(self, ledger):
-        self.audit_ledger = ledger; self._policies = OrderedDict(); self._entropy = OrderedDict()
+        self.audit_ledger = ledger
+        self._policies = OrderedDict()
+        self._entropy = OrderedDict()
     def _get_policy(self, aid):
         if aid not in self._policies:
-            self._policies[aid] = EscalationPolicy(); self._entropy[aid] = 0.0
+            self._policies[aid] = EscalationPolicy()
+            self._entropy[aid] = 0.0
         return self._policies[aid]
     def select(self, a):
         eng = ["heuristic", "behavioral", "reserve"]
-        if self._entropy.get(a.asset_id, 0.0) > 0.6 or a.context.get("force_heavy"): eng += ["bayesian", "drift"]
-        if a.context.get("activity_history"): eng.append("trajectory")
-        if a.context.get("baseline_history"): eng.append("drift")
-        if a.telemetry_gap > 0 or a.context.get("edr_tamper") or a.context.get("log_clear_event"): eng.append("adversarial")
+        if self._entropy.get(a.asset_id, 0.0) > 0.6 or a.context.get("force_heavy"):
+            eng += ["bayesian", "drift"]
+        if a.context.get("activity_history"):
+            eng.append("trajectory")
+        if a.context.get("baseline_history"):
+            eng.append("drift")
+        if a.telemetry_gap > 0 or a.context.get("edr_tamper") or a.context.get("log_clear_event"):
+            eng.append("adversarial")
         eng.append("bayesian")  # UEBA always informative for security
         seen, out = set(), []
         for e in eng:
-            if e not in seen: seen.add(e); out.append(e)
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
         return out
     def evaluate(self, a: AssetState) -> Verdict:
         policy = self._get_policy(a.asset_id)
@@ -405,20 +453,27 @@ class AssetEngine:
         candidate = OperationalRegime(max(probs, key=probs.get))
         rf = 1.0
         for o in outputs:
-            if o.engine_name == "reserve" and "reserve_factor" in o.debug_info: rf = o.debug_info["reserve_factor"]
+            if o.engine_name == "reserve" and "reserve_factor" in o.debug_info:
+                rf = o.debug_info["reserve_factor"]
         active = [o for o in outputs if not o.abstained]
         det = any(r.startswith("HARD_RULE:") or r.startswith("DANGEROUS_PATTERN:") for o in active for r in o.triggered_rules)
         if det and candidate.value in ("warning", "critical"):
             esc = policy.current_regime.value in ("stable", "caution")
-            final = candidate; policy.current_regime = final; policy.pending_regime = None; policy.dwell_count = 0
-            if esc: policy.escalation_locked = True; policy.last_escalation_time = a.timestamp
+            final = candidate
+            policy.current_regime = final
+            policy.pending_regime = None
+            policy.dwell_count = 0
+            if esc:
+                policy.escalation_locked = True
+                policy.last_escalation_time = a.timestamp
         else:
             final, esc = policy.evaluate(candidate, a.timestamp, rf)
         rules = [r for o in outputs for r in o.triggered_rules]
         conf = sum(o.confidence for o in active)/len(active) if active else 0.0
         ttps = []
         for o in outputs:
-            if "ttps" in o.debug_info: ttps += o.debug_info["ttps"]
+            if "ttps" in o.debug_info:
+                ttps += o.debug_info["ttps"]
         v = Verdict(a.asset_id, fused, final, conf, entropy, [o.engine_name for o in active],
                     rules, datetime.now(timezone.utc), escalation_required=esc, reserve_factor=rf)
         v.audit_hash = self.audit_ledger.append(a.asset_id, "asset_assessment",
@@ -455,7 +510,8 @@ def _cluster_campaigns(states: Dict[str, AssetState], verdicts: Dict[str, Verdic
     parent = {aid: aid for aid in elevated}
     def find(x):
         while parent[x] != x:
-            parent[x] = parent[parent[x]]; x = parent[x]
+            parent[x] = parent[parent[x]]
+            x = parent[x]
         return x
     def union(x, y): parent[find(x)] = find(y)
     # link assets that share any indicator
@@ -602,7 +658,8 @@ class SOCMonitor:
         "adaptive_adversary": NetworkAdapters.adaptive_adversary,
     }
     def __init__(self, cfg: SOCConfig = SOCConfig()):
-        self.cfg = cfg; self.audit_ledger = ImmutableAuditLedger()
+        self.cfg = cfg
+        self.audit_ledger = ImmutableAuditLedger()
         self.asset_engine = AssetEngine(self.audit_ledger)
         self.network_policy = EscalationPolicy()
 
@@ -616,7 +673,8 @@ class SOCMonitor:
 
         rf = 1.0
         for a in assets:
-            cap = a.context.get("soc_capacity_remaining"); tot = a.context.get("soc_capacity_total", 10.0)
+            cap = a.context.get("soc_capacity_remaining")
+            tot = a.context.get("soc_capacity_total", 10.0)
             if cap is not None and tot > 0:
                 rf = min(rf, max(0.0, min(1.0, cap / tot)))
 
@@ -624,9 +682,13 @@ class SOCMonitor:
         danger = any(r.startswith("DANGEROUS_PATTERN:") for o in active for r in o.triggered_rules)
         if danger and candidate.value in ("warning", "critical"):
             esc = self.network_policy.current_regime.value in ("stable", "caution")
-            final = candidate; self.network_policy.current_regime = final
-            self.network_policy.pending_regime = None; self.network_policy.dwell_count = 0
-            if esc: self.network_policy.escalation_locked = True; self.network_policy.last_escalation_time = timestamp
+            final = candidate
+            self.network_policy.current_regime = final
+            self.network_policy.pending_regime = None
+            self.network_policy.dwell_count = 0
+            if esc:
+                self.network_policy.escalation_locked = True
+                self.network_policy.last_escalation_time = timestamp
         else:
             final, esc = self.network_policy.evaluate(candidate, timestamp, rf)
 
@@ -719,5 +781,6 @@ if __name__ == "__main__":
         thin.append(AssetState(**{**asdict(a), "context": {**a.context, "soc_capacity_remaining": 2, "soc_capacity_total": 10}}))
     show("Two campaigns, thin SOC capacity (2 of 10)", *SOCMonitor(SOCConfig(responder_capacity=2)).evaluate(thin, now))
 
-    _m = SOCMonitor(); _m.evaluate(clean, now)
+    _m = SOCMonitor()
+    _m.evaluate(clean, now)
     print(f"\nAudit chain integrity (clean run): {_m.audit_ledger.verify_integrity()} ({len(_m.audit_ledger.entries)} entries)")

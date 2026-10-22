@@ -142,7 +142,7 @@ Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'ide
 | `sentinel_os/metrics_prometheus.py` | GSA-815 | identical |
 | `sentinel_os/.gitignore` | sentinel_os | diverged |
 | `sentinel_os/readme-staleness-pass-2.bundle` | (none) | unique |
-| `sentinel_os/test_governor_failclosed.py` | (none) | unique |
+| `sentinel_os/test_governor_failclosed_root.py` | (none) | unique |
 | `sentinel_os/_.gitignore` | (none) | unique |
 | `sentinel_os/GSA.py` | (none) | unique |
 | `sentinel_os/api_server_resilient.py` | GSA-815 | identical |

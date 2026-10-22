@@ -84,8 +84,8 @@ def _ship_and_derive(twin):
         "primary_id": 1, "previous_hash": "genesis", "current_hash": "h1",
         "envelope": _ENVELOPE, "outcome_obligation": "loan_performance@24mo",
         "decided_at": NOW, "domain": "lending"}, headers=twin.good)
-    resp = twin.post(f"/replica/{twin.replica_id}/obligations/derive",
-                     headers=twin.good)
+    twin.post(f"/replica/{twin.replica_id}/obligations/derive",
+              headers=twin.good)
     obligations = twin.get(f"/replica/{twin.replica_id}/obligations",
                            headers=twin.good).json()["obligations"]
     return obligations[0]["obligation_id"]

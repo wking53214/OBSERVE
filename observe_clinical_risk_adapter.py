@@ -189,9 +189,14 @@ class RegimeClassificationModule:
        if faults:
            classified_regime = "warning"
            escalation = True
+       elif not fused.get("regime_distribution"):
+           # No fused distribution (no adapter output) is not evidence of
+           # stability: fail closed to a WARNING floor and escalate.
+           classified_regime = "warning"
+           escalation = True
        else:
-           dist = fused.get("regime_distribution", {})
-           classified_regime = max(dist, key=dist.get) if dist else "stable"
+           dist = fused["regime_distribution"]
+           classified_regime = max(dist, key=dist.get)
            escalation = classified_regime in ("warning", "critical")
 
        fingerprint_data = {

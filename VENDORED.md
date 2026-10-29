@@ -22,6 +22,10 @@ changed with it, and fails if the root copy stops being declared `diverged` in t
 **The original `identical` assertion must be restored when the plan in `RECONCILE_UPSTREAM_PLAN.md` completes.**
 Remove this section and the pin test then.
 
+## Re-sync log
+
+- 2026-10-29: `sentinel_os/queue_schema.py` re-synced from sentinel_os `b5d8e78` (byte-identical, sha256 `6969e87126ed074f...`). The previous copy was an older design that OBSERVE's own `api_server_v2.py` and `twin_sync_worker.py` had already outgrown (they call `namespace=`, `get_job`, `ping`, `promote_due` and `ack(result=)`, which it lacked). Its methods and reasons were a strict subset of upstream's, so nothing OBSERVE-only was lost. Row status above changed from `diverged` to `identical`.
+
 | File | Upstream | Status |
 | --- | --- | --- |
 | `observe_consolidated.py` | observe-perceive | diverged |
@@ -152,7 +156,7 @@ Remove this section and the pin test then.
 | `sentinel_os/cohort_sweep_scheduling_v1.patch` | (none) | unique |
 | `sentinel_os/load_test_config.py` | sentinel_os | identical |
 | `sentinel_os/02-COMPLIANCE.patch` | (none) | unique |
-| `sentinel_os/queue_schema.py` | sentinel_os | diverged |
+| `sentinel_os/queue_schema.py` | sentinel_os | identical |
 | `sentinel_os/perceive_consolidated.py` | observe-perceive | identical |
 | `sentinel_os/DEPLOYMENT.md` | sentinel_os | diverged |
 | `sentinel_os/sentinel_worker.py` | sentinel_os | diverged |

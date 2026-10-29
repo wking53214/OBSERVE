@@ -2,6 +2,26 @@
 
 Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'identical': 140} of 402 files.
 
+## Temporary stopgap (owner-approved 2026-10-29): pinned snapshot instead of byte-identity
+
+The root `observe_consolidated.py` and `sentinel_os/observe_consolidated.py` are not meant to be byte-identical today.
+The `sentinel_os/` copy is an upstream snapshot and the root copy is OBSERVE's own evolved engine
+(see `UPSTREAM.md` and `RECONCILE_UPSTREAM_PLAN.md`). The original assertion that the two are identical has therefore
+been replaced, for now, by a pin on the snapshot:
+
+| Pin | Value |
+| --- | --- |
+| Upstream | observe-perceive |
+| Upstream commit | `717c2e2` |
+| File | `sentinel_os/observe_consolidated.py` |
+| sha256 | `66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c` |
+
+`test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if the snapshot changes without this pin being
+changed with it, and fails if the root copy stops being declared `diverged` in the table below.
+
+**The original `identical` assertion must be restored when the plan in `RECONCILE_UPSTREAM_PLAN.md` completes.**
+Remove this section and the pin test then.
+
 | File | Upstream | Status |
 | --- | --- | --- |
 | `observe_consolidated.py` | observe-perceive | diverged |

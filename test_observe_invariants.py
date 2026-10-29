@@ -504,19 +504,45 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
 
 
 class VendoredCopyStaysInSync(unittest.TestCase):
-    """Review finding 8: the commit promises root and sentinel_os/ copies are
-    byte-synced; nothing enforced it. This does.
+    """TEMPORARY STOPGAP (owner-approved 2026-10-29), not the original assertion.
+
+    The original test asserted that the root and sentinel_os/ copies of
+    observe_consolidated.py are byte-identical (review finding 8). They have
+    not been since 2026-09-08: sentinel_os/ holds an upstream snapshot
+    (observe-perceive 717c2e2) and the root holds OBSERVE's own evolved engine.
+    This test asserts what is true and documented instead, and still fails
+    loudly (never skips) if either side changes unexpectedly. The identical
+    assertion must be restored when RECONCILE_UPSTREAM_PLAN.md completes.
     """
 
-    def test_root_and_vendored_observe_consolidated_are_identical(self):
-        root = pathlib.Path(__file__).with_name("observe_consolidated.py")
-        vendored = root.with_name("sentinel_os") / "observe_consolidated.py"
-        if not vendored.exists():
-            self.skipTest("vendored sentinel_os/observe_consolidated.py not present")
+    # observe-perceive 717c2e2, observe_consolidated.py. Also recorded in VENDORED.md.
+    UPSTREAM_COMMIT = "717c2e2"
+    UPSTREAM_SNAPSHOT_SHA256 = "66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c"
+
+    def test_vendored_copy_is_the_pinned_upstream_snapshot_and_root_is_declared_diverged(self):
+        here = pathlib.Path(__file__).parent
+        vendored = here / "sentinel_os" / "observe_consolidated.py"
+        self.assertTrue(vendored.exists(), "sentinel_os/observe_consolidated.py is missing")
         self.assertEqual(
-            hashlib.sha256(root.read_bytes()).hexdigest(),
             hashlib.sha256(vendored.read_bytes()).hexdigest(),
-            msg="root and sentinel_os/ copies of observe_consolidated.py have drifted",
+            self.UPSTREAM_SNAPSHOT_SHA256,
+            msg=(
+                "sentinel_os/observe_consolidated.py no longer matches the pinned upstream snapshot "
+                f"(observe-perceive {self.UPSTREAM_COMMIT}). If this was a deliberate re-sync, update the "
+                "pin here and in VENDORED.md together."
+            ),
+        )
+        manifest = (here / "VENDORED.md").read_text(encoding="utf-8")
+        self.assertIn(
+            self.UPSTREAM_SNAPSHOT_SHA256,
+            manifest,
+            msg="VENDORED.md does not record the same snapshot pin as this test",
+        )
+        rows = [ln for ln in manifest.splitlines() if ln.startswith("| `observe_consolidated.py` |")]
+        self.assertEqual(len(rows), 1, msg="VENDORED.md must have exactly one row for the root observe_consolidated.py")
+        self.assertTrue(
+            rows[0].rstrip().endswith("| diverged |"),
+            msg="VENDORED.md must declare the root observe_consolidated.py as 'diverged'",
         )
 
 

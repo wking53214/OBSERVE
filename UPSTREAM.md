@@ -10,6 +10,7 @@ where they came from or when they were last synced. This file and
 | observe-perceive | `observe_consolidated.py`, `test_observe_consolidated.py` | `717c2e2` | 2026-09-07 |
 | sentinel_os (`sentinel_os/` subtree) | `sentinel_os/` | `ddedd12` | 2026-09-07 |
 | GSA-815 | `sentinel_os/` (files that live in GSA-815) | `44ee595` | 2026-09-07 |
+| sentinel_os | `sentinel_os/queue_schema.py` (one file) | `b5d8e78` | 2026-10-29 |
 
 What was tried on 2026-09-07 and what it showed:
 

@@ -2,25 +2,32 @@
 
 Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'identical': 140} of 402 files.
 
-## Temporary stopgap (owner-approved 2026-10-29): pinned snapshot instead of byte-identity
+## Temporary stopgap (owner-approved 2026-10-29): pins instead of byte-identity
 
-The root `observe_consolidated.py` and `sentinel_os/observe_consolidated.py` are not meant to be byte-identical today.
-The `sentinel_os/` copy is an upstream snapshot and the root copy is OBSERVE's own evolved engine
-(see `UPSTREAM.md` and `RECONCILE_UPSTREAM_PLAN.md`). The original assertion that the two are identical has therefore
-been replaced, for now, by a pin on the snapshot:
+The root `observe_consolidated.py` and `sentinel_os/observe_consolidated.py` are not byte-identical today, and are not
+meant to be until PR-3 and PR-4 of `RECONCILE_UPSTREAM_PLAN.md` land. Since PR-2 the root engine is observe-perceive
+`e8186599e2399157feaa1592bf1399ff37d5c3d2` (the merge of #67), copied byte-for-byte together with four sibling modules and never edited here. The
+`sentinel_os/` copy is still the older upstream snapshot `717c2e2`. The original assertion that the two are identical has
+therefore been replaced, for now, by pins on both:
 
-| Pin | Value |
-| --- | --- |
-| Upstream | observe-perceive |
-| Upstream commit | `717c2e2` |
-| File | `sentinel_os/observe_consolidated.py` |
-| sha256 | `66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c` |
+| Pin | File | Upstream commit | sha256 |
+| --- | --- | --- | --- |
+| root | `observe_consolidated.py` | `e818659` | `0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566` |
+| root | `cassette.py` | `e818659` | `7e5465d65e2095df547641bd4d814ef496d3d9ac3f81e8ac77c14fb6055965d4` |
+| root | `pediatric_cassette.py` | `e818659` | `71774badff2c698e694c61189ec59003b23c288b0efe215304d88d987e991f20` |
+| root | `kalman_trajectory.py` | `e818659` | `03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a` |
+| root | `governance_contracts.py` | `e818659` | `2145fb7d4daf1e99e74858a92bd86185650fcf6debb470273411a280091e1aca` |
+| sentinel_os | `sentinel_os/observe_consolidated.py` | `717c2e2` | `66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c` |
 
-`test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if the snapshot changes without this pin being
-changed with it, and fails if the root copy stops being declared `diverged` in the table below.
+`test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if any pinned file changes without the pins here being
+changed with it, and fails if a root file stops being declared `identical` in the table below.
 
-**The original `identical` assertion must be restored when the plan in `RECONCILE_UPSTREAM_PLAN.md` completes.**
-Remove this section and the pin test then.
+OBSERVE chooses when the behavioral engine runs in one place, `observe_engine_gate.py`: it selects upstream's
+`conservative_legacy` gate (OBSERVE's own rule) until a pediatrician signs off upstream's widened rule. That file is
+OBSERVE's own and is not a copy.
+
+**The original `identical` assertion between root and `sentinel_os/` must be restored when the plan in
+`RECONCILE_UPSTREAM_PLAN.md` completes (PR-4).** Remove this section and the pin test then.
 
 ## Re-sync log
 
@@ -28,7 +35,11 @@ Remove this section and the pin test then.
 
 | File | Upstream | Status |
 | --- | --- | --- |
-| `observe_consolidated.py` | observe-perceive | diverged |
+| `observe_consolidated.py` | observe-perceive | identical |
+| `cassette.py` | observe-perceive | identical |
+| `pediatric_cassette.py` | observe-perceive | identical |
+| `kalman_trajectory.py` | observe-perceive | identical |
+| `governance_contracts.py` | observe-perceive | identical |
 | `test_observe_consolidated.py` | observe-perceive | diverged |
 | `sentinel_os/APPLY-remove-fake-ppo-router.md` | (none) | unique |
 | `sentinel_os/data.json` | (none) | unique |

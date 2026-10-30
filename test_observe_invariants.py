@@ -22,15 +22,13 @@ from observe_consolidated import (
     OperationalRegime,
     regime_distribution,
     validate_vitals,
-    compute_decision_fingerprint,
+    decision_fingerprint,
     compute_state_commitment,
     PARAMETER_SET,
     PARAMETER_SET_VERSION,
     _canonical_json,
     REGIME_DISTRIBUTION_BANDS,
     DRIFT_SIGMA_THRESHOLD,
-    HEAVY_PATH_ENTROPY_TRIGGER,
-    HEURISTIC_HARD_RULE_THRESHOLD,
     REGIME_CRITICAL_FLOOR_DEFAULT,
     DRIFT_CRITICAL_FLOOR,
     ESCALATION_DWELL_THRESHOLD,
@@ -55,21 +53,31 @@ def make_vitals(**overrides) -> VitalsSnapshot:
     return VitalsSnapshot(**defaults)
 
 
+_PROVENANCE_KEYS = ("decision_fingerprint", "predecessor_state_commitment", "state_commitment")
+
+
+def _replay_fingerprint(entry, **overrides) -> str:
+    """Recompute the fingerprint from a stored audit entry, as a verifier would."""
+    payload = {k: v for k, v in entry["data"].items() if k not in _PROVENANCE_KEYS}
+    payload.update(overrides)
+    return decision_fingerprint(payload)
+
+
 class StateContinuityBoundary(unittest.TestCase):
     """Narrow continuity checks at the evidence boundary."""
 
     def test_state_commitment_is_deterministic(self):
         payload = {"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}
         self.assertEqual(
-            compute_state_commitment(payload),
-            compute_state_commitment({"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}),
+            compute_state_commitment("", payload),
+            compute_state_commitment("", {"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}),
         )
 
     def test_state_commitment_binds_to_predecessor(self):
         payload = {"patient_id": "P-STATE", "risk_score": 0.63, "regime": "warning"}
         self.assertNotEqual(
-            compute_state_commitment(payload, predecessor_state_commitment="prev-1"),
-            compute_state_commitment(payload, predecessor_state_commitment="prev-2"),
+            compute_state_commitment("prev-1", payload),
+            compute_state_commitment("prev-2", payload),
         )
 
     def test_engine_binds_each_verdict_to_the_previous_state(self):
@@ -160,7 +168,7 @@ class T2_MissingOrGarbageTelemetryNeverReadsAsHealthy(unittest.TestCase):
     def test_out_of_range_vital_rejected(self):
         engine = ObserveClinicalEngine()
         verdict = engine.evaluate(make_vitals(heart_rate=999.0))
-        self.assertIn("heart_rate=out_of_range(999.0)", verdict.validation_faults)
+        self.assertIn("heart_rate=999.0 outside physical range [0.0, 350.0]", verdict.validation_faults)
         self.assertNotEqual(verdict.regime, OperationalRegime.STABLE)
 
     def test_negative_vital_rejected(self):
@@ -204,11 +212,11 @@ class T2b_ValidationFaultOverlayIsSafe(unittest.TestCase):
         verdict = engine.evaluate(make_vitals(patient_id="multi", oxygen_saturation=float("nan"),
                                               heart_rate=210.0, respiratory_rate=70.0))
         self.assertTrue(verdict.unassessable)
-        self.assertTrue(any("VALIDATION_FAULT" in r for r in verdict.triggered_rules))
+        self.assertTrue(any("DATA_INTEGRITY_FAULT" in r for r in verdict.triggered_rules))
         # the real tachycardia / tachypnea must still surface
         self.assertTrue(any(("tachy" in r.lower() or "hr" in r.lower() or "rr" in r.lower()
                              or "DANGEROUS_PATTERN" in r)
-                            for r in verdict.triggered_rules if "VALIDATION_FAULT" not in r),
+                            for r in verdict.triggered_rules if "DATA_INTEGRITY_FAULT" not in r),
                         msg=verdict.triggered_rules)
         self.assertIn(verdict.regime, (OperationalRegime.WARNING, OperationalRegime.CRITICAL))
 
@@ -415,10 +423,9 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         self.assertEqual(entry["data"]["parameter_set_version"], PARAMETER_SET_VERSION)
 
     def test_decision_fingerprint_is_deterministic_and_timestamp_free(self):
-        engine = ObserveClinicalEngine()
         v = make_vitals(patient_id="replay", oxygen_saturation=88.0)
-        fp1 = compute_decision_fingerprint(v, engine.evaluate(v))
-        fp2 = compute_decision_fingerprint(v, ObserveClinicalEngine().evaluate(v))
+        fp1 = ObserveClinicalEngine().evaluate(v).decision_fingerprint
+        fp2 = ObserveClinicalEngine().evaluate(v).decision_fingerprint
         self.assertEqual(fp1, fp2)
 
     def test_decision_fingerprint_is_persisted_on_verdict_and_in_audit(self):
@@ -428,17 +435,15 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         v = make_vitals(patient_id="persist", oxygen_saturation=88.0)
         verdict = engine.evaluate(v)
         self.assertEqual(len(verdict.decision_fingerprint), 64)
-        self.assertEqual(verdict.decision_fingerprint, compute_decision_fingerprint(v, verdict))
         entry = engine.audit_ledger.entries[-1]
         self.assertEqual(entry["data"]["decision_fingerprint"], verdict.decision_fingerprint)
+        self.assertEqual(_replay_fingerprint(entry), verdict.decision_fingerprint)
 
     def test_manifest_entries_track_their_live_module_constants(self):
         # Review finding 5: the version only means something if the manifest
         # actually references the constants the decision path uses, rather than
         # holding a stale hand-copied value.
         self.assertEqual(PARAMETER_SET["drift_sigma_threshold"], DRIFT_SIGMA_THRESHOLD)
-        self.assertEqual(PARAMETER_SET["heavy_path_entropy_trigger"], HEAVY_PATH_ENTROPY_TRIGGER)
-        self.assertEqual(PARAMETER_SET["heuristic_hard_rule_threshold"], HEURISTIC_HARD_RULE_THRESHOLD)
         self.assertEqual(PARAMETER_SET["regime_critical_floor_default"], REGIME_CRITICAL_FLOOR_DEFAULT)
         self.assertEqual(PARAMETER_SET["drift_critical_floor"], DRIFT_CRITICAL_FLOOR)
         self.assertEqual(PARAMETER_SET["escalation_dwell_threshold"], ESCALATION_DWELL_THRESHOLD)
@@ -496,11 +501,10 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
 
     def test_fingerprint_moves_with_the_parameter_version(self):
         engine = ObserveClinicalEngine()
-        v = make_vitals(oxygen_saturation=88.0)
-        verdict = engine.evaluate(v)
-        fp_real = compute_decision_fingerprint(v, verdict)
-        verdict.parameter_set_version = "different-version"
-        self.assertNotEqual(compute_decision_fingerprint(v, verdict), fp_real)
+        engine.evaluate(make_vitals(oxygen_saturation=88.0))
+        entry = engine.audit_ledger.entries[-1]
+        self.assertNotEqual(_replay_fingerprint(entry, parameter_set_version="different-version"),
+                            entry["data"]["decision_fingerprint"])
 
 
 class VendoredCopyStaysInSync(unittest.TestCase):
@@ -508,42 +512,62 @@ class VendoredCopyStaysInSync(unittest.TestCase):
 
     The original test asserted that the root and sentinel_os/ copies of
     observe_consolidated.py are byte-identical (review finding 8). They have
-    not been since 2026-09-08: sentinel_os/ holds an upstream snapshot
-    (observe-perceive 717c2e2) and the root holds OBSERVE's own evolved engine.
-    This test asserts what is true and documented instead, and still fails
-    loudly (never skips) if either side changes unexpectedly. The identical
-    assertion must be restored when RECONCILE_UPSTREAM_PLAN.md completes.
+    not been since 2026-09-08. Since PR-2 the root engine is observe-perceive
+    e8186599 (byte-identical, with its four sibling modules), while sentinel_os/
+    still holds the older upstream snapshot 717c2e2 until PR-3 re-syncs it.
+    This test asserts both facts and still fails loudly (never skips) if either
+    side, or any pinned file, changes unexpectedly. The identical assertion
+    between root and sentinel_os/ is restored by PR-4 of RECONCILE_UPSTREAM_PLAN.md.
     """
 
-    # observe-perceive 717c2e2, observe_consolidated.py. Also recorded in VENDORED.md.
-    UPSTREAM_COMMIT = "717c2e2"
-    UPSTREAM_SNAPSHOT_SHA256 = "66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c"
+    # Root: observe-perceive e8186599 (merge of #67). Also recorded in VENDORED.md.
+    ROOT_UPSTREAM_COMMIT = "e8186599e2399157feaa1592bf1399ff37d5c3d2"
+    ROOT_PINS = {
+        "observe_consolidated.py": "0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566",
+        "cassette.py": "7e5465d65e2095df547641bd4d814ef496d3d9ac3f81e8ac77c14fb6055965d4",
+        "pediatric_cassette.py": "71774badff2c698e694c61189ec59003b23c288b0efe215304d88d987e991f20",
+        "kalman_trajectory.py": "03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a",
+        "governance_contracts.py": "2145fb7d4daf1e99e74858a92bd86185650fcf6debb470273411a280091e1aca",
+    }
+    # sentinel_os/: observe-perceive 717c2e2, observe_consolidated.py. Also recorded in VENDORED.md.
+    SNAPSHOT_COMMIT = "717c2e2"
+    SNAPSHOT_SHA256 = "66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c"
 
-    def test_vendored_copy_is_the_pinned_upstream_snapshot_and_root_is_declared_diverged(self):
+    def test_root_is_the_pinned_upstream_engine_and_sentinel_os_is_the_pinned_snapshot(self):
         here = pathlib.Path(__file__).parent
+        for name, pin in self.ROOT_PINS.items():
+            path = here / name
+            self.assertTrue(path.exists(), f"{name} is missing")
+            self.assertEqual(
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                pin,
+                msg=(
+                    f"{name} no longer matches observe-perceive {self.ROOT_UPSTREAM_COMMIT}. These files are "
+                    "copied, never edited here. If this was a deliberate re-sync, update the pins here and "
+                    "in VENDORED.md together."
+                ),
+            )
         vendored = here / "sentinel_os" / "observe_consolidated.py"
         self.assertTrue(vendored.exists(), "sentinel_os/observe_consolidated.py is missing")
         self.assertEqual(
             hashlib.sha256(vendored.read_bytes()).hexdigest(),
-            self.UPSTREAM_SNAPSHOT_SHA256,
+            self.SNAPSHOT_SHA256,
             msg=(
                 "sentinel_os/observe_consolidated.py no longer matches the pinned upstream snapshot "
-                f"(observe-perceive {self.UPSTREAM_COMMIT}). If this was a deliberate re-sync, update the "
+                f"(observe-perceive {self.SNAPSHOT_COMMIT}). If this was a deliberate re-sync, update the "
                 "pin here and in VENDORED.md together."
             ),
         )
         manifest = (here / "VENDORED.md").read_text(encoding="utf-8")
-        self.assertIn(
-            self.UPSTREAM_SNAPSHOT_SHA256,
-            manifest,
-            msg="VENDORED.md does not record the same snapshot pin as this test",
-        )
-        rows = [ln for ln in manifest.splitlines() if ln.startswith("| `observe_consolidated.py` |")]
-        self.assertEqual(len(rows), 1, msg="VENDORED.md must have exactly one row for the root observe_consolidated.py")
-        self.assertTrue(
-            rows[0].rstrip().endswith("| diverged |"),
-            msg="VENDORED.md must declare the root observe_consolidated.py as 'diverged'",
-        )
+        for pin in (self.SNAPSHOT_SHA256, *self.ROOT_PINS.values()):
+            self.assertIn(pin, manifest, msg="VENDORED.md does not record the same pin as this test")
+        for name in self.ROOT_PINS:
+            rows = [ln for ln in manifest.splitlines() if ln.startswith(f"| `{name}` |")]
+            self.assertEqual(len(rows), 1, msg=f"VENDORED.md must have exactly one row for the root {name}")
+            self.assertTrue(
+                rows[0].rstrip().endswith("| identical |"),
+                msg=f"VENDORED.md must declare the root {name} as 'identical' to observe-perceive",
+            )
 
 
 if __name__ == "__main__":

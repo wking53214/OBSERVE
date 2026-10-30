@@ -26,7 +26,8 @@ What actually lives in this checkout:
 
 | Path | What it is |
 |---|---|
-| `observe_consolidated.py` | The real OBSERVE engine (also copied into observe-perceive). RiskAdapters, EscalationPolicy, fusion. |
+| `observe_consolidated.py` | The OBSERVE engine: RiskAdapters, EscalationPolicy, fusion. **Copied byte-for-byte from observe-perceive `e818659`** (never edited here), with its four sibling modules `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py` and `governance_contracts.py`. |
+| `observe_engine_gate.py` | OBSERVE's own: the one place that chooses when the behavioral engine runs (`conservative_legacy`, OBSERVE's rule, until a pediatrician signs off upstream's widened rule). |
 | `observe_clinical_risk_adapter.py` and `clinical_*` | Clinical wiring. |
 | `perceive_policy_enforcement_*` | PERCEIVE copies / flattened sources — **policy code in an observation repo**. |
 | `sentinel_os/` | A **vendored historical tree** of sentinel_os: patches (`APPLY-*.md`, `0001-*.patch`), Docker, tests, governance, cassettes. Not a clean observation library. |
@@ -47,7 +48,7 @@ What actually lives in this checkout:
 | Gap | Detail |
 |---|---|
 | Nested `sentinel_os/` | Hundreds of files: patches, APPLY playbooks, IVR kernel. OBSERVE-the-idea is a handful of modules; OBSERVE-the-repo is a dump. Drift vs live `wking53214/sentinel_os` is expected. |
-| Dual engine | `observe_consolidated.py` here vs the copy in observe-perceive. No single package pin. |
+| Engine copies | The root engine is a byte-identical copy of observe-perceive `e818659` (pinned in `VENDORED.md`, checked by `test_observe_invariants.py`). `sentinel_os/observe_consolidated.py` is still the older upstream snapshot `717c2e2` until PR-3 of `RECONCILE_UPSTREAM_PLAN.md`. |
 | Clinical skips | Commercial red team: missed/late pediatric detections and sensor-fault gaps recorded as **skipped tests** in the spine. This repo does not close them. |
 | Uncalibrated constants | `PEDIATRIC_NORMS`, dwell, lock_seconds, syndrome weights (`0.40`/`0.35`) — copied into α without independent validation. |
 | Age-adjustment asymmetry | Syndromes not age-adjusted. Preserved, not a bug, but unsafe to treat as a finished clinical model. |
@@ -71,7 +72,7 @@ Live types live in `observe_consolidated.py` (also in observe-perceive): `Vitals
 ## 7. Stack Integration Topology
 
 ```text
-this repo:observe_consolidated.py  ──copied──►  observe-perceive:observe_consolidated.py  (LIVE)
+observe-perceive:observe_consolidated.py  (LIVE)  ──copied──►  this repo:observe_consolidated.py
         │                                         │
         ├── extracted detectors ──► interconnected_alpha
         └── EscalationPolicy   ──► interconnected_zeta

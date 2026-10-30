@@ -152,7 +152,7 @@ jobs:
           # NO repo-root pytest.ini/pyproject, so the vendored `pytest .` run
           # above (working-directory: sentinel_os) keeps its own rootdir and
           # default import mode. This is a real gate — not `|| true`.
-          python -m pytest test_observe_consolidated.py test_observe_invariants.py test_observe_clinical_risk_adapter.py -v --tb=short
+          python -m pytest test_observe_consolidated.py test_observe_invariants.py test_observe_clinical_risk_adapter.py test_engine_resync_differential.py -v --tb=short
 
       - name: Lint (ruff)
         if: always()

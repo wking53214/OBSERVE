@@ -27,14 +27,19 @@ class IcebergProductionHarness:
         
         self.config = config
         
+        # One IVR cassette for everything that reads thresholds: the parser's
+        # friction count raises without one (fail-loud), so every real call
+        # failed before the parser was given its cassette.
+        ivr_cassette = CassetteLoader().load_cassette("ivr")
+        
         # Data sources
-        self.twilio_parser = TwilioLogParser()
+        self.twilio_parser = TwilioLogParser(cassette=ivr_cassette)
         self.twilio_adapter = None  # Will init if API key provided
         
         # Observability
         self.metrics = PrometheusMetrics()
         self.observer = ObserveCore()
-        self.sentinel = SentinelCore(CassetteLoader().load_cassette("ivr"))
+        self.sentinel = SentinelCore(ivr_cassette)
         
         # Persistence
         self.ledger = None  # Will init if DB config provided

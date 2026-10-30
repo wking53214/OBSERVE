@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
 from observe_consolidated import (
-    ObserveClinicalEngine,
     VitalsSnapshot,
     FusedVerdict,
     OperationalRegime,
 )
+from observe_engine_gate import make_engine
 
 from perceive_consolidated import (
     PerceiveGovernanceKernel,
@@ -105,7 +105,7 @@ class ClinicalGovernanceSystem:
         capacity_forecaster: Optional[ErlangCapacityForecaster] = None,
         accuracy_monitor: Optional[AccuracyMonitor] = None,
     ):
-        self.observe = ObserveClinicalEngine()
+        self.observe = make_engine()
 
         self.perceive = PerceiveGovernanceKernel(
             dgk_gateway=dgk_gateway,

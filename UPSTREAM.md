@@ -7,7 +7,8 @@ where they came from or when they were last synced. This file and
 
 | Upstream | Path here | Synced from commit | Sync date |
 | --- | --- | --- | --- |
-| observe-perceive | `observe_consolidated.py`, `test_observe_consolidated.py` | `717c2e2` | 2026-09-07 |
+| observe-perceive | `test_observe_consolidated.py` | `717c2e2` | 2026-09-07 |
+| observe-perceive | `observe_consolidated.py`, `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py`, `governance_contracts.py` (root, byte-identical) | `e818659` | 2026-10-30 |
 | sentinel_os (`sentinel_os/` subtree) | `sentinel_os/` | `ddedd12` | 2026-09-07 |
 | GSA-815 | `sentinel_os/` (files that live in GSA-815) | `44ee595` | 2026-09-07 |
 | sentinel_os | `sentinel_os/queue_schema.py` (one file) | `b5d8e78` | 2026-10-29 |

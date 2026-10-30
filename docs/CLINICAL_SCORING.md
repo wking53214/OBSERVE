@@ -20,6 +20,57 @@ threshold wrong, that correction is a separate code change.
 
 ---
 
+## Changes made by PR-2b (2026-10-30): the engine is now observe-perceive's, with OBSERVE's gate
+
+**Read this first; the sections below were extracted from the previous engine (`73eff68`) and their line
+numbers refer to it. They have not been re-extracted line by line against the new engine.**
+
+The root `observe_consolidated.py` is now a byte-identical copy of observe-perceive `e818659` (see
+`VENDORED.md`). What that means for clinical review:
+
+1. **The rule for when the behavioral engine runs is unchanged. It is OBSERVE's own rule.** §6 below is still
+   accurate for OBSERVE: the behavioral adapter runs for SpO2 < 92, or HR > 140, or HR < 90. Upstream's current
+   engine has a **wider** rule (it also runs the behavioral engine for respiratory rate > 35 or temperature >
+   38.5) that its own code marks **provisional, pending pediatrician sign-off**. OBSERVE has **not** adopted it.
+   OBSERVE selects upstream's `conservative_legacy` gate in one place, `observe_engine_gate.py`; flipping that one
+   constant adopts the widened rule. A decision made under the legacy gate names the gate in its stored audit entry.
+   On the plan's 600-reading test corpus the widened rule adds the behavioral engine on 75 readings (one in eight), so
+   adopting it is a clinical decision, not a refactor.
+2. **A reading with a junk context value is now scored instead of refused.** Before, a reading whose context held a
+   non-numeric value for a field such as `previous_o2` or `age_months` made the engine raise an error, so that
+   reading received **no assessment at all** and the dwell step for it was lost (an alert could come one reading late).
+   Now the junk value is ignored and the reading is assessed from its valid vitals. On the 600-reading corpus this
+   affected 12 readings.
+3. **An impossible `previous_o2` (for example 200) is now ignored instead of used as a real value.** It used to feed
+   the trajectory comparison. This can move a risk score slightly (11 readings in the corpus; by 0.005 to 0.114, mostly lower and once higher) and,
+   through the dwell step, a regime on the following readings of that patient.
+4. **Nothing else about scoring changed under the legacy gate.** With the junk value removed from the old engine's run,
+   the new engine agrees with the old on all 600 readings: regime, escalation, engine set, unassessable flag and risk
+   (`test_engine_resync_differential.py`). The 40 differences against the old engine as it actually ran are all
+   explained by points 2 and 3 and are listed in that test.
+5. **Wording and evidence.** A data-integrity fault in a rule note now reads `DATA_INTEGRITY_FAULT:` (it was
+   `VALIDATION_FAULT:`), and the fault text reads `heart_rate=999.0 outside physical range [0.0, 350.0]`. The
+   parameter-set label is `observe.parameters/v2` and the safety-bypass note is part of the stored decision data, so
+   every fingerprint and parameter-set version differs from the previous engine's. Assumption: no persisted evidence
+   from before this change must stay verifiable.
+
+### OPEN ITEM this change does NOT fix: a worsening patient gets no new alert
+
+Measured on 2026-10-30 on **both** engines (they behave identically): after a patient has raised a WARNING alert, a
+worsening to CRITICAL raises **no new `escalation_required`**, at +60 s, +120 s, +240 s, +299 s, +301 s and for 12
+minutes of critical readings. The 300 s cooldown is not the cause. `escalation_required` is set only when the tracked
+regime moves up **from STABLE or CAUTION**; a bypass (hard rule or syndrome) updates the regime straight to CRITICAL
+but does not raise the flag. Run through the hospital-facing `ClinicalGovernanceSystem`, such a patient is labelled
+CRITICAL with the action `continue_monitoring` and governance is never asked. In about 69,000 combinations of
+single-reading vitals, no reading reaches WARNING or CRITICAL without a bypass firing, so the bypass is the only route
+in, and it is the route that does not raise the flag on a worsening. Trend and drift sequences were not exhaustively
+searched. This is the already-listed **Review Q5c.1 (high priority)** in §5c and Q-0.4 / Q-0.5; it needs a clinical
+decision from the rapid-response protocol owner, and a fix must be applied to both engines. Options on the table (none
+implemented): the flag fires on any upward move in severity; a bypass-triggered worsening raises the flag and ignores
+the lock (recommended); or a distinct, louder "worsened" event.
+
+---
+
 ## 0. Observed engine behaviors that need clinical sign-off
 
 These are **real end-to-end runs of the current engine**, not hypotheticals.

@@ -129,3 +129,39 @@ def test_missing_cns_raises_with_the_install_command(monkeypatch):
     assert cns_available() is False
     with pytest.raises(CnsNotInstalled, match="cns @ git"):
         ObserveCnsGate("alpha")
+
+
+# ------------------------------------------------- audit findings OBS-1 .. OBS-6
+
+from cns_composition.gate_chain import run_chain  # noqa: E402
+
+READING_TIME = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+
+
+def reading(**overrides):
+    return make_vitals(**{"timestamp": READING_TIME, **overrides})
+
+
+def test_obs5_validation_faults_without_the_unassessable_flag_are_a_retry():
+    inconsistent = make_verdict(validation_faults=["heart_rate=nan is not a finite number"], unassessable=False)
+    result = ObserveCnsGate("omega").check(inconsistent)
+    assert result.outcome is GateOutcome.RETRY
+    assert "partial assessment" in result.reason
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_obs6_a_non_finite_reading_asks_for_a_new_reading(value):
+    result = ObserveCnsGate("alpha").check(reading(heart_rate=value))
+    assert result.outcome is GateOutcome.RETRY
+    assert "re-read required" in result.reason
+    assert result.bound()
+
+
+def test_retry_and_terminal_breach_survive_the_chain():
+    alpha, omega = ObserveCnsGate("alpha"), ObserveCnsGate("omega")
+    retry = run_chain([(alpha, reading(heart_rate=float("nan")))], [(omega, make_verdict())])
+    assert retry.outcome is GateOutcome.RETRY and not retry.omega_ran
+    both = run_chain([(alpha, reading(heart_rate=-5)), (alpha, make_verdict())], [(omega, make_verdict())])
+    assert both.outcome is GateOutcome.TERMINAL_BREACH and not both.omega_ran
+    late = run_chain([(alpha, reading())], [(omega, make_verdict(validation_faults=["x"]))])
+    assert late.outcome is GateOutcome.RETRY and late.omega_ran

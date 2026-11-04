@@ -29,6 +29,23 @@ and any engine that produced evidence is enough: that is the safest reading
 available without one, and it still never passes a verdict on selection
 alone.
 
+Record integrity at OMEGA. Before counting evidence the gate checks that the
+ledger entry still hashes to its own immutable_hash, recomputes the decision
+fingerprint from the recorded payload with observe_consolidated's
+decision_fingerprint, and requires the verdict's fingerprint, regime, risk,
+engines, parameter set and state commitments to equal the record. Any
+difference is a TERMINAL_BREACH. OMEGA binds its result to the verdict
+without its wall-clock timestamp and its ledger position (audit_hash), so the
+same decision binds to the same digest in any run; the fingerprint is what
+identifies the decision.
+
+Patient linkage. FusedVerdict carries no patient id, so OMEGA takes it from
+the verdict's ledger entry and names it in the subject
+(observe:omega:<patient>:<fingerprint>). A caller that judges one patient
+builds both gates with patient_id=..., and each end then refuses content
+for any other patient as a TERMINAL_BREACH, so ALPHA vitals for one patient
+and an OMEGA verdict for another cannot pass as one run.
+
 OBSERVE never authorizes anything. These gates only decide whether an
 observation or verdict is sound enough to pass along. Refusals that a fresh
 reading can fix are RETRY. Anything else is TERMINAL_BREACH. An exception,
@@ -42,7 +59,9 @@ raises CnsNotInstalled with the install command and nothing else changes.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
+import json
 import math
 from dataclasses import asdict
 from datetime import datetime
@@ -50,7 +69,7 @@ from enum import Enum
 from types import ModuleType
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Union
 
-from observe_consolidated import FusedVerdict, VitalsSnapshot, validate_vitals
+from observe_consolidated import FusedVerdict, VitalsSnapshot, decision_fingerprint, validate_vitals
 
 __all__ = [
     "CnsNotInstalled",
@@ -62,6 +81,11 @@ INSTALL_HINT = "pip install -r requirements-cns.txt (cns @ git+https://github.co
 
 _ALPHA = "alpha"
 _OMEGA = "omega"
+
+#: Written into a ledger entry beside the fingerprinted payload, not part of it.
+_BESIDE_FINGERPRINT = ("decision_fingerprint", "predecessor_state_commitment", "state_commitment")
+#: Left out of the OMEGA binding: wall-clock time and ledger position, not the decision.
+_UNBOUND_VERDICT_FIELDS = ("timestamp", "audit_hash")
 
 
 class CnsNotInstalled(ImportError):
@@ -124,6 +148,37 @@ def _engine_set(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(names)
 
 
+def _record_problem(entry: Dict[str, Any], verdict: Any) -> str:
+    """Why a verdict and its ledger entry disagree, or "" when they agree."""
+    target = {k: v for k, v in entry.items() if k != "immutable_hash"}
+    rehashed = hashlib.sha256(json.dumps(target, sort_keys=True, default=str).encode()).hexdigest()
+    if rehashed != entry.get("immutable_hash"):
+        return "the verdict's audit ledger entry has been altered"
+    data = entry["data"]
+    payload = {k: v for k, v in data.items() if k not in _BESIDE_FINGERPRINT}
+    fingerprint = decision_fingerprint(payload)
+    if fingerprint != data.get("decision_fingerprint") or fingerprint != verdict.decision_fingerprint:
+        return "the decision fingerprint does not match the recorded decision"
+    recorded = data["verdict"]
+    expected = {
+        "regime": recorded.get("regime"),
+        "risk_score": recorded.get("risk_score"),
+        "entropy": recorded.get("entropy"),
+        "escalation_required": recorded.get("escalation_required"),
+        "unassessable": bool(recorded.get("unassessable", False)),
+        "validation_faults": list(data.get("validation_faults", [])),
+        "active_engines": list(data.get("selected_engines", [])),
+        "parameter_set_version": data.get("parameter_set_version"),
+        "predecessor_state_commitment": data.get("predecessor_state_commitment"),
+        "state_commitment": data.get("state_commitment"),
+    }
+    actual = {name: _plain(getattr(verdict, name)) for name in expected}
+    differ = sorted(name for name in expected if actual[name] != expected[name])
+    if differ:
+        return "verdict does not match its audit record: " + ", ".join(differ)
+    return ""
+
+
 def _cassette_of(engine: Any) -> Any:
     """The cassette an ObserveClinicalEngine scores with."""
     return engine._cassette
@@ -139,13 +194,15 @@ class ObserveCnsGate:
         engine: Any = None,
         mandatory_engines: Iterable[str] = (),
         advisory_engines: Iterable[str] = (),
+        patient_id: Optional[str] = None,
     ) -> None:
         """Build the gate for one end.
 
         engine is the ObserveClinicalEngine whose verdicts OMEGA judges; its
         audit ledger and cassette are where OMEGA confirms evidence. The two
         engine sets are the application's policy (see the module docstring).
-        All three belong to OMEGA only.
+        All three belong to OMEGA only. patient_id, at either end, refuses
+        content for any other patient.
         """
         cns = _cns_gate()
         if position not in (_ALPHA, _OMEGA):
@@ -153,6 +210,8 @@ class ObserveCnsGate:
         mandatory, advisory = _engine_set(mandatory_engines), _engine_set(advisory_engines)
         if position == _ALPHA and (engine is not None or mandatory or advisory):
             raise ValueError("engine, mandatory_engines and advisory_engines belong to the omega end")
+        if patient_id is not None and (not isinstance(patient_id, str) or not patient_id):
+            raise ValueError("patient_id must be a non-empty string")
         if mandatory & advisory:
             raise ValueError(f"engines cannot be both mandatory and advisory: {sorted(mandatory & advisory)}")
         if engine is not None:
@@ -162,6 +221,7 @@ class ObserveCnsGate:
                 raise ValueError(f"the engine's cassette cannot re-run {sorted(unknown)}, so the gate "
                                  "could never confirm their evidence")
         self._engine = engine
+        self._patient_id = patient_id
         self._mandatory: FrozenSet[str] = mandatory
         self._advisory: FrozenSet[str] = advisory
         self._cns = cns
@@ -182,7 +242,11 @@ class ObserveCnsGate:
         try:
             # A NaN or infinite vital is a sensor fault (RETRY, as documented), not
             # content that cannot be bound, so ALPHA describes it rather than refusing it.
-            digest = cns.subject_digest(_plain(asdict(candidate), non_finite=self._position == _ALPHA))
+            content = asdict(candidate)
+            if self._position == _OMEGA:
+                for name in _UNBOUND_VERDICT_FIELDS:
+                    content.pop(name, None)
+            digest = cns.subject_digest(_plain(content, non_finite=self._position == _ALPHA))
         except (TypeError, ValueError) as exc:
             return self._result(cns.GateOutcome.TERMINAL_BREACH, f"fault: content cannot be bound ({exc})")
 
@@ -200,6 +264,9 @@ class ObserveCnsGate:
     def _judge(self, candidate: Any) -> tuple:
         cns = self._cns
         if self._position == _ALPHA:
+            if self._patient_id is not None and candidate.patient_id != self._patient_id:
+                return cns.GateOutcome.TERMINAL_BREACH, (
+                    f"fault: vitals are for patient {candidate.patient_id!r}, this gate judges {self._patient_id!r}")
             faults = validate_vitals(candidate)
             if faults:
                 return cns.GateOutcome.RETRY, "sensor fault, re-read required: " + "; ".join(faults)
@@ -219,6 +286,12 @@ class ObserveCnsGate:
         entry = self._entry(candidate)
         if entry is None:
             return cns.GateOutcome.TERMINAL_BREACH, "fault: the verdict has no entry in the engine's audit ledger"
+        problem = _record_problem(entry, candidate)
+        if problem:
+            return cns.GateOutcome.TERMINAL_BREACH, "fault: " + problem
+        if self._patient_id is not None and entry["patient_id"] != self._patient_id:
+            return cns.GateOutcome.TERMINAL_BREACH, (
+                f"fault: verdict is for patient {entry['patient_id']!r}, this gate judges {self._patient_id!r}")
         return self._judge_evidence(entry["data"])
 
     def _judge_evidence(self, data: Dict[str, Any]) -> tuple:
@@ -267,7 +340,15 @@ class ObserveCnsGate:
     def _subject(self, candidate: Any) -> str:
         if self._position == _ALPHA:
             return f"observe:alpha:{candidate.patient_id}"
-        return f"observe:omega:{candidate.decision_fingerprint or 'unfingerprinted'}"
+        patient = None
+        if self._engine is not None:
+            try:
+                entry = self._entry(candidate)
+            except Exception:  # an unreadable ledger leaves the subject unnamed; _judge refuses it
+                entry = None
+            patient = entry.get("patient_id") if entry else None
+        fingerprint = candidate.decision_fingerprint or "unfingerprinted"
+        return f"observe:omega:{patient}:{fingerprint}" if patient else f"observe:omega:{fingerprint}"
 
     def _result(self, outcome: Any, reason: str, subject: str = "", digest: str = "") -> Any:
         return self._cns.GateResult(

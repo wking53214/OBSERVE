@@ -68,7 +68,8 @@ def test_alpha_asks_for_a_new_reading_on_a_sensor_fault():
 
 
 def test_omega_passes_a_verdict_backed_by_evidence():
-    result = ObserveCnsGate("omega").check(make_verdict())
+    engine = ObserveClinicalEngine()
+    result = ObserveCnsGate("omega", engine=engine).check(engine.evaluate(make_vitals()))
     assert result.outcome is GateOutcome.PASS
     assert result.position is GatePosition.OMEGA
     assert result.gate == "observe.verdict_egress"
@@ -133,13 +134,107 @@ def test_missing_cns_raises_with_the_install_command(monkeypatch):
 
 # ------------------------------------------------- audit findings OBS-1 .. OBS-6
 
+#
+# These drive the real engine and its real audit ledger, so the OMEGA gate is judged on verdicts the engine
+# actually produced, not on hand-built ones.
+
 from cns_composition.gate_chain import run_chain  # noqa: E402
+from observe_consolidated import ObserveClinicalEngine, RiskOutput  # noqa: E402
+from pediatric_cassette import PediatricCassette  # noqa: E402
 
 READING_TIME = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+HEAVY = {"age_months": 24, "force_heavy": True}  # selects trajectory and drift, which abstain without history
 
 
 def reading(**overrides):
     return make_vitals(**{"timestamp": READING_TIME, **overrides})
+
+
+class AbstainingCassette(PediatricCassette):
+    """Every engine says it has no data. Selected, run, and not one of them assessed the patient."""
+
+    def engines(self):
+        def abstain(name):
+            def run(vitals):
+                return RiskOutput(name, 0.0, 0.0, {"stable": 1.0, "caution": 0.0, "warning": 0.0, "critical": 0.0},
+                                  [], READING_TIME, abstained=True)
+            return run
+        return {name: abstain(name) for name in super().engines()}
+
+
+def evaluated(engine=None, **overrides):
+    engine = engine or ObserveClinicalEngine()
+    return engine, engine.evaluate(reading(**overrides))
+
+
+def test_obs1_omega_refuses_a_verdict_every_engine_abstained_from():
+    engine, verdict = evaluated(ObserveClinicalEngine(cassette=AbstainingCassette()))
+    assert verdict.active_engines, "fixture: the engines were selected, so active_engines is not empty"
+    result = ObserveCnsGate("omega", engine=engine).check(verdict)
+    assert result.outcome is GateOutcome.RETRY
+    assert "no engine produced evidence" in result.reason
+
+
+def test_obs1_omega_passes_a_real_verdict_an_engine_backed():
+    engine, verdict = evaluated()
+    result = ObserveCnsGate("omega", engine=engine).check(verdict)
+    assert result.outcome is GateOutcome.PASS
+    assert result.bound()
+
+
+def test_obs1_omega_without_an_evidence_source_never_passes():
+    # Without the engine's ledger the gate cannot tell a selected engine from one that assessed the patient.
+    result = ObserveCnsGate("omega").check(make_verdict())
+    assert result.outcome is GateOutcome.TERMINAL_BREACH
+    assert "evidence cannot be confirmed" in result.reason
+
+
+def test_obs1_omega_refuses_a_verdict_naming_an_engine_that_does_not_exist():
+    engine, _ = evaluated()
+    fake = make_verdict(active_engines=["ghost_engine"], decision_fingerprint="", audit_hash="")
+    assert ObserveCnsGate("omega", engine=engine).check(fake).outcome is GateOutcome.TERMINAL_BREACH
+
+
+def test_obs2_a_mandatory_engine_that_abstained_is_not_a_pass():
+    engine, verdict = evaluated(context=HEAVY)
+    gate = ObserveCnsGate("omega", engine=engine, mandatory_engines={"heuristic", "trajectory"})
+    result = gate.check(verdict)
+    assert result.outcome is GateOutcome.RETRY
+    assert "trajectory" in result.reason and "abstained" in result.reason
+
+
+def test_obs2_a_mandatory_engine_that_never_ran_is_not_a_pass():
+    engine, verdict = evaluated()  # heart rate 100: the behavioral engine is not selected
+    assert "behavioral" not in verdict.active_engines
+    gate = ObserveCnsGate("omega", engine=engine, mandatory_engines={"heuristic", "behavioral"})
+    result = gate.check(verdict)
+    assert result.outcome is GateOutcome.RETRY
+    assert "behavioral" in result.reason and "not run" in result.reason
+
+
+def test_obs2_an_advisory_engine_that_abstained_does_not_block():
+    engine, verdict = evaluated(context=HEAVY)
+    gate = ObserveCnsGate("omega", engine=engine, mandatory_engines={"heuristic"},
+                          advisory_engines={"trajectory", "drift"})
+    assert gate.check(verdict).outcome is GateOutcome.PASS
+
+
+def test_obs2_only_engines_the_policy_names_count_as_evidence():
+    engine, verdict = evaluated()  # only heuristic is selected, and the policy does not name it
+    gate = ObserveCnsGate("omega", engine=engine, advisory_engines={"bayesian"})
+    assert gate.check(verdict).outcome is GateOutcome.RETRY
+
+
+def test_obs2_the_policy_is_checked_when_the_gate_is_built():
+    engine = ObserveClinicalEngine()
+    with pytest.raises(ValueError):
+        ObserveCnsGate("omega", engine=engine, mandatory_engines={"heuristic"}, advisory_engines={"heuristic"})
+    with pytest.raises(ValueError):
+        ObserveCnsGate("omega", engine=engine, mandatory_engines={"no_such_engine"})
+    with pytest.raises(ValueError):
+        ObserveCnsGate("alpha", mandatory_engines={"heuristic"})
+    with pytest.raises(TypeError):
+        ObserveCnsGate("omega", engine=engine, mandatory_engines="heuristic")
 
 
 def test_obs5_validation_faults_without_the_unassessable_flag_are_a_retry():

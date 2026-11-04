@@ -9,6 +9,26 @@ refuses any verdict that is only a partial assessment or that no engine
 backed with evidence. A verdict with nothing behind it is abstention, not
 normality.
 
+Evidence at OMEGA. A verdict's active_engines lists the engines that were
+SELECTED, including ones that ran and abstained, so it is not evidence. The
+verdict does not record which engines abstained, so OMEGA needs the engine
+that produced it (ObserveCnsGate("omega", engine=...)). The gate finds the
+verdict's entry in that engine's audit ledger by audit_hash, re-runs each
+recorded engine on the recorded reading through the engine's cassette, and
+counts only the engines that did not abstain. An engine the cassette cannot
+re-run (the stateful Kalman adapter) is never counted as evidence. Built
+without an engine, OMEGA cannot confirm any evidence and never passes a
+verdict; it refuses it as a fault.
+
+Engine policy at OMEGA comes from the application, through the constructor,
+never from the verdict being judged. mandatory_engines must each have run
+and produced evidence, or the verdict is RETRY. advisory_engines count as
+evidence but may be absent or abstain. When either set is given, only the
+engines they name count as evidence. With no policy, no engine is mandatory
+and any engine that produced evidence is enough: that is the safest reading
+available without one, and it still never passes a verdict on selection
+alone.
+
 OBSERVE never authorizes anything. These gates only decide whether an
 observation or verdict is sound enough to pass along. Refusals that a fresh
 reading can fix are RETRY. Anything else is TERMINAL_BREACH. An exception,
@@ -21,13 +41,14 @@ raises CnsNotInstalled with the install command and nothing else changes.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import math
 from dataclasses import asdict
 from datetime import datetime
 from enum import Enum
 from types import ModuleType
-from typing import Any, Dict, Union
+from typing import Any, Dict, FrozenSet, Iterable, Optional, Union
 
 from observe_consolidated import FusedVerdict, VitalsSnapshot, validate_vitals
 
@@ -96,13 +117,53 @@ def _plain(value: Any, non_finite: bool = False) -> Any:
     return value
 
 
+def _engine_set(names: Iterable[str]) -> FrozenSet[str]:
+    """An engine policy set. A bare string is refused: it would read as its letters."""
+    if isinstance(names, str):
+        raise TypeError("an engine policy is a collection of engine names, not one string")
+    return frozenset(names)
+
+
+def _cassette_of(engine: Any) -> Any:
+    """The cassette an ObserveClinicalEngine scores with."""
+    return engine._cassette
+
+
 class ObserveCnsGate:
     """OBSERVE as a CNS gate. ALPHA takes vitals, OMEGA takes a fused verdict."""
 
-    def __init__(self, position: str = _ALPHA) -> None:
+    def __init__(
+        self,
+        position: str = _ALPHA,
+        *,
+        engine: Any = None,
+        mandatory_engines: Iterable[str] = (),
+        advisory_engines: Iterable[str] = (),
+    ) -> None:
+        """Build the gate for one end.
+
+        engine is the ObserveClinicalEngine whose verdicts OMEGA judges; its
+        audit ledger and cassette are where OMEGA confirms evidence. The two
+        engine sets are the application's policy (see the module docstring).
+        All three belong to OMEGA only.
+        """
         cns = _cns_gate()
         if position not in (_ALPHA, _OMEGA):
             raise ValueError(f"position must be 'alpha' or 'omega', not {position!r}")
+        mandatory, advisory = _engine_set(mandatory_engines), _engine_set(advisory_engines)
+        if position == _ALPHA and (engine is not None or mandatory or advisory):
+            raise ValueError("engine, mandatory_engines and advisory_engines belong to the omega end")
+        if mandatory & advisory:
+            raise ValueError(f"engines cannot be both mandatory and advisory: {sorted(mandatory & advisory)}")
+        if engine is not None:
+            known = set(_cassette_of(engine).engines())
+            unknown = (mandatory | advisory) - known
+            if unknown:
+                raise ValueError(f"the engine's cassette cannot re-run {sorted(unknown)}, so the gate "
+                                 "could never confirm their evidence")
+        self._engine = engine
+        self._mandatory: FrozenSet[str] = mandatory
+        self._advisory: FrozenSet[str] = advisory
         self._cns = cns
         self._position = position
         self.position = cns.GatePosition.ALPHA if position == _ALPHA else cns.GatePosition.OMEGA
@@ -150,7 +211,58 @@ class ObserveCnsGate:
             return cns.GateOutcome.RETRY, "partial assessment: " + faults
         if not candidate.active_engines:
             return cns.GateOutcome.RETRY, "no engine produced evidence for this verdict"
+        if self._engine is None:
+            return cns.GateOutcome.TERMINAL_BREACH, (
+                "fault: evidence cannot be confirmed: this gate was built without the engine whose "
+                "audit ledger records the verdict, and active_engines lists engines that abstained"
+            )
+        entry = self._entry(candidate)
+        if entry is None:
+            return cns.GateOutcome.TERMINAL_BREACH, "fault: the verdict has no entry in the engine's audit ledger"
+        return self._judge_evidence(entry["data"])
+
+    def _judge_evidence(self, data: Dict[str, Any]) -> tuple:
+        """Re-run the recorded engines on the recorded reading; count those that did not abstain."""
+        cns = self._cns
+        selected = list(data["selected_engines"])
+        recorded = {o["engine"]: o for o in data["outputs"]}
+        reading = VitalsSnapshot(**copy.deepcopy(data["vitals"]))
+        engines = _cassette_of(self._engine).engines()
+        contributed, silent = [], []
+        for name in selected:
+            run = engines.get(name)
+            if run is None:  # not re-runnable, so its evidence cannot be confirmed
+                silent.append(name)
+                continue
+            out = run(reading)
+            rec = recorded.get(name)
+            if rec is None or (out.risk_score, out.confidence, list(out.triggered_rules)) != (
+                    rec["risk"], rec["confidence"], list(rec["rules"])):
+                return cns.GateOutcome.TERMINAL_BREACH, (
+                    f"fault: the recorded output of {name} is not what it gives on the recorded reading")
+            (silent if out.abstained else contributed).append(name)
+        not_run = sorted(self._mandatory - set(selected))
+        abstained = sorted(self._mandatory & set(silent))
+        if not_run or abstained:
+            parts = ([f"{', '.join(not_run)} not run"] if not_run else []) + (
+                [f"{', '.join(abstained)} abstained or unconfirmed"] if abstained else [])
+            return cns.GateOutcome.RETRY, "mandatory engine gave no evidence: " + "; ".join(parts)
+        policy = self._mandatory | self._advisory
+        counted = [n for n in contributed if n in policy] if policy else contributed
+        if not counted:
+            return cns.GateOutcome.RETRY, (
+                "no engine produced evidence for this verdict (selected: " + ", ".join(selected)
+                + "; abstained or unconfirmed: " + (", ".join(silent) or "none") + ")")
         return cns.GateOutcome.PASS, ""
+
+    def _entry(self, candidate: Any) -> Optional[Dict[str, Any]]:
+        """The engine's audit ledger entry for this verdict, or None."""
+        if not candidate.audit_hash:
+            return None
+        for entry in reversed(self._engine.audit_ledger.entries):
+            if entry.get("immutable_hash") == candidate.audit_hash:
+                return entry
+        return None
 
     def _subject(self, candidate: Any) -> str:
         if self._position == _ALPHA:

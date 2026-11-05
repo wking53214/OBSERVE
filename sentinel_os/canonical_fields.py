@@ -36,7 +36,15 @@ json.dumps(sort_keys=True, default=str); the twin's _ledger_dumps mirrors that
 exactly. canonical_json's compact separators are a DIFFERENT serialization for
 the envelope layer and are deliberately not touched.
 """
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+# Node-role vocabulary (2026-07-31, relocated here so the kernel doesn't
+# reach into an IVR-side file for one shared constant): a governance path
+# outside telephony -- sentinel_core.py's outcome/journey classification --
+# needs to recognize a "queue" stop without importing anything IVR-specific.
+# twilio_log_ingestion.py imports this back rather than redefining it, so
+# there is exactly one place this string is spelled.
+NODE_ROLE_QUEUE = "queue"
 
 # The optional governance-decision fields that enter the hash when present.
 # Order is fixed for reviewability; sort_keys makes it hash-irrelevant.
@@ -46,7 +54,11 @@ OPTIONAL_HASHED_FIELDS = (
     "cassette_hash",       # Phase 1: parameter-snapshot integrity
     "cassette_code_hash",  # Item 3: decision-code integrity
     "model_identity",      # Item 5: which model produced the decision
-    "authorized_by",       # Item 7: resolved authorizing identity (role/key name)
+    "authorized_by",       # Item 7: the identity NAMED as accountable (role/key
+                           #   name). A claim, not a verified fact -- write
+                           #   paths only check it is non-empty. See
+                           #   authorized_by_sig below and
+                           #   governance/authorized_by_attestation.py.
     "supersedes_hash",     # Item 6: link from a supersession row to the row it supersedes
     "outcome_obligation",  # OutcomeV1: the maturation rule in force at decision time
     # Distinct from supersedes_hash on purpose: supersedes_hash is Item 6's
@@ -81,7 +93,177 @@ OPTIONAL_HASHED_FIELDS = (
     # field mean two different things depending on record_kind with
     # nothing to warn a future reader which one they're looking at.
     "shadow_run_hash",
+    # F2 (2026-08-07): which governance_decision row a human_selection
+    # row is reviewing. Its own field for the same reason shadow_run_hash
+    # is its own field and not a reuse of replaces_hash/supersedes_hash --
+    # a human_selection isn't a decision, a correction, or a supersession,
+    # it's a separate reviewer's verdict ON a decision, and needs a link
+    # that means only that. See governance/human_selection_v1.py.
+    "decision_hash",
+    # Keyed attestation over the row's authorized_by claim: a hex
+    # HMAC-SHA256, present only on rows that (a) carry an authorized_by
+    # value AND (b) were written while ICEBERG_LEDGER_ATTESTATION_KEY was
+    # configured. It attests that the row was written by a component
+    # holding the service signing key and that the authorized_by string
+    # has not changed since -- NOT that the named party holds any
+    # authority (see governance/authorized_by_attestation.py). It rides
+    # here, inside the chain, so a signature stripped from a row breaks
+    # that row's current_hash recomputation. NULL/absent on every row
+    # written without a key and every row predating this field -- same
+    # migration guarantee every optional field above already has.
+    "authorized_by_sig",
+    # TACK Layer 5 (verdict receipts): the CNS canonical digest
+    # (cns.gate.subject_digest) of the content this decision judged, its
+    # input_data as stored. Computed by the writer, never taken from the
+    # record; the witness recomputes it from the stored input_data and a
+    # mismatch is a TRANSPLANTED verdict (moved onto content it was not
+    # issued for). Present on governance_decision rows written from this
+    # change on; absent -> omitted -> every earlier row keeps its bytes.
+    "subject_digest",
+    # Reserved for TACK Layer 1 (the MTD sequencer): the server-derived
+    # seed that fixed the order of non-dependent validation gates for
+    # this row (governance/authorized_by_attestation.derive_shuffle_seed).
+    # Absent on every row written by a chain that was not shuffled, which
+    # today is every row. Present-when-truthy, so no existing row changes
+    # bytes; when present the witness re-derives it and a mismatch is
+    # SEED_FORGED (the agent, not the server, chose the gate order).
+    "shuffle_seed",
 )
+
+
+# ---------------------------------------------------------------------------
+# Contract compliance attestation: the four contract record kinds and the
+# fields each one hashes, in the order the writer builds them.
+#
+# This lives HERE, next to OPTIONAL_HASHED_FIELDS, for exactly the reason
+# that list does. Three sites recompute these hashes -- the writer
+# (ledger_postgres._append_contract_row), the primary's own verifier
+# (ledger_postgres.verify_chain) and the witness
+# (twin_custody.recompute_current_hash) -- and the outcome_harm_event
+# build already proved what happens when one of them is missed: honest
+# rows fail their own verification and it looks exactly like tampering.
+# One list, imported by all three, so there is no second copy to forget.
+#
+# sort_keys=True makes the order hash-irrelevant; it is fixed so the
+# three call sites stay visually comparable.
+CONTRACT_CANONICAL_FIELDS: Dict[str, tuple] = {
+    # Data arrived under a contract. Starts the retention clock.
+    "contract_ingest": ("counterparty", "ingest_id", "data_scope",
+                        "received_at"),
+    # One egress authorization decision, granted OR refused. `decision`
+    # is hashed so a refusal cannot later read as an authorization.
+    "contract_egress": ("counterparty", "decision", "data_scope", "recipient",
+                        "recipient_class", "purpose", "approval_reference",
+                        "occurred_at"),
+    # An approval grant or its revocation. Revocation is a new row, never
+    # an edit of the grant.
+    "contract_approval": ("counterparty", "approval_id", "state", "recipient",
+                          "recipient_class", "scope", "granted_at",
+                          "expires_at", "revoked_at"),
+    # A positive deletion event bound to the ingest it retires. `stamp` is
+    # hashed and is always "attested" -- see record_contract_deletion.
+    "contract_deletion": ("counterparty", "ingest_id", "deleted_at", "scope",
+                          "method", "stamp"),
+}
+
+# Which contract kinds carry a finding body (stored in decision_output and
+# hashed under "finding"). The other three hash no finding at all, and
+# omitting the key entirely -- not passing None -- is what keeps the three
+# sites byte-identical.
+CONTRACT_KINDS_WITH_FINDING: tuple = ("contract_egress",)
+
+
+# ---------------------------------------------------------------------------
+# observed_event rows: the persisted form of an EventV1 (event_v1.py), one
+# row per event, written in the same transaction as the governance_decision
+# they belong to (ledger_postgres.append_decision's observed_events arg).
+#
+# Unlike a governance_decision, an observed_event has NO optional/legacy
+# fields -- every field is always present because every such row is new
+# (there is no pre-existing observed_event row to stay byte-compatible with).
+# So this is a FIXED canonical form, not the present-when-truthy contract
+# above. Same three recompute sites, same one-list rule:
+#   * ledger_postgres.append_decision   (writer)
+#   * ledger_postgres.verify_chain      (primary verifier)
+#   * twin_custody.recompute_current_hash (witness)
+#
+# The event body is stored verbatim in the input_data JSONB column; each
+# site pulls these keys from it in this fixed order (sort_keys makes order
+# hash-irrelevant; fixed for reviewability).
+OBSERVED_EVENT_CANONICAL_FIELDS: tuple = (
+    "episode_id", "event_id", "domain", "kind",
+    "occurred_at", "observed_at", "source", "provenance", "method",
+    "fields", "detail", "schema_version", "reducer_version",
+)
+
+
+def observed_event_canonical(event_body: Dict[str, Any],
+                             previous_hash: str) -> Dict[str, Any]:
+    """The canonical dict hashed for one observed_event ledger row.
+
+    `event_body` is the event as stored in the row's input_data column (the
+    writer serializes an EventV1 into it; the verifiers read it straight
+    back). `method` is carried as-is -- null for verified/attested events --
+    so the form is identical no matter which site builds it.
+    """
+    canonical: Dict[str, Any] = {"record_kind": "observed_event"}
+    for key in OBSERVED_EVENT_CANONICAL_FIELDS:
+        canonical[key] = event_body.get(key)
+    canonical["previous_hash"] = previous_hash
+    return canonical
+
+
+# ---------------------------------------------------------------------------
+# attestation_policy rows: the chain-native marker that authorized_by
+# attestation is enforced from this row forward (TACK Layer 5, step 2.5).
+#
+# Written by the ledger at boot when enforcement is on and a signing key is
+# configured, once per key fingerprint (a rotation adds a new marker). From
+# the marker on, a row that names an accountable party and carries no
+# signature is UNATTESTED. Rows before the marker are untouched: that is the
+# backward-compatibility guarantee, and it is why the marker is in the chain
+# rather than in configuration a verifier would have to be told about.
+#
+# Same pattern as observed_event: a FIXED canonical form (every marker row is
+# new; there is nothing older to stay byte-compatible with), one function
+# that builds it, imported by the writer, verify_chain and the witness. The
+# body rides in the data JSONB; `reason` is the row's own column, hashed so
+# the marker's human-readable statement is part of the receipt.
+ATTESTATION_POLICY_RECORD_KIND = "attestation_policy"
+ATTESTATION_POLICY_CANONICAL_FIELDS: tuple = ("key_fingerprint", "enforced_at")
+
+
+def attestation_policy_canonical(body: Dict[str, Any], reason: Optional[str],
+                                 previous_hash: str) -> Dict[str, Any]:
+    """The canonical dict hashed for one attestation_policy ledger row."""
+    canonical: Dict[str, Any] = {"record_kind": ATTESTATION_POLICY_RECORD_KIND}
+    for key in ATTESTATION_POLICY_CANONICAL_FIELDS:
+        canonical[key] = body.get(key)
+    canonical["reason"] = reason
+    canonical["previous_hash"] = previous_hash
+    return canonical
+
+
+def event_v1_to_body(event: Any) -> Dict[str, Any]:
+    """Serialize an EventV1 (or anything with the same attributes) into the
+    plain dict stored in an observed_event row's input_data column and hashed
+    via observed_event_canonical. Kept here so the writer and any
+    re-materializer agree on the shape."""
+    return {
+        "episode_id": str(event.episode_id),
+        "event_id": str(event.event_id),
+        "domain": str(event.domain),
+        "kind": str(event.kind),
+        "occurred_at": float(event.occurred_at),
+        "observed_at": float(event.observed_at),
+        "source": str(event.source),
+        "provenance": str(event.provenance),
+        "method": None if event.method is None else str(event.method),
+        "fields": dict(event.fields),
+        "detail": dict(event.detail),
+        "schema_version": int(event.schema_version),
+        "reducer_version": str(event.reducer_version),
+    }
 
 
 def apply_optional_hashed_fields(canonical: Dict[str, Any],

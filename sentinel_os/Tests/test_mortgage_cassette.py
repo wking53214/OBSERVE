@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from cassette_capabilities import (
+    CAPABILITY_INTERPRETATION_TESTABLE,
     CAPABILITY_OUTCOME_OBLIGATION,
     require_capabilities,
 )
@@ -26,6 +27,7 @@ from cassettes.mortgage_cassette import (
     RESOLUTION_INVOLUNTARY_CLOSURE,
     RESOLUTION_PAID_IN_FULL,
     RESOLUTION_TYPES,
+    ZONE_ADVERSE_ACTION_REASON_SPECIFICITY,
     MortgageCassette,
 )
 from episode import EpisodeIntegrityError, explain_episode, judge_episode, make_episode
@@ -36,22 +38,26 @@ from outcome_v1 import MaturationRule
 # Manifest / schema validity
 # ---------------------------------------------------------------------------
 
-def test_manifest_is_outcome_obligation_only():
-    """Kernel-only plus outcome_obligation -- no call-center surface
-    at all, matching this domain's honest capability set."""
-    assert MortgageCassette.CAPABILITIES == (CAPABILITY_OUTCOME_OBLIGATION,)
+def test_manifest_is_outcome_obligation_and_interpretation_testable():
+    """Kernel-only plus outcome_obligation plus interpretation_testable
+    (the second obligated by the first -- see cassette_capabilities'
+    module docstring) -- no call-center surface at all, matching this
+    domain's honest capability set."""
+    assert MortgageCassette.CAPABILITIES == (
+        CAPABILITY_OUTCOME_OBLIGATION, CAPABILITY_INTERPRETATION_TESTABLE)
 
 
 def test_config_identity():
     config = MortgageCassette().get_config()
     assert config.name == "mortgage-v1"
     assert config.domain == "mortgage"
-    assert cassette_version_of(MortgageCassette()) == "mortgage:mortgage-v1:1.0.0"
+    assert cassette_version_of(MortgageCassette()) == "mortgage:mortgage-v1:1.0.1"
 
 
 def test_validates_cleanly_against_full_schema():
     params = validate_cassette(MortgageCassette())
-    assert params.capabilities == (CAPABILITY_OUTCOME_OBLIGATION,)
+    assert params.capabilities == (
+        CAPABILITY_OUTCOME_OBLIGATION, CAPABILITY_INTERPRETATION_TESTABLE)
     # Exactly kernel + outcome_obligation's own parameter -- nothing
     # owned by a capability this cassette doesn't enable (the
     # anti-placeholder rule; a stray owned-but-unenabled param would
@@ -170,6 +176,65 @@ def test_resolution_types_are_exactly_the_two_locked_paths():
 
 
 # ---------------------------------------------------------------------------
+# resolve_scenario -- the interpretation_testable capability this
+# cassette is obligated to implement (see module docstring's SCENARIO
+# RESOLUTION section).
+# ---------------------------------------------------------------------------
+
+def _reason_scenario(candidate_reason, options=("specific", "generic"), zone=None):
+    from interpretation.scenarios import Scenario
+    return Scenario(
+        regulation_id="cfpb-ecoa-reg-b",
+        zone=zone if zone is not None else ZONE_ADVERSE_ACTION_REASON_SPECIFICITY,
+        question="Is this adverse-action reason specific enough under Reg B?",
+        situation={"candidate_reason": candidate_reason},
+        options=list(options),
+    )
+
+
+def test_resolve_scenario_calls_a_substantive_reason_specific():
+    reason = "credit score 574 is below the 620 minimum required for this loan amount"
+    assert MortgageCassette().resolve_scenario(_reason_scenario(reason)) == "specific"
+
+
+def test_resolve_scenario_calls_a_thin_reason_generic():
+    assert MortgageCassette().resolve_scenario(_reason_scenario("denied")) == "generic"
+
+
+def test_resolve_scenario_uses_the_same_threshold_as_judge():
+    """The word-count boundary must not drift between judge()'s own
+    reason-substance check and resolve_scenario's -- both read
+    _THIN_REASON_WORD_COUNT, never a separately maintained number."""
+    cassette = MortgageCassette()
+    boundary_words = " ".join(["word"] * cassette._THIN_REASON_WORD_COUNT)
+    assert cassette.resolve_scenario(_reason_scenario(boundary_words)) == "specific"
+    one_short = " ".join(["word"] * (cassette._THIN_REASON_WORD_COUNT - 1))
+    assert cassette.resolve_scenario(_reason_scenario(one_short)) == "generic"
+
+
+def test_resolve_scenario_declines_a_different_zone():
+    scenario = _reason_scenario("denied", zone="some_unrelated_zone")
+    assert MortgageCassette().resolve_scenario(scenario) is None
+
+
+def test_resolve_scenario_declines_a_different_options_shape():
+    scenario = _reason_scenario("denied", options=("A", "B"))
+    assert MortgageCassette().resolve_scenario(scenario) is None
+
+
+def test_resolve_scenario_declines_a_missing_candidate_reason():
+    from interpretation.scenarios import Scenario
+    scenario = Scenario(
+        regulation_id="cfpb-ecoa-reg-b",
+        zone=ZONE_ADVERSE_ACTION_REASON_SPECIFICITY,
+        question="Is this adverse-action reason specific enough under Reg B?",
+        situation={},  # no candidate_reason key at all
+        options=["specific", "generic"],
+    )
+    assert MortgageCassette().resolve_scenario(scenario) is None
+
+
+# ---------------------------------------------------------------------------
 # Property address field -- the resolved input_fields schema question
 # ---------------------------------------------------------------------------
 
@@ -272,3 +337,89 @@ def test_explain_includes_kernel_prepended_mismatch_findings():
     kernel_findings = [f for f in factors if f.get("factor") == "outcome_mismatch"]
     assert len(kernel_findings) == 1
     assert kernel_findings[0]["field"] == "amount"
+
+
+# ---------------------------------------------------------------------------
+# judge()/explain() reason-gap fix (2026-08-01) -- two ways an episode
+# could previously score excellent with nothing actually checked.
+# ---------------------------------------------------------------------------
+
+def test_no_requested_fields_cannot_score_excellent():
+    """An episode recording no requested fields has nothing for
+    outcome_mismatches to compare `actual` against -- that used to
+    silently take the SAME "no mismatch" path as a genuinely verified
+    clean match and score 1.0. Now it's a distinct, penalized,
+    unverifiable state that cannot reach the top tier."""
+    cassette = MortgageCassette()
+    episode = make_episode(
+        "M-7", "mortgage",
+        requested={},
+        actual={"outcome": "approved", "amount": 300000.0},
+    )
+    result = judge_episode(cassette, episode)
+    assert result.score == pytest.approx(0.75)
+    assert result.tier == "good"
+    factors = explain_episode(cassette, episode)
+    unverifiable = [f for f in factors
+                    if f.get("factor") == "requested_vs_actual_unverifiable"]
+    assert len(unverifiable) == 1
+    assert unverifiable[0]["contribution"] == pytest.approx(-0.25)
+
+
+def test_genuinely_clean_match_is_distinct_from_unverifiable():
+    """The unverifiable penalty must not leak onto a real verified
+    match -- requested recorded AND matching actual still scores 1.0
+    and gets the ordinary requested_vs_actual factor, not the
+    unverifiable one."""
+    cassette = MortgageCassette()
+    episode = make_episode(
+        "M-8", "mortgage",
+        requested={"outcome": "approved", "amount": 300000.0},
+        actual={"outcome": "approved", "amount": 300000.0},
+    )
+    result = judge_episode(cassette, episode)
+    assert result.score == 1.0
+    assert result.tier == "excellent"
+    factors = explain_episode(cassette, episode)
+    assert [f["factor"] for f in factors] == ["requested_vs_actual"]
+
+
+def test_reason_substance_is_examined_even_with_no_mismatch():
+    """A thin/placeholder reason attached to a decision that never
+    triggers a mismatch (e.g. the recorded outcome matched what was
+    requested) used to never be examined at all, since the substance
+    check only ran inside the mismatch branch. Now it's checked
+    regardless of mismatch status."""
+    cassette = MortgageCassette()
+    episode = make_episode(
+        "M-9", "mortgage",
+        requested={"outcome": "denied"},
+        actual={"outcome": "denied"},
+        outcome_reasons=["no"],
+    )
+    result = judge_episode(cassette, episode)
+    assert result.score < 1.0
+    factors = explain_episode(cassette, episode)
+    substance = [f for f in factors if f.get("factor") == "reason_substance"]
+    assert len(substance) == 1
+    assert substance[0]["contribution"] < 0
+
+
+def test_reason_substance_examined_with_no_mismatch_stays_clean_if_substantive():
+    """The reverse of the above: a genuinely substantive reason
+    attached with no mismatch is examined and passes -- proves the
+    fix checks substance, it doesn't just penalize presence."""
+    cassette = MortgageCassette()
+    episode = make_episode(
+        "M-10", "mortgage",
+        requested={"outcome": "denied"},
+        actual={"outcome": "denied"},
+        outcome_reasons=["denial confirmed and documented per underwriting policy 4.2"],
+    )
+    result = judge_episode(cassette, episode)
+    assert result.score == 1.0
+    assert result.tier == "excellent"
+    factors = explain_episode(cassette, episode)
+    substance = [f for f in factors if f.get("factor") == "reason_substance"]
+    assert len(substance) == 1
+    assert substance[0]["contribution"] == 0.0

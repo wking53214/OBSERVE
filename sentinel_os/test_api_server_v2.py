@@ -327,11 +327,18 @@ def test_T10_ingress_never_imports_the_harness(tc):
 
     import api_server_v2  # already imported by the fixture  # noqa: F401
 
-    # 1) Live module table: importing the ingress must not have loaded any of
-    #    the synchronous machinery into the process.
+    # 1) Live module table of a FRESH process that imports only the ingress: it
+    #    must not have loaded any of the synchronous machinery. A fresh process,
+    #    because this one has run other test files that legitimately import
+    #    governance, so its own sys.modules says nothing about the ingress.
     forbidden_mods = ("production_harness", "resilient_harness", "sentinel_core")
-    loaded = [m for m in sys.modules
-              if m.split(".")[-1] in forbidden_mods or m.startswith("governance")]
+    probe = ("import json, sys; sys.path.insert(0, %r); import api_server_v2; "
+             "print(json.dumps([m for m in sys.modules if m.split('.')[-1] in %r "
+             "or m.startswith('governance')]))" % (BUILD_DIR, forbidden_mods))
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, cwd=BUILD_DIR, timeout=60,
+                          env=dict(os.environ, TRANSMISSION_REDIS_URL=REDIS_URL, TRANSMISSION_NAMESPACE=NAMESPACE))
+    assert done.returncode == 0, f"could not import the ingress in a fresh process: {done.stderr[-500:]}"
+    loaded = json.loads(done.stdout.strip().splitlines()[-1])
     assert not loaded, f"ingress import pulled in forbidden modules: {loaded}"
 
     # 2) Structural (AST, so the docstring DESCRIBING the old breaker doesn't

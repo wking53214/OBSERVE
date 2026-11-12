@@ -117,6 +117,31 @@ address field at all). This is the field the new ZIP/county regional-
 equity cohort dimension geocodes via bisg_estimator.CensusGeocoder,
 reusing the existing address-to-tract pipeline rather than a new data
 source.
+
+SCENARIO RESOLUTION (interpretation_testable, added post-1.0.1)
+------------------------------------------------------------------
+This cassette enables CAPABILITY_OUTCOME_OBLIGATION, which obligates it
+to also enable CAPABILITY_INTERPRETATION_TESTABLE and implement
+resolve_scenario (cassette_capabilities' module docstring; enforced at
+load time by cassette_schema.validate_governance_parameters) -- it is
+the one cassette this rule currently binds.
+
+resolve_scenario answers exactly one recognized zone,
+ZONE_ADVERSE_ACTION_REASON_SPECIFICITY, which names the same regulatory
+question regulatory_cassettes.cfpb_reg_b's reason-specificity check
+screens (adverse-action reasons must be case-specific, not boilerplate,
+under Reg B 12 CFR 1002.9) -- viewed from the other side: that lens
+SCREENS a reason already on file, this cassette CHOOSES between
+candidate reasons at decision time. A recognized scenario carries
+situation["candidate_reason"] (the reason text to evaluate) and
+options == ["specific", "generic"] exactly; the verdict reuses the
+SAME _THIN_REASON_WORD_COUNT rule judge() already applies to a
+decision's own recorded reason, so the drift-check probes the same
+reading this cassette's ordinary judgment enforces, not a second,
+divergent one. Any scenario outside that shape (a different zone, a
+missing candidate_reason, or a different options set) is declined
+(returns None) rather than guessed at -- the same "genuinely
+ambiguous, not a failure" posture classify_outcome already takes.
 """
 
 from __future__ import annotations
@@ -126,7 +151,9 @@ from typing import Any, Dict, List, Optional
 
 from cassette_interface import Cassette, CassetteConfig, QualityResult
 from cassette_capabilities import (
+    CAPABILITY_INTERPRETATION_TESTABLE,
     CAPABILITY_OUTCOME_OBLIGATION,
+    InterpretationTestable,
     OutcomeObligations,
 )
 from episode import Episode, outcome_mismatches
@@ -152,17 +179,33 @@ _OUTCOME_HORIZON_DAYS = 1095  # 3 years
 # 2026-07-29 -- see module docstring; no prior convention existed).
 PROPERTY_ADDRESS_FIELD = "loan_property_address"
 
+# The one interpretation-scenario zone this cassette knows how to
+# answer (see module docstring's SCENARIO RESOLUTION section). Named
+# after regulatory_cassettes.cfpb_reg_b.CHECK_REASON_SPECIFICITY on
+# purpose -- same regulatory question, screen side vs. decision side.
+ZONE_ADVERSE_ACTION_REASON_SPECIFICITY = "adverse_action_reason_specificity"
 
-class MortgageCassette(Cassette, OutcomeObligations):
+# situation key a recognized scenario carries: the candidate reason
+# text under review.
+SCENARIO_CANDIDATE_REASON_KEY = "candidate_reason"
+
+# The exact two-option shape resolve_scenario answers.
+SCENARIO_REASON_OPTIONS = frozenset({"specific", "generic"})
+
+
+class MortgageCassette(Cassette, OutcomeObligations, InterpretationTestable):
     """Residential mortgage lending cassette.
 
-    Kernel-only plus outcome_obligation: no telephony/routing/RL/
-    self-healing surface, because this domain has none. Judgment
-    happens through judge/explain over episodes (see _score_components
-    for what "judgment" means here).
+    Kernel plus outcome_obligation plus interpretation_testable (the
+    second is obligated by the first -- see module docstring): no
+    telephony/routing/RL/self-healing surface, because this domain has
+    none. Judgment happens through judge/explain over episodes (see
+    _score_components for what "judgment" means here); scenario
+    resolution happens through resolve_scenario (see module docstring's
+    SCENARIO RESOLUTION section).
     """
 
-    CAPABILITIES = (CAPABILITY_OUTCOME_OBLIGATION,)
+    CAPABILITIES = (CAPABILITY_OUTCOME_OBLIGATION, CAPABILITY_INTERPRETATION_TESTABLE)
 
     # THE declaration site for mortgage governance numbers (see
     # cassette_schema). governance_trigger is the kernel-required
@@ -224,7 +267,7 @@ class MortgageCassette(Cassette, OutcomeObligations):
     def get_config(self) -> CassetteConfig:
         return CassetteConfig(
             name="mortgage-v1",
-            version="1.0.0",
+            version="1.0.1",
             description="Residential mortgage lending",
             domain="mortgage",
         )
@@ -264,6 +307,29 @@ class MortgageCassette(Cassette, OutcomeObligations):
             return False
         return None
 
+    # ---- interpretation_testable capability ----
+
+    def resolve_scenario(self, scenario: Any) -> Optional[str]:
+        """Answer one interpretation scenario -- see module docstring's
+        SCENARIO RESOLUTION section for the recognized shape.
+
+        Reuses _THIN_REASON_WORD_COUNT, the SAME threshold judge()
+        applies to a decision's own recorded reason, so the drift-check
+        probes the reading this cassette already enforces day to day
+        rather than a second, independently-maintained one. Anything
+        outside the recognized zone/shape is declined (None) rather
+        than guessed at.
+        """
+        if scenario.zone != ZONE_ADVERSE_ACTION_REASON_SPECIFICITY:
+            return None
+        if set(scenario.options) != SCENARIO_REASON_OPTIONS:
+            return None
+        reason = scenario.situation.get(SCENARIO_CANDIDATE_REASON_KEY)
+        if not isinstance(reason, str) or not reason.strip():
+            return None
+        word_count = len(reason.split())
+        return "generic" if word_count < self._THIN_REASON_WORD_COUNT else "specific"
+
     # ---- Kernel judgment surface ----
     #
     # "Judgment" for a mortgage decision episode means decision-PROCESS
@@ -285,22 +351,46 @@ class MortgageCassette(Cassette, OutcomeObligations):
     # thin to be a documented basis for an adverse action.
     _THIN_REASON_WORD_COUNT = 3
 
+    # An episode recording no requested fields at all has nothing for
+    # outcome_mismatches to compare `actual` against -- outcome_mismatches
+    # iterates episode.requested, so an empty requested dict silently
+    # produces the SAME "no mismatch" result as a genuinely verified
+    # clean match. Fixed 2026-08-01: this can no longer reach the top
+    # score -- see the requested_vs_actual_unverifiable factor below.
+    _UNVERIFIABLE_PENALTY = 0.25
+
     def _episode_facts(self, episode: Episode):
         mismatches = outcome_mismatches(episode)
         reasons = list(episode.outcome_reasons)
-        return mismatches, reasons
+        requested_recorded = bool(episode.requested)
+        return mismatches, reasons, requested_recorded
 
-    def _score_components(self, mismatches, reasons):
+    def _score_components(self, mismatches, reasons, requested_recorded):
         factors: List[Dict[str, Any]] = []
         score = 1.0
 
         if not mismatches:
-            factors.append({
-                "factor": "requested_vs_actual",
-                "value": 0,
-                "contribution": 0.0,
-                "detail": "outcome matched what was requested; no mismatch",
-            })
+            if requested_recorded:
+                factors.append({
+                    "factor": "requested_vs_actual",
+                    "value": 0,
+                    "contribution": 0.0,
+                    "detail": "outcome matched what was requested; no mismatch",
+                })
+            else:
+                score -= self._UNVERIFIABLE_PENALTY
+                factors.append({
+                    "factor": "requested_vs_actual_unverifiable",
+                    "value": 0,
+                    "contribution": -self._UNVERIFIABLE_PENALTY,
+                    "detail": (
+                        "no requested fields were recorded on this episode "
+                        "-- there is nothing to compare actual against, so "
+                        "decision-process integrity on this axis could not "
+                        "be checked (this is NOT the same as a verified "
+                        "clean match, and cannot score in the top tier)"
+                    ),
+                })
         else:
             penalty = min(len(mismatches) * 0.2, 0.6)
             score -= penalty
@@ -315,46 +405,55 @@ class MortgageCassette(Cassette, OutcomeObligations):
                 ),
             })
 
-            if not reasons:
-                # Defensive only: episode.validate_episode already
-                # refuses a mismatch with no reason on file, so
-                # judge_episode never reaches this cassette in that
-                # state. Scored anyway rather than assumed unreachable.
-                score -= 0.6
+        # Reason substance is checked on EVERY episode that has a reason
+        # on file, not only inside the mismatch branch -- a placeholder
+        # reason attached with no mismatch (e.g. an adverse action whose
+        # recorded outcome matched what was requested, so no mismatch
+        # ever fires) previously skipped this check entirely and could
+        # score 1.0/excellent with a one-word reason never examined.
+        if reasons:
+            thin = [r for r in reasons
+                   if len(r.split()) < self._THIN_REASON_WORD_COUNT]
+            if thin:
+                penalty2 = min(len(thin) * 0.2, 0.4)
+                score -= penalty2
                 factors.append({
                     "factor": "reason_substance",
-                    "value": 0,
-                    "contribution": -0.6,
-                    "detail": "mismatch present with no outcome reason on file",
+                    "value": len(thin),
+                    "contribution": -penalty2,
+                    "detail": (
+                        f"{len(thin)} outcome reason(s) under "
+                        f"{self._THIN_REASON_WORD_COUNT} words -- "
+                        f"present (kernel requires it on a mismatch) but "
+                        f"too thin to be a documented basis for the "
+                        f"adverse action"
+                    ),
                 })
             else:
-                thin = [r for r in reasons
-                       if len(r.split()) < self._THIN_REASON_WORD_COUNT]
-                if thin:
-                    penalty2 = min(len(thin) * 0.2, 0.4)
-                    score -= penalty2
-                    factors.append({
-                        "factor": "reason_substance",
-                        "value": len(thin),
-                        "contribution": -penalty2,
-                        "detail": (
-                            f"{len(thin)} outcome reason(s) under "
-                            f"{self._THIN_REASON_WORD_COUNT} words -- "
-                            f"present (kernel requires it) but too thin "
-                            f"to be a documented basis for the adverse "
-                            f"action"
-                        ),
-                    })
-                else:
-                    factors.append({
-                        "factor": "reason_substance",
-                        "value": len(reasons),
-                        "contribution": 0.0,
-                        "detail": (
-                            f"all outcome reasons are substantive "
-                            f"(>= {self._THIN_REASON_WORD_COUNT} words)"
-                        ),
-                    })
+                factors.append({
+                    "factor": "reason_substance",
+                    "value": len(reasons),
+                    "contribution": 0.0,
+                    "detail": (
+                        f"all outcome reasons are substantive "
+                        f"(>= {self._THIN_REASON_WORD_COUNT} words)"
+                    ),
+                })
+        elif mismatches:
+            # Defensive only: episode.validate_episode already refuses a
+            # mismatch with no reason on file, so judge_episode never
+            # reaches this cassette in that state. Scored anyway rather
+            # than assumed unreachable.
+            score -= 0.6
+            factors.append({
+                "factor": "reason_substance",
+                "value": 0,
+                "contribution": -0.6,
+                "detail": "mismatch present with no outcome reason on file",
+            })
+        # else: no mismatch and no reasons on file -- normal, nothing to
+        # explain (requested_recorded's own factor above already covers
+        # the unverifiable case when requested was empty).
 
         score = max(0.0, min(1.0, score))
 
@@ -372,8 +471,8 @@ class MortgageCassette(Cassette, OutcomeObligations):
     def judge(self, episode: Episode) -> QualityResult:
         """Judge one validated episode on decision-process integrity
         (see class-level note above for what that means here)."""
-        mismatches, reasons = self._episode_facts(episode)
-        result, _ = self._score_components(mismatches, reasons)
+        mismatches, reasons, requested_recorded = self._episode_facts(episode)
+        result, _ = self._score_components(mismatches, reasons, requested_recorded)
         return result
 
     def explain(self, episode: Episode) -> List[Dict[str, Any]]:
@@ -381,8 +480,8 @@ class MortgageCassette(Cassette, OutcomeObligations):
         verification findings (raw mismatches/discrepancies) are
         prepended by episode.explain_episode; these factors are this
         cassette's own scoring interpretation of them."""
-        mismatches, reasons = self._episode_facts(episode)
-        _, factors = self._score_components(mismatches, reasons)
+        mismatches, reasons, requested_recorded = self._episode_facts(episode)
+        _, factors = self._score_components(mismatches, reasons, requested_recorded)
         return factors
 
     def validate(self) -> bool:

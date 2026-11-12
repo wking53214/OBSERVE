@@ -7,11 +7,62 @@ Replaces LocalDiskAdapter with real database: transactions, durability, ACID
 import json
 import hashlib
 import os
-from canonical_fields import apply_optional_hashed_fields
+from canonical_fields import (CONTRACT_CANONICAL_FIELDS,
+                              CONTRACT_KINDS_WITH_FINDING,
+                              apply_optional_hashed_fields,
+                              event_v1_to_body,
+                              observed_event_canonical,
+                              ATTESTATION_POLICY_RECORD_KIND,
+                              attestation_policy_canonical)
+from cns.gate import GateOutcome, GatePosition, subject_digest as cns_subject_digest
+import os as _os_for_anchor  # noqa: E402  (aliased below; see _head_anchor_path)
+from twin_custody import (CustodyError, HEAD_ANCHOR_ENV, check_head_anchor,
+                          read_head_anchor, write_head_anchor)
+from .human_selection_v1 import HUMAN_SELECTIONS
+from .authorized_by_attestation import (
+    SIGNATURE_FIELD as _AUTHORIZED_BY_SIG_FIELD,
+    STATUS_INVALID as _ATT_STATUS_INVALID,
+    STATUS_RETIRED_KEY as _ATT_STATUS_RETIRED_KEY,
+    STATUS_UNKNOWN_KEY as _ATT_STATUS_UNKNOWN_KEY,
+    attestation_key,
+    attestation_keyset,
+    enforcement_required,
+    sign_authorized_by,
+    verify_authorized_by_signature,
+    content_prehash as _content_prehash,
+    key_fingerprint as _key_fingerprint,
+    verify_shuffle_seed as _verify_shuffle_seed,
+    STATUS_OK as _SEED_STATUS_OK,
+    STATUS_RETIRED_KEY as _SEED_STATUS_RETIRED_KEY,
+)
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from psycopg2.pool import SimpleConnectionPool
+
+#: The one way a governance decision may reach the ledger without the episode
+#: it was judged from. Development machines and the test suite only: the
+#: conservation boundary needs the episode, so without it the ledger cannot
+#: verify anything. Same shape as ICEBERG_LEDGER_ATTESTATION_DEV_OVERRIDE.
+ENV_CONSERVATION_DEV_OVERRIDE = "ICEBERG_LEDGER_CONSERVATION_DEV_OVERRIDE"
+_CONSERVATION_TRUTHY = {"1", "true", "yes", "on"}
+_conservation_override_warned = False
+
+
+def conservation_boundary_waived() -> bool:
+    """True only when the dev override is set. Warns once per process on stderr."""
+    global _conservation_override_warned
+    if os.environ.get(ENV_CONSERVATION_DEV_OVERRIDE, "").strip().lower() not in _CONSERVATION_TRUTHY:
+        return False
+    if not _conservation_override_warned:
+        _conservation_override_warned = True
+        import sys
+        print(
+            f"WARNING: {ENV_CONSERVATION_DEV_OVERRIDE} is set. A governance decision "
+            f"that arrives without its episode is written with NO conservation "
+            f"verification. Development machines only; never a production profile.",
+            file=sys.stderr, flush=True)
+    return True
 
 # Forensic cassette handling (ledger item: cassette snapshots for audit)
 try:
@@ -64,8 +115,19 @@ class GovernanceDecisionRecord:
     # Item 5: the model string the governor's API call actually resolved to
     #   (response.model), so "which model governed decision N" is in the chain.
     model_identity: Optional[str] = None
-    # Item 7: resolved authorizing identity -- an API-key NAME or service
-    #   identity (e.g. "harness:production"), never a raw key and never PII.
+    # Item 7: the identity the writer NAMES as accountable for this decision
+    #   -- an API-key NAME or service identity (e.g. "harness:production"),
+    #   never a raw key and never PII.
+    #   HONEST SCOPE: this is a claim, not a verified fact. Nothing here
+    #   confirms the named party exists, holds the authority implied, or was
+    #   involved at all -- the only check any write path applies is that the
+    #   string is non-empty. When ICEBERG_LEDGER_ATTESTATION_KEY is
+    #   configured, a companion authorized_by_sig column carries a keyed
+    #   HMAC attesting that this string was written by a component holding
+    #   the service signing key and has not changed since (see
+    #   governance/authorized_by_attestation.py). That still does not
+    #   establish that the named party authorized anything -- one shared key,
+    #   any holder indistinguishable from any other, a leaked key forges it.
     authorized_by: Optional[str] = None
     # Item 6: for a supersession row, the current_hash of the row it
     #   supersedes -- proving the reviewer saw the actual decision. NULL on
@@ -100,6 +162,21 @@ class GovernanceDecisionRecord:
     #   recomputed here. None for a decision that never called the API.
     ai_cost: Optional[Dict[str, Any]] = None
 
+
+def gate_outcome_of(output: Dict[str, Any]) -> str:
+    """The CNS GateOutcome a decision output amounts to, as its value.
+
+    A decision output declares approval under "approved" (GovernanceHarness)
+    or "safe" (the governor's own answer); `is True`, never truthiness, the
+    same guard the harness applies. An output that declares neither passes
+    nothing: fail-closed, the posture of every gate in the library.
+    """
+    for key in ("approved", "safe"):
+        if key in output:
+            outcome = GateOutcome.PASS if output[key] is True else GateOutcome.TERMINAL_BREACH
+            return outcome.value
+    return GateOutcome.TERMINAL_BREACH.value
+
 class PostgreSQLLedger:
     """Production ledger backed by PostgreSQL"""
 
@@ -112,8 +189,11 @@ class PostgreSQLLedger:
         "prevent_ledger_truncate",
     )
 
-    def __init__(self, host: str = "localhost", port: int = 5432, 
-                 dbname: str = "iceberg", user: str = "iceberg", 
+    # "iceberg" is the documented local-dev default (DEPLOYMENT.md). Real
+    # deployments write through runtime_user/runtime_password, which is
+    # fail-closed with no privileged fallback.
+    def __init__(self, host: str = "localhost", port: int = 5432,  # nosec B107
+                 dbname: str = "iceberg", user: str = "iceberg",
                  password: str = "iceberg", min_connections: int = 1, max_connections: int = 10,
                  runtime_user: str = None, runtime_password: str = None):
         """Initialize connection pool.
@@ -143,6 +223,27 @@ class PostgreSQLLedger:
                 "INSERT only, no UPDATE/DELETE/DDL) so the app connection itself "
                 "cannot UPDATE/DELETE/DROP TRIGGER even if compromised or misused."
             )
+
+        # Attestation enforcement is opt-in and OFF by default (D3). But if
+        # it has been turned ON, a signing key MUST be configured -- there is
+        # no default or fallback key (D4). A signing system with a publicly
+        # known key provides no security while appearing to, so refuse to
+        # start rather than proceed with enforcement that cannot be honoured.
+        if enforcement_required() and attestation_key() is None:
+            raise RuntimeError(
+                "authorized_by attestation is enforced by default "
+                "(ICEBERG_LEDGER_ATTESTATION_DEV_OVERRIDE is the only opt-out) but "
+                "ICEBERG_LEDGER_ATTESTATION_KEY is not. The ledger refuses to "
+                "start: authorized_by attestation enforcement requires a real "
+                "service signing key supplied by the environment. There is no "
+                "default key and no fallback -- see "
+                "governance/authorized_by_attestation.py."
+            )
+        # Build the verification key set once at startup so a broken
+        # ATTESTATION_KEYS_PREVIOUS / _RETIRED file (set but unreadable) fails
+        # here, not silently on the first verify_chain. No-op when nothing is
+        # configured (the default): the set is simply empty.
+        attestation_keyset()
 
         # One-off privileged connection: create/migrate schema, then discard.
         # Never reused for ongoing reads/writes.
@@ -177,12 +278,28 @@ class PostgreSQLLedger:
         never any other role. Uses sql.Identifier for the role name (it
         can't be parameterized as a literal in DDL) and a parameterized
         literal for the password itself, mirroring set_ledger_reader_password.py.
+
+        Advisory-locked (same pattern as bind_cassette_version's own
+        pg_advisory_xact_lock, keyed here per runtime_user rather than
+        globally): ALTER ROLE modifies the shared pg_authid catalog, and
+        concurrent ALTER ROLE statements on the SAME role from different
+        sessions can raise Postgres's own "tuple concurrently updated" --
+        confirmed live, not theoretical: 9 of 10 threads each
+        constructing their own PostgreSQLLedger simultaneously (this
+        method running once per construction) failed with exactly that
+        error before this lock was added. The lock is transaction-scoped
+        (released at the commit/rollback below), so it only serializes
+        the brief ALTER ROLE window, not the whole harness construction.
         """
         from psycopg2 import sql
         conn = self.pool.getconn()
         try:
             cursor = conn.cursor()
             try:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('ledger_runtime_password_' || %s));",
+                    (runtime_user,)
+                )
                 cursor.execute(
                     sql.SQL("ALTER ROLE {} WITH PASSWORD %s;").format(
                         sql.Identifier(runtime_user)
@@ -412,6 +529,87 @@ class PostgreSQLLedger:
                         ON ledger_entries(shadow_run_hash)
                         WHERE shadow_run_hash IS NOT NULL;
                 """)
+            # F2 (2026-08-07): which governance_decision a human_selection
+            # row is reviewing. Own column, own index -- see
+            # canonical_fields.py's comment on decision_hash for why this
+            # is deliberately not a reuse of shadow_run_hash/replaces_hash.
+            if "decision_hash" not in existing_columns:
+                cursor.execute("""
+                    ALTER TABLE ledger_entries
+                        ADD COLUMN IF NOT EXISTS decision_hash VARCHAR(64);
+                    CREATE INDEX IF NOT EXISTS idx_decision_hash
+                        ON ledger_entries(decision_hash)
+                        WHERE decision_hash IS NOT NULL;
+                """)
+            # Keyed attestation over the authorized_by claim. Nullable, no
+            # backfill: rows written before this column existed -- and every
+            # row written while no ICEBERG_LEDGER_ATTESTATION_KEY is
+            # configured -- keep NULL here and hash byte-identically to what
+            # they hashed at write time (an absent optional field is omitted
+            # from the canonical form). VARCHAR(96) holds the v2 signature
+            # envelope "abv2.<16-hex keyfp>.<64-hex digest>" (~86 chars) that
+            # carries the signing key's fingerprint for rotation; a legacy
+            # bare 64-hex digest still fits and still verifies. No index: this
+            # column is read back alongside the row it attests, and the
+            # rotation dashboard query filters on a LIKE 'abv2.%' prefix. See
+            # governance/authorized_by_attestation.py.
+            if "authorized_by_sig" not in existing_columns:
+                cursor.execute("""
+                    ALTER TABLE ledger_entries
+                        ADD COLUMN IF NOT EXISTS authorized_by_sig VARCHAR(96);
+                """)
+            else:
+                # A ledger created before v2 has this column at VARCHAR(64).
+                # Widening a varchar is a catalog-only change in PG 9.2+ (no
+                # table rewrite); guarded on the current length so a normal
+                # boot never issues the ALTER. Existing 64-char bare digests
+                # are untouched and still verify.
+                cursor.execute(
+                    "SELECT character_maximum_length FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'ledger_entries' "
+                    "AND column_name = 'authorized_by_sig';"
+                )
+                _abs_len = cursor.fetchone()
+                if _abs_len and _abs_len[0] is not None and _abs_len[0] < 96:
+                    cursor.execute(
+                        "ALTER TABLE ledger_entries "
+                        "ALTER COLUMN authorized_by_sig TYPE VARCHAR(96);"
+                    )
+            # TACK Layer 5 verdict receipts: two hashed columns, both entering
+            # the canonical form through OPTIONAL_HASHED_FIELDS. Nullable, no
+            # backfill; every earlier row omits them and hashes
+            # byte-identically. subject_digest is the 64-hex SHA-256 from
+            # cns.gate.subject_digest over the stored input_data; shuffle_seed
+            # is a 64-hex HMAC-SHA256 reserved for Layer 1, NULL on every row
+            # written today.
+            if not {"subject_digest", "shuffle_seed"} <= existing_columns:
+                cursor.execute("""
+                    ALTER TABLE ledger_entries
+                        ADD COLUMN IF NOT EXISTS subject_digest VARCHAR(64),
+                        ADD COLUMN IF NOT EXISTS shuffle_seed VARCHAR(64);
+                """)
+            # observed_event rows (the persisted EventV1 stream, written in
+            # the same transaction as the governance_decision they feed --
+            # see append_decision's observed_events arg). No new column: the
+            # event body lives in input_data JSONB. This partial unique index
+            # is the DB-level backstop against a re-delivered event being
+            # double-recorded -- event_id is stable-at-creation and contains
+            # the episode id, so it is globally unique in practice. Same
+            # posture as idx_unique_call_sid: the normal path never hits it
+            # (append_decision writes each episode's events exactly once),
+            # it only catches a retry race. Guarded on a catalog read so a
+            # normal boot never issues the CREATE.
+            cursor.execute(
+                "SELECT 1 FROM pg_indexes WHERE schemaname = 'public' "
+                "AND tablename = 'ledger_entries' "
+                "AND indexname = 'idx_unique_observed_event_id';"
+            )
+            if cursor.fetchone() is None:
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_observed_event_id
+                        ON ledger_entries ((input_data->>'event_id'))
+                        WHERE record_kind = 'observed_event';
+                """)
             # Item 10: timestamp column made timezone-aware. The original
             # TIMESTAMP (no zone) column stored CURRENT_TIMESTAMP under
             # whatever timezone the Postgres session happened to be
@@ -538,6 +736,169 @@ class PostgreSQLLedger:
         finally:
             self.pool.putconn(conn)
 
+        # The head anchor's location is proven writable now, not on the
+        # first append: a ledger that cannot anchor its head does not start.
+        self._check_head_anchor_path()
+        # The attestation_policy marker belongs after these checks and
+        # nowhere earlier: a marker on a ledger that cannot prove its own
+        # immutability would promise something the ledger cannot keep, and
+        # the marker is itself an append that anchors the head.
+        self._ensure_attestation_policy_marker()
+
+    # ---- the external head anchor (TACK Layer 5, step 2.6) ----
+
+    @staticmethod
+    def _head_anchor_path() -> Optional[str]:
+        return _os_for_anchor.environ.get(HEAD_ANCHOR_ENV) or None
+
+    def _check_head_anchor_path(self) -> None:
+        """Fail closed at boot when ICEBERG_LEDGER_ANCHOR_PATH names a
+        location this process cannot write, or when it is set with no
+        signing key (an unsigned anchor anchors nothing)."""
+        path = self._head_anchor_path()
+        if not path:
+            return
+        if attestation_key() is None:
+            raise RuntimeError(
+                f"{HEAD_ANCHOR_ENV} is set but no ICEBERG_LEDGER_ATTESTATION_KEY "
+                f"is configured; the head anchor is signed with that key and an "
+                f"unsigned anchor proves nothing. Refusing to start.")
+        directory = _os_for_anchor.path.dirname(_os_for_anchor.path.abspath(path)) or "."
+        if not _os_for_anchor.path.isdir(directory) or not _os_for_anchor.access(directory, _os_for_anchor.W_OK):
+            raise RuntimeError(
+                f"{HEAD_ANCHOR_ENV}={path!r}: directory {directory!r} is missing "
+                f"or not writable by this process. Refusing to start a ledger "
+                f"whose head cannot be anchored.")
+
+    def _anchor_head(self, conn) -> None:
+        """After a successful append: seal the chain's head and row count
+        into the external anchor, signed with the attestation key. Called
+        by every writer right after its commit, on the same connection, so
+        the anchor never runs ahead of a row that did not commit. The
+        anchor code is the witness's (twin_custody); this only hands it the
+        head. A no-op when no anchor location is configured.
+        """
+        path = self._head_anchor_path()
+        if not path:
+            return
+        cursor = conn.cursor()
+        cursor.execute("SELECT current_hash, id FROM ledger_entries ORDER BY id DESC LIMIT 1")
+        head_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM ledger_entries")
+        count = cursor.fetchone()[0]
+        conn.rollback()  # read-only; release the snapshot
+        if not head_row:
+            return
+        write_head_anchor(path, head_row[0], int(count), attestation_key())
+
+    def _ensure_attestation_policy_marker(self) -> None:
+        """Append the chain-native marker that attestation is enforced from
+        here on, when enforcement is on and a signing key is configured and
+        the chain's latest marker does not already name this key. Boot-time
+        and idempotent: a normal restart appends nothing; a key rotation
+        appends one marker naming the new key. See
+        canonical_fields.attestation_policy_canonical.
+        """
+        if not enforcement_required():
+            return
+        key = attestation_key()
+        if key is None:
+            return
+        self.record_attestation_policy(_key_fingerprint(key))
+
+    def record_attestation_policy(self, key_fingerprint: str,
+                                  enforced_at: Optional[str] = None) -> bool:
+        """Append an attestation_policy marker for ``key_fingerprint`` unless
+        the chain's newest marker already names it. Returns True when a row
+        was written. Serialized under the same advisory lock every writer
+        takes, so concurrent boots cannot each append their own marker.
+
+        From this row forward, any row that carries authorized_by and no
+        signature is an UNATTESTED violation in verify_chain and in the
+        witness. Rows before it are untouched.
+        """
+        if enforced_at is None:
+            from datetime import datetime, timezone  # lazy: keeps the cold path clean
+            enforced_at = datetime.now(timezone.utc).isoformat()
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
+            cursor.execute("""
+                SELECT data->>'key_fingerprint' FROM ledger_entries
+                WHERE record_kind = %s ORDER BY id DESC LIMIT 1
+            """, (ATTESTATION_POLICY_RECORD_KIND,))
+            latest = cursor.fetchone()
+            if latest and latest[0] == key_fingerprint:
+                conn.rollback()
+                return False
+            cursor.execute("""
+                SELECT current_hash FROM ledger_entries
+                ORDER BY id DESC LIMIT 1
+            """)
+            row = cursor.fetchone()
+            previous_hash = row[0] if row else "genesis"
+            body = {
+                "record_kind": ATTESTATION_POLICY_RECORD_KIND,
+                "parameter_changed": False,
+                "key_fingerprint": key_fingerprint,
+                "enforced_at": enforced_at,
+            }
+            reason = (f"authorized_by attestation enforced from this row "
+                      f"under key {key_fingerprint}")
+            canonical_entry = attestation_policy_canonical(body, reason, previous_hash)
+            current_hash = hashlib.sha256(
+                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            cursor.execute("""
+                INSERT INTO ledger_entries
+                (action_type, node, reason, previous_hash, current_hash,
+                 data, record_kind)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (ATTESTATION_POLICY_RECORD_KIND, "ledger", reason,
+                  previous_hash, current_hash, json.dumps(body),
+                  ATTESTATION_POLICY_RECORD_KIND))
+            conn.commit()
+            self._anchor_head(conn)
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def _authorized_by_sig(self, authorized_by: Optional[str],
+                           previous_hash: str,
+                           record_kind: str,
+                           content_prehash: Optional[str] = None) -> Optional[str]:
+        """Compute the keyed attestation for a row's authorized_by claim.
+
+        Returns the hex HMAC (a component holding ICEBERG_LEDGER_ATTESTATION_KEY
+        wrote this claim and it has not changed since) or None when there is
+        no claim or no key configured -- in which case the row is written with
+        a NULL signature and is honestly unattested (D3/D4).
+
+        When enforcement is ON (ICEBERG_LEDGER_REQUIRE_ATTESTATION) and a
+        present authorized_by claim could not be signed, this refuses the
+        write rather than record an unattested authorization claim. The
+        ledger will not even start with enforcement on and no key (see
+        __init__), so in practice this fires only if signing itself fails.
+
+        This attests writer-authenticity and integrity of one string. It does
+        NOT verify that the named party holds the authority claimed -- see
+        governance/authorized_by_attestation.py.
+        """
+        sig = sign_authorized_by(authorized_by, previous_hash, record_kind,
+                                 attestation_key(), content_prehash)
+        if authorized_by and enforcement_required() and not sig:
+            raise RuntimeError(
+                f"authorized_by attestation enforcement is on but no signature "
+                f"was produced for the authorized_by claim on this "
+                f"{record_kind} row. Refusing to record an unattested "
+                f"authorization claim."
+            )
+        return sig
+
     def append(self, action_type: str, node: str, previous_value: float,
                applied_value: float, reason: str, data: Dict) -> bool:
         """Append entry to ledger (transaction).
@@ -588,6 +949,7 @@ class PostgreSQLLedger:
             """, (action_type, node, previous_value, applied_value, reason,
                   previous_hash, current_hash, json.dumps(data)))
             conn.commit()
+            self._anchor_head(conn)
             return True
         except Exception as e:
             conn.rollback()
@@ -596,9 +958,23 @@ class PostgreSQLLedger:
         finally:
             self.pool.putconn(conn)
     
-    def append_decision(self, record: GovernanceDecisionRecord, 
-                       governance_params: Optional[Any] = None) -> bool:
+    def append_decision(self, record: GovernanceDecisionRecord,
+                       governance_params: Optional[Any] = None,
+                       observed_events: "Optional[Any]" = None,
+                       episode: "Optional[Any]" = None) -> bool:
         """Append one structured governance decision (transaction).
+
+        MANDATORY CONSERVATION BOUNDARY, enforced here and not only in the
+        harness: the ledger is the point of durability, so it is the one place
+        no caller can route around. `episode` is the Episode the decision was
+        judged from. When it is given, conservation.boundary verifies
+        episode -> judgment before anything is written, and the decision is
+        refused (ConservationBoundaryRejected, or RuntimeError if the check
+        itself failed) if the kernel does not accept it. When it is absent the
+        decision is refused with ValueError, because nothing can be verified
+        without it, unless the dev-only override
+        ICEBERG_LEDGER_CONSERVATION_DEV_OVERRIDE is set. The override only
+        permits a missing episode; a given episode is always verified.
 
         TRIPWIRE: a decision without a cassette_version is an error,
         not a warning. The whole point of the record is "which policy
@@ -609,6 +985,17 @@ class PostgreSQLLedger:
         NEW: governance_params (GovernanceParameters from cassette_schema.py)
         is required. We serialize and hash the cassette at decision time
         so regulators can reconstruct it and prove it hasn't been changed.
+
+        observed_events (optional): an iterable of EventV1 (event_v1.py) --
+        the raw observations this decision was assembled from. When given,
+        each event is written as its own observed_event row IN THE SAME
+        TRANSACTION AND UNDER THE SAME ADVISORY LOCK as the decision, chained
+        immediately AFTER the decision row (decision.current_hash -> event 1
+        -> event 2 -> ...). Chain position is not chronology: the
+        observations happened first, but the decision row references them by
+        id in input_data and the rows carry occurred_at. Default None keeps
+        every existing caller a no-op. A decision either commits with all its
+        events or not at all -- a half-written stream is never left behind.
 
         All forensic fields are inside the canonical form that gets
         hashed, so editing any of them after the fact breaks the chain.
@@ -633,6 +1020,89 @@ class PostgreSQLLedger:
             raise ValueError("Governance decision rejected: input_data must be a dict")
         if not isinstance(record.output, dict) or not record.output:
             raise ValueError("Governance decision rejected: output must be a non-empty dict")
+
+        # TACK Layer 5: bind the verdict to what it judged. The digest is the
+        # CNS canonical digest of input_data exactly as it will be stored (a
+        # JSON round trip, which is what the witness reads back), computed
+        # by the writer and never taken from the record. cns.gate refuses
+        # NaN, the infinities and any type it cannot encode unambiguously.
+        # That refusal is a defect in the gate that produced the input, so
+        # the write is refused here, before any row is written, rather than
+        # papered over with a digest of something else.
+        try:
+            stored_input = json.loads(json.dumps(record.input_data))
+            subject_digest = cns_subject_digest(stored_input)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Governance decision rejected: input_data is not canonically "
+                f"encodable, so the verdict cannot be bound to it ({exc})"
+            ) from exc
+
+        # The gate identity rides inside the hashed output mapping, not in
+        # a column: which gate judged, at which end, and what it said in the
+        # CNS vocabulary. A cassette judges produced input, so the position
+        # is OMEGA. A caller-supplied "gate" entry is refused rather than
+        # overwritten: the ledger, not the agent, names the gate.
+        if "gate" in record.output:
+            raise ValueError(
+                "Governance decision rejected: output already carries a "
+                "'gate' entry; the ledger records the gate identity itself")
+        output = dict(record.output)
+        output["gate"] = {
+            "name": record.cassette_version,
+            "position": GatePosition.OMEGA.value,
+            "outcome": gate_outcome_of(record.output),
+        }
+
+        # observed_events: validate the whole batch BEFORE the transaction
+        # opens, same fail-early posture as the record checks above. One bad
+        # event rejects the decision -- a governed call whose observation
+        # stream will not validate is a finding, not something to silently
+        # record half of.
+        event_bodies: List[Dict[str, Any]] = []
+        if observed_events:
+            from event_v1 import validate_event  # lazy: keeps the cold path clean
+            events_list = list(observed_events)
+            seen_ids: set = set()
+            episode_ids: set = set()
+            for ev in events_list:
+                validate_event(ev)
+                if ev.event_id in seen_ids:
+                    raise ValueError(
+                        f"Governance decision rejected: duplicate observed event_id "
+                        f"{ev.event_id!r} in this batch"
+                    )
+                seen_ids.add(ev.event_id)
+                episode_ids.add(ev.episode_id)
+                event_bodies.append(event_v1_to_body(ev))
+            if len(episode_ids) > 1:
+                raise ValueError(
+                    f"Governance decision rejected: observed_events span multiple "
+                    f"episodes {sorted(episode_ids)!r} -- one decision's stream is "
+                    f"one episode"
+                )
+
+        # MANDATORY CONSERVATION BOUNDARY (see the docstring). Fail-closed and
+        # before any connection is taken: no durable state without verification.
+        if episode is not None:
+            from conservation.boundary import (  # lazy: keeps the cold path clean
+                verify_governed_decision,
+                ConservationBoundaryRejected,
+            )
+            try:
+                verify_governed_decision(episode, record)
+            except ConservationBoundaryRejected:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Conservation boundary failed, decision not persisted: {exc}"
+                ) from exc
+        elif not conservation_boundary_waived():
+            raise ValueError(
+                "Governance decision rejected: no episode was supplied, so the "
+                "conservation boundary cannot verify it, and the boundary is "
+                "mandatory at the ledger (pass episode=; the only exception is "
+                f"{ENV_CONSERVATION_DEV_OVERRIDE}, for development machines)")
 
         # NEW: Capture cassette snapshot for forensic reconstruction
         cassette_snapshot = None
@@ -701,7 +1171,7 @@ class PostgreSQLLedger:
                 "input_data": record.input_data,
                 "policy_parameters": record.policy_parameters,
                 "reasoning": record.reasoning,
-                "output": record.output,
+                "output": output,
                 "previous_value": record.previous_value,
                 "applied_value": record.applied_value,
                 "parameter_changed": bool(record.parameter_changed),
@@ -723,8 +1193,24 @@ class PostgreSQLLedger:
                 "outcome_obligation": record.outcome_obligation,
                 "replaces_hash": record.replaces_hash,
                 "ai_cost": record.ai_cost,
+                "subject_digest": subject_digest,
+                # Reserved for TACK Layer 1. Never read from the record or
+                # the request: the writer derives it (see
+                # authorized_by_attestation.derive_shuffle_seed) or leaves
+                # the field absent, and today no chain is shuffled.
+                "shuffle_seed": None,
             }
             apply_optional_hashed_fields(canonical_entry, optional_source)
+
+            # abv3: the signature covers the content pre-hash, the canonical
+            # entry as it stands with every other field in place and before
+            # the signature itself joins it. Signed last, applied last, so
+            # the row never contains a signature over itself.
+            authorized_by_sig = self._authorized_by_sig(
+                record.authorized_by, previous_hash, "governance_decision",
+                content_prehash=_content_prehash(canonical_entry))
+            apply_optional_hashed_fields(
+                canonical_entry, {_AUTHORIZED_BY_SIG_FIELD: authorized_by_sig})
 
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -738,16 +1224,16 @@ class PostgreSQLLedger:
                  decision_output, cassette_snapshot, cassette_hash, call_sid,
                  cassette_code_hash, model_identity, authorized_by,
                  supersedes_id, supersedes_hash, outcome_obligation, replaces_hash,
-                 ai_cost)
+                 ai_cost, authorized_by_sig, subject_digest, shuffle_seed)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s)
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (record.action_type, record.node, record.previous_value,
                   record.applied_value, record.reasoning,
                   previous_hash, current_hash, json.dumps(data),
                   "governance_decision", record.cassette_version,
                   json.dumps(record.input_data),
                   json.dumps(record.policy_parameters),
-                  json.dumps(record.output),
+                  json.dumps(output),
                   json.dumps(cassette_snapshot) if cassette_snapshot else None,
                   cassette_hash,
                   record.input_data.get("call_sid"),
@@ -755,8 +1241,39 @@ class PostgreSQLLedger:
                   record.authorized_by,
                   getattr(record, "supersedes_id", None), record.supersedes_hash,
                   record.outcome_obligation, record.replaces_hash,
-                  json.dumps(record.ai_cost) if record.ai_cost else None))
+                  json.dumps(record.ai_cost) if record.ai_cost else None,
+                  authorized_by_sig, subject_digest, None))
+
+            # observed_event rows: chained after the decision row, still
+            # inside this transaction and still holding the advisory lock, so
+            # the decision and its whole observation stream commit together
+            # or not at all. Each row hashes a FIXED canonical form (no
+            # optional fields -- every observed_event row is new) via the
+            # shared observed_event_canonical the verifier and witness use.
+            event_prev = current_hash
+            for body in event_bodies:
+                ev_canonical = observed_event_canonical(body, event_prev)
+                ev_hash = hashlib.sha256(
+                    json.dumps(ev_canonical, sort_keys=True, default=str).encode()
+                ).hexdigest()
+                cursor.execute("""
+                    INSERT INTO ledger_entries
+                    (action_type, node, reason, previous_hash, current_hash,
+                     data, record_kind, input_data)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    body["kind"], body["episode_id"],
+                    f"observed_event {body['event_id']} "
+                    f"({body['provenance']}) for episode {body['episode_id']}",
+                    event_prev, ev_hash,
+                    json.dumps({"record_kind": "observed_event",
+                                "parameter_changed": False}),
+                    "observed_event", json.dumps(body),
+                ))
+                event_prev = ev_hash
+
             conn.commit()
+            self._anchor_head(conn)
             return True
         except Exception:
             conn.rollback()
@@ -850,10 +1367,13 @@ class PostgreSQLLedger:
             # cassette_hash + cassette_code_hash enter the hash via the SAME
             # shared contract used by decisions -- so a binding row's integrity
             # recomputes identically on the twin.
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, "cassette_binding")
             apply_optional_hashed_fields(canonical_entry, {
                 "cassette_hash": cassette_hash,
                 "cassette_code_hash": cassette_code_hash,
                 "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -865,14 +1385,15 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, cassette_hash, cassette_code_hash,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("cassette_binding", cassette_version, 0.0, 0.0,
                   "cassette version->content binding",
                   previous_hash, current_hash, json.dumps(data),
                   "cassette_binding", cassette_version, cassette_hash,
-                  cassette_code_hash, authorized_by))
+                  cassette_code_hash, authorized_by, authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "created",
                 "cassette_version": cassette_version,
@@ -960,10 +1481,13 @@ class PostgreSQLLedger:
                 "regulation": str(regulation),
                 "previous_hash": previous_hash,
             }
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, event)
             apply_optional_hashed_fields(canonical_entry, {
                 "cassette_hash": cassette_hash,
                 "cassette_code_hash": cassette_code_hash,
                 "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -979,14 +1503,15 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, cassette_hash, cassette_code_hash,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (event, str(regulation)[:100], 0.0, 0.0,
                   f"regulatory lens {verb} ({mode} mode)",
                   previous_hash, current_hash, json.dumps(data),
                   event, cassette_version, cassette_hash,
-                  cassette_code_hash, authorized_by))
+                  cassette_code_hash, authorized_by, authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "created",
                 "event": event,
@@ -1070,9 +1595,12 @@ class PostgreSQLLedger:
                 "finding": finding,
                 "previous_hash": previous_hash,
             }
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, "regulatory_disclosure")
             apply_optional_hashed_fields(canonical_entry, {
                 "cassette_hash": cassette_hash,
                 "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -1087,14 +1615,16 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, decision_output, cassette_hash,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("regulatory_disclosure", str(check)[:100], 0.0, 0.0,
                   f"regulatory lens {action}: {check} ({str(regulation)[:120]})",
                   previous_hash, current_hash, json.dumps(data),
                   "regulatory_disclosure", cassette_version,
-                  json.dumps(finding), cassette_hash, authorized_by))
+                  json.dumps(finding), cassette_hash, authorized_by,
+                  authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "created",
                 "cassette_version": cassette_version,
@@ -1172,8 +1702,11 @@ class PostgreSQLLedger:
                 "recommendation": recommendation,
                 "previous_hash": previous_hash,
             }
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, "recommendation_shadow_run")
             apply_optional_hashed_fields(canonical_entry, {
                 "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -1187,15 +1720,17 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, input_data, decision_output,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("recommendation_shadow_run", str(subject)[:100], 0.0, 0.0,
                   f"shadow recommendation ({recommendation_kind}) for {subject}, "
                   "never acted on -- predictive-accuracy measurement only",
                   previous_hash, current_hash, json.dumps(data),
                   "recommendation_shadow_run", cassette_version,
-                  json.dumps(inputs), json.dumps(recommendation), authorized_by))
+                  json.dumps(inputs), json.dumps(recommendation), authorized_by,
+                  authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "created",
                 "recommendation_kind": str(recommendation_kind),
@@ -1260,9 +1795,12 @@ class PostgreSQLLedger:
                 "score": score,
                 "previous_hash": previous_hash,
             }
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, "recommendation_shadow_score")
             apply_optional_hashed_fields(canonical_entry, {
                 "authorized_by": authorized_by,
                 "shadow_run_hash": shadow_run_hash,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -1275,19 +1813,179 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, shadow_run_hash, input_data, decision_output,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("recommendation_shadow_score", shadow_run_hash[:100], 0.0, 0.0,
                   f"scored shadow recommendation {shadow_run_hash[:12]}",
                   previous_hash, current_hash, json.dumps(data),
                   "recommendation_shadow_score", shadow_run_hash,
-                  json.dumps(actual), json.dumps(score), authorized_by))
+                  json.dumps(actual), json.dumps(score), authorized_by,
+                  authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {"status": "created", "shadow_run_hash": shadow_run_hash,
                     "current_hash": current_hash}
         except Exception:
             conn.rollback()
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    def record_human_selection(
+            self, decision_hash: str, human_selection: str, selected_by: str,
+            rationale: Optional[str] = None) -> Dict[str, Any]:
+        """Record a human's response to ONE governance_decision row's verdict.
+
+        F2 (2026-08-07): the founding idea that had never been built --
+        nothing captured which recommendation a human accepted, overrode,
+        or rejected. Piloted on exactly one surface: GovernanceDecider.
+        safety_check's verdict on a governed episode, the only
+        recommendation confirmed live in the whole system (see
+        record_recommendation_shadow_run's own docstring, and
+        governance/human_selection_v1.py's module docstring for the full
+        survey that ruled out every other candidate). Every other
+        recommendation surface (queue-reordering, healing-bounds,
+        staffing) is untouched by this method.
+
+        `recommendation_shown` is never accepted from the caller -- same
+        "never trust the actor's self-report" posture as episode.py's
+        Provenance Rule. It is looked up here from the actual
+        governance_decision row decision_hash names, so a human_selection
+        row can never misrepresent what was actually recommended.
+
+        This is capture only. Nothing here feeds simple_rl_trainer.py or
+        any other learner -- that trainer is simulator-only and slated
+        for GSA-815; wiring a real signal into it is a separate, later
+        decision this method deliberately does not make.
+        """
+        if not decision_hash or not str(decision_hash).strip():
+            raise ValueError("record_human_selection requires decision_hash")
+        if human_selection not in HUMAN_SELECTIONS:
+            raise ValueError(
+                f"record_human_selection requires human_selection to be one "
+                f"of {sorted(HUMAN_SELECTIONS)}, got {human_selection!r}")
+        if not selected_by or not str(selected_by).strip():
+            raise ValueError("record_human_selection requires selected_by "
+                             "(who reviewed this decision)")
+
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
+
+            cursor.execute("""
+                SELECT record_kind, cassette_version, reason, decision_output
+                FROM ledger_entries WHERE current_hash = %s
+            """, (decision_hash,))
+            parent = cursor.fetchone()
+            if parent is None or parent[0] != "governance_decision":
+                raise ValueError(
+                    f"decision_hash {decision_hash!r} does not match any "
+                    "governance_decision row -- refusing to record a human "
+                    "selection against something that was never actually "
+                    "decided")
+            _, cassette_version, parent_reason, parent_output = parent
+            recommendation_shown = {
+                "reasoning": parent_reason,
+                "output": self._as_json(parent_output),
+            }
+
+            cursor.execute("""
+                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
+            """)
+            row = cursor.fetchone()
+            previous_hash = row[0] if row else "genesis"
+
+            canonical_entry = {
+                "record_kind": "human_selection",
+                "cassette_version": cassette_version,
+                "human_selection": human_selection,
+                "rationale": rationale,
+                "recommendation_shown": recommendation_shown,
+                "previous_hash": previous_hash,
+            }
+            authorized_by_sig = self._authorized_by_sig(
+                selected_by, previous_hash, "human_selection")
+            apply_optional_hashed_fields(canonical_entry, {
+                "authorized_by": selected_by,
+                "decision_hash": decision_hash,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
+            })
+            current_hash = hashlib.sha256(
+                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
+            ).hexdigest()
+
+            data = {"record_kind": "human_selection",
+                    "human_selection": human_selection,
+                    "rationale": rationale, "parameter_changed": False}
+            cursor.execute("""
+                INSERT INTO ledger_entries
+                (action_type, node, previous_value, applied_value, reason,
+                 previous_hash, current_hash, data,
+                 record_kind, cassette_version, decision_hash, decision_output,
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, ("human_selection", decision_hash[:100], 0.0, 0.0,
+                  f"human selection ({human_selection}) on decision "
+                  f"{decision_hash[:12]}",
+                  previous_hash, current_hash, json.dumps(data),
+                  "human_selection", cassette_version, decision_hash,
+                  json.dumps(recommendation_shown), selected_by,
+                  authorized_by_sig))
+            conn.commit()
+            self._anchor_head(conn)
+            return {
+                "status": "created",
+                "human_selection": human_selection,
+                "decision_hash": decision_hash,
+                "current_hash": current_hash,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    def get_human_selections(self, decision_hash: Optional[str] = None,
+                             limit: int = 100) -> List[Dict[str, Any]]:
+        """human_selection rows, newest first. `decision_hash`, when given,
+        filters to selections reviewing that one governance_decision row --
+        mirrors get_decisions'/get_unscored_shadow_runs' filter posture.
+        """
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            query = """
+                SELECT id, timestamp, cassette_version, decision_hash,
+                       authorized_by, current_hash, previous_hash, data,
+                       decision_output
+                FROM ledger_entries
+                WHERE record_kind = 'human_selection'
+            """
+            params: list = []
+            if decision_hash is not None:
+                query += " AND decision_hash = %s"
+                params.append(decision_hash)
+            query += " ORDER BY id DESC LIMIT %s"
+            params.append(limit)
+            cursor.execute(query, tuple(params))
+
+            selections = []
+            for row in cursor.fetchall():
+                data = self._as_json(row[7]) or {}
+                selections.append({
+                    "id": row[0],
+                    "timestamp": row[1].isoformat() if row[1] else None,
+                    "cassette_version": row[2],
+                    "decision_hash": row[3],
+                    "selected_by": row[4],
+                    "current_hash": row[5],
+                    "previous_hash": row[6],
+                    "human_selection": data.get("human_selection"),
+                    "rationale": data.get("rationale"),
+                    "recommendation_shown": self._as_json(row[8]),
+                })
+            return selections
         finally:
             self.pool.putconn(conn)
 
@@ -1404,9 +2102,12 @@ class PostgreSQLLedger:
                 "finding": finding,
                 "previous_hash": previous_hash,
             }
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, "outcome_harm_event")
             apply_optional_hashed_fields(canonical_entry, {
                 "cassette_hash": cassette_hash,
                 "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -1422,15 +2123,17 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, decision_output, cassette_hash,
-                 authorized_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("outcome_harm_event", str(harm_kind)[:100], 0.0, 0.0,
                   f"outcome harm event: {str(harm_kind)[:80]} on decision "
                   f"{str(decision_hash)[:16]}",
                   previous_hash, current_hash, json.dumps(data),
                   "outcome_harm_event", cassette_version,
-                  json.dumps(finding), cassette_hash, authorized_by))
+                  json.dumps(finding), cassette_hash, authorized_by,
+                  authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "created",
                 "cassette_version": cassette_version,
@@ -1442,6 +2145,385 @@ class PostgreSQLLedger:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            self.pool.putconn(conn)
+
+    # -- Contract compliance attestation --------------------------------
+    #
+    # Four record kinds, all on the SAME chain as every other event, all
+    # hashed through the shared canonical_fields contract. They exist as
+    # distinct kinds rather than one "contract_event" with a subtype for
+    # the reason record_outcome_harm_event states: filing distinguishable
+    # events under one record_kind leaves an examiner unable to count
+    # either. "How many egresses went to subcontractors" and "how many
+    # deletions were attested late" are different questions and must be
+    # different queries.
+    #
+    # REMINDER, learned the hard way on outcome_harm_event: a new record
+    # kind is not done until all THREE recompute sites agree -- the
+    # writer here, verify_chain below, and twin_custody.recompute_current_hash.
+
+    _CONTRACT_EGRESS_DECISIONS = ("authorized", "refused")
+    _CONTRACT_APPROVAL_STATES = ("granted", "revoked")
+    _CONTRACT_DELETION_SCOPES = ("active", "backup")
+
+    def record_contract_ingest(self, contract_version: str, counterparty: str,
+                               ingest_id: str, data_scope: str,
+                               received_at: str,
+                               cassette_hash: Optional[str] = None,
+                               authorized_by: Optional[str] = None
+                               ) -> Dict[str, Any]:
+        """Record that data arrived under a contract, as a chained event.
+
+        Retention cannot be checked without a start date. An ingest row
+        is that start date, on the chain, so the clock a deletion is
+        measured against is not something the operator can quietly
+        restate later. A deletion event points back at ingest_id.
+
+        Deliberately NOT a governance_decision: nothing was decided
+        here. Data arrived.
+        """
+        if not contract_version or not isinstance(contract_version, str):
+            raise ValueError("record_contract_ingest requires contract_version")
+        if not counterparty or not str(counterparty).strip():
+            raise ValueError("record_contract_ingest requires the counterparty "
+                             "whose contract governs this data")
+        if not ingest_id or not str(ingest_id).strip():
+            raise ValueError("record_contract_ingest requires ingest_id -- a "
+                             "deletion with nothing to point back at cannot "
+                             "retire anything")
+        if not data_scope or not str(data_scope).strip():
+            raise ValueError("record_contract_ingest requires data_scope")
+        if not received_at or not str(received_at).strip():
+            raise ValueError("record_contract_ingest requires received_at; the "
+                             "retention clock has to start somewhere explicit")
+
+        return self._append_contract_row(
+            record_kind="contract_ingest",
+            cassette_version=contract_version,
+            canonical_extra={
+                "counterparty": str(counterparty),
+                "ingest_id": str(ingest_id),
+                "data_scope": str(data_scope),
+                "received_at": str(received_at),
+            },
+            finding=None,
+            node=str(counterparty)[:100],
+            reason=f"contract ingest {str(ingest_id)[:60]}",
+            cassette_hash=cassette_hash,
+            authorized_by=authorized_by,
+        )
+
+    def record_contract_egress(self, contract_version: str, counterparty: str,
+                               decision: str, data_scope: str, recipient: str,
+                               recipient_class: str, purpose: str,
+                               occurred_at: str, finding: Dict[str, Any],
+                               approval_reference: Optional[str] = None,
+                               cassette_hash: Optional[str] = None,
+                               authorized_by: Optional[str] = None
+                               ) -> Dict[str, Any]:
+        """Record one egress authorization decision -- granted or refused.
+
+        Both outcomes are chained. A refusal that left no trace would
+        make the log a record of successes, which is the one shape of
+        egress log nobody should trust. `decision` is a first-class
+        hashed field, so "authorized" cannot be edited to look like a
+        refusal or vice versa without breaking the chain.
+
+        HONEST SCOPE, and it must stay stated wherever this data is
+        shown: this proves the egress log is complete relative to the
+        chokepoint. It cannot prove nothing left by a path that never
+        called the chokepoint at all.
+        """
+        if not contract_version or not isinstance(contract_version, str):
+            raise ValueError("record_contract_egress requires contract_version")
+        if decision not in self._CONTRACT_EGRESS_DECISIONS:
+            raise ValueError(
+                f"decision must be one of {list(self._CONTRACT_EGRESS_DECISIONS)}, "
+                f"got {decision!r}")
+        for name, value in (("counterparty", counterparty),
+                            ("data_scope", data_scope),
+                            ("recipient", recipient),
+                            ("recipient_class", recipient_class),
+                            ("purpose", purpose),
+                            ("occurred_at", occurred_at)):
+            if not value or not str(value).strip():
+                raise ValueError(f"record_contract_egress requires {name}")
+        if not isinstance(finding, dict) or not finding:
+            raise ValueError("record_contract_egress requires a non-empty finding "
+                             "body stating the basis for the decision")
+        finding = json.loads(json.dumps(finding, sort_keys=True, default=str))
+
+        return self._append_contract_row(
+            record_kind="contract_egress",
+            cassette_version=contract_version,
+            canonical_extra={
+                "counterparty": str(counterparty),
+                "decision": str(decision),
+                "data_scope": str(data_scope),
+                "recipient": str(recipient),
+                "recipient_class": str(recipient_class),
+                "purpose": str(purpose),
+                "approval_reference": str(approval_reference or ""),
+                "occurred_at": str(occurred_at),
+            },
+            finding=finding,
+            node=str(recipient_class)[:100],
+            reason=(f"contract egress {decision}: {str(purpose)[:40]} -> "
+                    f"{str(recipient)[:40]}"),
+            cassette_hash=cassette_hash,
+            authorized_by=authorized_by,
+        )
+
+    def record_contract_approval(self, contract_version: str, counterparty: str,
+                                 approval_id: str, state: str, approver: str,
+                                 recipient: str, recipient_class: str,
+                                 scope: str, granted_at: str,
+                                 expires_at: Optional[str] = None,
+                                 revoked_at: Optional[str] = None,
+                                 cassette_hash: Optional[str] = None
+                                 ) -> Dict[str, Any]:
+        """Record an approval grant or revocation as a chained event.
+
+        Approval is first-class, not an attribute of the egress that
+        used it: an egress references an approval, and whether that
+        approval was live and unrevoked AT EGRESS TIME is then a
+        question answerable from two chained rows rather than from one
+        row's self-description.
+
+        Revocation is its own row with state="revoked", never an edit
+        of the grant row. The grant happened; the chain says so
+        permanently, and the revocation says when that stopped being
+        true.
+
+        approver rides in the authorized_by column, the same column
+        every other authorizing identity in this ledger uses.
+        """
+        if not contract_version or not isinstance(contract_version, str):
+            raise ValueError("record_contract_approval requires contract_version")
+        if state not in self._CONTRACT_APPROVAL_STATES:
+            raise ValueError(
+                f"state must be one of {list(self._CONTRACT_APPROVAL_STATES)}, "
+                f"got {state!r}")
+        for name, value in (("counterparty", counterparty),
+                            ("approval_id", approval_id),
+                            ("approver", approver),
+                            ("recipient", recipient),
+                            ("recipient_class", recipient_class),
+                            ("scope", scope),
+                            ("granted_at", granted_at)):
+            if not value or not str(value).strip():
+                raise ValueError(f"record_contract_approval requires {name}")
+        if state == "revoked" and not str(revoked_at or "").strip():
+            raise ValueError("a revocation requires revoked_at; 'revoked at some "
+                             "point' cannot be compared against an egress time")
+
+        return self._append_contract_row(
+            record_kind="contract_approval",
+            cassette_version=contract_version,
+            canonical_extra={
+                "counterparty": str(counterparty),
+                "approval_id": str(approval_id),
+                "state": str(state),
+                "recipient": str(recipient),
+                "recipient_class": str(recipient_class),
+                "scope": str(scope),
+                "granted_at": str(granted_at),
+                "expires_at": str(expires_at or ""),
+                "revoked_at": str(revoked_at or ""),
+            },
+            finding=None,
+            node=str(recipient_class)[:100],
+            reason=f"contract approval {state}: {str(approval_id)[:60]}",
+            cassette_hash=cassette_hash,
+            authorized_by=str(approver),
+        )
+
+    def record_contract_deletion(self, contract_version: str, counterparty: str,
+                                 ingest_id: str, deleted_at: str,
+                                 scope: str, method: str,
+                                 cassette_hash: Optional[str] = None,
+                                 authorized_by: Optional[str] = None
+                                 ) -> Dict[str, Any]:
+        """Record a deletion as a POSITIVE event bound to the ingest it retires.
+
+        Absence is never evidence of deletion. That is the whole reason
+        this row exists: without a positive event, "no record of this
+        data" and "deleted on time" are indistinguishable, and the
+        latter is the one an operator would prefer you assume.
+
+        PROVENANCE. This event is ATTESTED, never verified, and
+        contract_retention.py stamps it that way in every report.
+        Sentinel does not delete anything and does not watch the
+        deletion happen; the processor deletes and then says so. A
+        read-back check would still be the operator's own code
+        reporting on the operator, which is attestation with extra
+        steps. Real verification needs a signed tombstone from the
+        storage layer -- outside instrumentation, explicitly out of
+        scope. What gives the check teeth is not the stamp on a claim
+        the operator did make, it is the treatment of the claim they
+        did not: a missing deletion past the horizon is overdue or
+        INDETERMINATE, never compliant.
+
+        `method` names how the deletion was performed and is required
+        -- an attestation that will not describe its own mechanism is
+        the same failure event_v1 refuses for an estimate that will not
+        name its method.
+        """
+        if not contract_version or not isinstance(contract_version, str):
+            raise ValueError("record_contract_deletion requires contract_version")
+        if scope not in self._CONTRACT_DELETION_SCOPES:
+            raise ValueError(
+                f"scope must be one of {list(self._CONTRACT_DELETION_SCOPES)}, "
+                f"got {scope!r}")
+        for name, value in (("counterparty", counterparty),
+                            ("ingest_id", ingest_id),
+                            ("deleted_at", deleted_at),
+                            ("method", method)):
+            if not value or not str(value).strip():
+                raise ValueError(f"record_contract_deletion requires {name}")
+
+        return self._append_contract_row(
+            record_kind="contract_deletion",
+            cassette_version=contract_version,
+            canonical_extra={
+                "counterparty": str(counterparty),
+                "ingest_id": str(ingest_id),
+                "deleted_at": str(deleted_at),
+                "scope": str(scope),
+                "method": str(method),
+                "stamp": "attested",
+            },
+            finding=None,
+            node=str(scope)[:100],
+            reason=f"contract deletion ({scope}) of {str(ingest_id)[:50]}",
+            cassette_hash=cassette_hash,
+            authorized_by=authorized_by,
+        )
+
+    def _append_contract_row(self, record_kind: str, cassette_version: str,
+                             canonical_extra: Dict[str, Any],
+                             finding: Optional[Dict[str, Any]],
+                             node: str, reason: str,
+                             cassette_hash: Optional[str],
+                             authorized_by: Optional[str]) -> Dict[str, Any]:
+        """Shared append path for the four contract record kinds.
+
+        One function rather than four near-identical bodies, because
+        four hand-copied canonical-form builders is four chances for
+        the writer to drift from verify_chain and the twin. The
+        canonical form is always:
+
+            record_kind, cassette_version, <the kind's own fields>,
+            [finding, when the kind carries one], previous_hash
+
+        plus the shared optional hashed fields. The kind's own fields
+        are stored verbatim in the data JSONB under the same names, so
+        both other recompute sites rebuild them by copying keys out of
+        data with no per-kind mapping table to get wrong.
+        """
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pg_advisory_xact_lock(hashtext('ledger_entries'))")
+            cursor.execute("""
+                SELECT current_hash FROM ledger_entries ORDER BY id DESC LIMIT 1
+            """)
+            row = cursor.fetchone()
+            previous_hash = row[0] if row else "genesis"
+
+            canonical_entry: Dict[str, Any] = {
+                "record_kind": record_kind,
+                "cassette_version": cassette_version,
+            }
+            canonical_entry.update(canonical_extra)
+            if finding is not None:
+                canonical_entry["finding"] = finding
+            canonical_entry["previous_hash"] = previous_hash
+            authorized_by_sig = self._authorized_by_sig(
+                authorized_by, previous_hash, record_kind)
+            apply_optional_hashed_fields(canonical_entry, {
+                "cassette_hash": cassette_hash,
+                "authorized_by": authorized_by,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
+            })
+            current_hash = hashlib.sha256(
+                json.dumps(canonical_entry, sort_keys=True, default=str).encode()
+            ).hexdigest()
+
+            data = {"record_kind": record_kind, "parameter_changed": False}
+            data.update(canonical_extra)
+            cursor.execute("""
+                INSERT INTO ledger_entries
+                (action_type, node, previous_value, applied_value, reason,
+                 previous_hash, current_hash, data,
+                 record_kind, cassette_version, decision_output, cassette_hash,
+                 authorized_by, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (record_kind, node, 0.0, 0.0, reason,
+                  previous_hash, current_hash, json.dumps(data),
+                  record_kind, cassette_version,
+                  json.dumps(finding) if finding is not None else None,
+                  cassette_hash, authorized_by, authorized_by_sig))
+            conn.commit()
+            self._anchor_head(conn)
+            result = {"status": "created", "record_kind": record_kind,
+                      "cassette_version": cassette_version,
+                      "current_hash": current_hash}
+            result.update(canonical_extra)
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self.pool.putconn(conn)
+
+    # The canonical field lists live in canonical_fields.py, imported by
+    # all three recompute sites. Bound here as class attributes so the
+    # methods below read naturally, NOT redefined -- a second copy is
+    # exactly the drift canonical_fields exists to prevent.
+    CONTRACT_CANONICAL_FIELDS: Dict[str, Tuple[str, ...]] = CONTRACT_CANONICAL_FIELDS
+    CONTRACT_KINDS_WITH_FINDING: Tuple[str, ...] = CONTRACT_KINDS_WITH_FINDING
+
+    def get_contract_rows(self, counterparty: str,
+                          record_kinds: Optional[Tuple[str, ...]] = None,
+                          limit: int = 5000) -> List[Dict[str, Any]]:
+        """Every contract row for ONE counterparty, oldest first.
+
+        Scoped at the query, not filtered after the fact in Python:
+        a report generator that had to remember to filter is a report
+        generator that will eventually forget. See
+        contract_attestation.py for what is built on top of this.
+        """
+        if not counterparty or not str(counterparty).strip():
+            raise ValueError("get_contract_rows requires a counterparty")
+        kinds = tuple(record_kinds or tuple(self.CONTRACT_CANONICAL_FIELDS))
+        unknown = [k for k in kinds if k not in self.CONTRACT_CANONICAL_FIELDS]
+        if unknown:
+            raise ValueError(f"unknown contract record kinds: {unknown}")
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, timestamp, record_kind, cassette_version, data,
+                       decision_output, cassette_hash, authorized_by,
+                       previous_hash, current_hash
+                FROM ledger_entries
+                WHERE record_kind = ANY(%s)
+                  AND data->>'counterparty' = %s
+                ORDER BY id ASC
+                LIMIT %s
+            """, (list(kinds), str(counterparty), int(limit)))
+            rows = []
+            for r in cursor.fetchall():
+                rows.append({
+                    "id": r[0], "timestamp": r[1], "record_kind": r[2],
+                    "cassette_version": r[3], "data": self._as_json(r[4]),
+                    "decision_output": self._as_json(r[5]),
+                    "cassette_hash": r[6], "authorized_by": r[7],
+                    "previous_hash": r[8], "current_hash": r[9],
+                })
+            return rows
         finally:
             self.pool.putconn(conn)
 
@@ -1572,9 +2654,12 @@ class PostgreSQLLedger:
             # supersedes_hash (the original's current_hash) + authorized_by enter
             # the hash via the shared contract, so the link and the authorizing
             # identity are both tamper-evident and recompute identically on the twin.
+            authorized_by_sig = self._authorized_by_sig(
+                authority, previous_hash, "decision_supersession")
             apply_optional_hashed_fields(canonical_entry, {
                 "supersedes_hash": orig_hash,
                 "authorized_by": authority,
+                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
             })
             current_hash = hashlib.sha256(
                 json.dumps(canonical_entry, sort_keys=True, default=str).encode()
@@ -1586,14 +2671,15 @@ class PostgreSQLLedger:
                 (action_type, node, previous_value, applied_value, reason,
                  previous_hash, current_hash, data,
                  record_kind, cassette_version, decision_output,
-                 authorized_by, supersedes_id, supersedes_hash)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 authorized_by, supersedes_id, supersedes_hash, authorized_by_sig)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, ("decision_supersession", "supersession", 0.0, 0.0, reason,
                   previous_hash, current_hash, json.dumps(data),
                   "decision_supersession", version,
                   json.dumps(corrected_output),
-                  authority, supersedes_id, orig_hash))
+                  authority, supersedes_id, orig_hash, authorized_by_sig))
             conn.commit()
+            self._anchor_head(conn)
             return {
                 "status": "superseded",
                 "supersedes_id": supersedes_id,
@@ -1897,15 +2983,29 @@ class PostgreSQLLedger:
 
     def verify_chain(self, mode: str = "strict") -> Dict:
         """Verify ledger integrity: chain links AND content hash recomputation.
-        
+
         Checks both that previous_hash links form an unbroken chain AND that
         each row's current_hash matches a fresh recomputation from its contents.
         Detects in-place tampering (e.g., flipping decision_output.approved).
+
+        When any attestation key is configured (current, PREVIOUS, or
+        RETIRED), ALSO checks the keyed attestation on each row's authorized_by
+        claim: a row whose authorized_by string was altered after writing is
+        reported as a violation even if current_hash was recomputed to keep the
+        unkeyed SHA-256 chain self-consistent. A row signed by a key this
+        deployment does not hold at all (UNKNOWN_KEY) is ALWAYS a violation; a
+        row signed by a deliberately retired key (RETIRED_KEY) is a violation
+        only when enforcement is on. This check attests writer-authenticity and
+        integrity of the claim string only -- NOT that the named party held the
+        authority claimed (see authorized_by_attestation.py). With no key
+        configured, this method behaves exactly as before.
         """
-        
+
         conn = self.pool.getconn()
         try:
             cursor = conn.cursor()
+            _att_keys = attestation_keyset()
+            _att_enforced = enforcement_required()
             # Fetch all columns needed to reconstruct canonical forms
             cursor.execute("""
                 SELECT id, record_kind, previous_hash, current_hash,
@@ -1914,7 +3014,8 @@ class PostgreSQLLedger:
                        decision_output, cassette_hash,
                        cassette_code_hash, model_identity, authorized_by,
                        supersedes_id, supersedes_hash, outcome_obligation,
-                       replaces_hash, ai_cost, shadow_run_hash
+                       replaces_hash, ai_cost, shadow_run_hash, decision_hash,
+                       authorized_by_sig, subject_digest, shuffle_seed
                 FROM ledger_entries
                 ORDER BY id ASC
             """)
@@ -1926,7 +3027,10 @@ class PostgreSQLLedger:
             
             violations = []
             prev_hash = "genesis"
-            
+            # attestation_policy marker seen so far: from that row forward
+            # an accountable claim without a signature is UNATTESTED.
+            policy_from_row = None
+
             for row in rows:
                 (row_id, record_kind, stored_prev, stored_current,
                  action_type, node, previous_value, applied_value, reason,
@@ -1934,7 +3038,8 @@ class PostgreSQLLedger:
                  decision_output, cassette_hash,
                  cassette_code_hash, model_identity, authorized_by,
                  supersedes_id, supersedes_hash, outcome_obligation,
-                 replaces_hash, ai_cost, shadow_run_hash) = row
+                 replaces_hash, ai_cost, shadow_run_hash, decision_hash,
+                 authorized_by_sig, subject_digest, shuffle_seed) = row
                 
                 # Check chain link integrity
                 if stored_prev != prev_hash:
@@ -1971,6 +3076,8 @@ class PostgreSQLLedger:
                             "outcome_obligation": outcome_obligation,
                             "replaces_hash": replaces_hash,
                             "ai_cost": self._as_json(ai_cost),
+                            "subject_digest": subject_digest,
+                            "shuffle_seed": shuffle_seed,
                         })
                     elif record_kind == "cassette_binding":
                         # Item 2 -- mirrors bind_cassette_version()
@@ -2043,6 +3150,27 @@ class PostgreSQLLedger:
                             "cassette_hash": cassette_hash,
                             "authorized_by": authorized_by,
                         })
+                    elif record_kind in self.CONTRACT_CANONICAL_FIELDS:
+                        # Contract compliance attestation -- mirrors
+                        # _append_contract_row(). Every one of the kind's own
+                        # fields was stored in data under its canonical name,
+                        # so this rebuilds by copying keys in the declared
+                        # order rather than by a per-kind mapping that could
+                        # drift from the writer. Recompute site 2 of 3.
+                        d = self._as_json(data) or {}
+                        canonical_entry = {
+                            "record_kind": record_kind,
+                            "cassette_version": cassette_version,
+                        }
+                        for key in self.CONTRACT_CANONICAL_FIELDS[record_kind]:
+                            canonical_entry[key] = d.get(key)
+                        if record_kind in self.CONTRACT_KINDS_WITH_FINDING:
+                            canonical_entry["finding"] = self._as_json(decision_output)
+                        canonical_entry["previous_hash"] = stored_prev
+                        apply_optional_hashed_fields(canonical_entry, {
+                            "cassette_hash": cassette_hash,
+                            "authorized_by": authorized_by,
+                        })
                     elif record_kind == "decision_supersession":
                         # Item 6 -- mirrors supersede_decision(). authority was
                         # stored in authorized_by; corrected_output in decision_output.
@@ -2096,6 +3224,51 @@ class PostgreSQLLedger:
                             "authorized_by": authorized_by,
                             "shadow_run_hash": shadow_run_hash,
                         })
+                    elif record_kind == "human_selection":
+                        # F2 -- mirrors record_human_selection(). The
+                        # selection/rationale were stored in data;
+                        # recommendation_shown (looked up from the parent
+                        # governance_decision at write time, never
+                        # caller-supplied) in decision_output;
+                        # decision_hash has its own dedicated column, same
+                        # posture as shadow_run_hash -- see
+                        # canonical_fields.py. Without this branch a
+                        # human_selection row would fall through to the
+                        # legacy path and fail its own verification -- a
+                        # new record kind is not done until all three
+                        # recompute sites (writer, this, twin_custody) agree.
+                        d = self._as_json(data)
+                        canonical_entry = {
+                            "record_kind": "human_selection",
+                            "cassette_version": cassette_version,
+                            "human_selection": d.get("human_selection"),
+                            "rationale": d.get("rationale"),
+                            "recommendation_shown": self._as_json(decision_output),
+                            "previous_hash": stored_prev,
+                        }
+                        apply_optional_hashed_fields(canonical_entry, {
+                            "authorized_by": authorized_by,
+                            "decision_hash": decision_hash,
+                        })
+                    elif record_kind == "observed_event":
+                        # The persisted EventV1 stream -- mirrors the
+                        # observed_event loop in append_decision(). The event
+                        # body is stored verbatim in input_data; the FIXED
+                        # canonical form (no optional fields) is built by the
+                        # shared observed_event_canonical the writer and the
+                        # twin also call, so all three sites stay
+                        # byte-identical. Without this branch these rows fall
+                        # through to the legacy path and fail their own
+                        # verification -- a false DIVERGE indistinguishable
+                        # from tampering.
+                        canonical_entry = observed_event_canonical(
+                            self._as_json(input_data) or {}, stored_prev)
+                    elif record_kind == ATTESTATION_POLICY_RECORD_KIND:
+                        # The enforcement marker -- mirrors
+                        # record_attestation_policy(). Fixed canonical form
+                        # from the shared builder, like observed_event.
+                        canonical_entry = attestation_policy_canonical(
+                            self._as_json(data) or {}, reason, stored_prev)
                     else:
                         # Legacy path (append)
                         canonical_entry = {
@@ -2107,12 +3280,28 @@ class PostgreSQLLedger:
                             "data": self._as_json(data),
                             "previous_hash": stored_prev,
                         }
-                    
+
+                    # authorized_by_sig rides in EVERY record kind's canonical
+                    # form via the shared OPTIONAL_HASHED_FIELDS contract
+                    # (D5). Applied here once, at the single recompute point,
+                    # rather than threaded through each per-kind source dict
+                    # above -- exactly how twin_custody.recompute_current_hash
+                    # applies the shared contract to the whole row. Absent
+                    # (legacy rows, rows written with no key) -> omitted ->
+                    # byte-identical recompute to before this field existed.
+                    # The content pre-hash an abv3 signature covers: the
+                    # entry as rebuilt above, before the signature joins it.
+                    row_prehash = _content_prehash(canonical_entry)
+                    apply_optional_hashed_fields(
+                        canonical_entry,
+                        {_AUTHORIZED_BY_SIG_FIELD: authorized_by_sig},
+                    )
+
                     # Recompute hash from canonical form
                     recomputed_hash = hashlib.sha256(
                         json.dumps(canonical_entry, sort_keys=True, default=str).encode()
                     ).hexdigest()
-                    
+
                     # Check for tampering
                     if recomputed_hash != stored_current:
                         violations.append(
@@ -2120,12 +3309,113 @@ class PostgreSQLLedger:
                             f"(stored={stored_current[:8]}..., "
                             f"recomputed={recomputed_hash[:8]}...)"
                         )
-                    
+
+                    # TACK Layer 5 receipt checks, the same two the witness
+                    # runs (twin_custody.verify_subject_binding and
+                    # verify_shuffle_seed_row), so the primary verifier and
+                    # the witness agree. Both are independent of the chain
+                    # above: an attacker who recomputes current_hash after
+                    # moving a digest or choosing a seed is still caught,
+                    # because the digest is recomputed from the content and
+                    # the seed is re-derived under the key.
+                    if record_kind == "governance_decision" and subject_digest:
+                        try:
+                            expected_digest = cns_subject_digest(
+                                self._as_json(input_data) or {})
+                        except TypeError as exc:
+                            expected_digest = f"unencodable ({exc})"
+                        if expected_digest != subject_digest:
+                            violations.append(
+                                f"Entry {row_id}: TRANSPLANTED (subject_digest "
+                                f"{subject_digest[:8]}... was not issued for this "
+                                f"row's input_data; recomputed "
+                                f"{str(expected_digest)[:8]}...)"
+                            )
+                    if shuffle_seed:
+                        seed_status, seed_detail = _verify_shuffle_seed(
+                            shuffle_seed, stored_prev, record_kind, _att_keys)
+                        seed_ok = seed_status == _SEED_STATUS_OK or (
+                            seed_status == _SEED_STATUS_RETIRED_KEY and not _att_enforced)
+                        if not seed_ok:
+                            violations.append(
+                                f"Entry {row_id}: SEED_FORGED "
+                                f"({seed_detail or seed_status})"
+                            )
+
+                    # Keyed attestation check on the authorized_by claim.
+                    # Independent of the SHA-256 chain above: catches an
+                    # authorized_by edit even when current_hash was recomputed
+                    # to match. Only runs when this deployment holds at least
+                    # one attestation key. A NULL signature (unattested row) is
+                    # never a violation. INVALID (tampering) and UNKNOWN_KEY
+                    # (signed by a key we do not hold in any role) are always
+                    # violations; RETIRED_KEY (signed by a deliberately
+                    # distrusted key) is a violation only under enforcement.
+                    if not _att_keys.is_empty():
+                        att_status, att_detail = verify_authorized_by_signature(
+                            {
+                                "authorized_by": authorized_by,
+                                _AUTHORIZED_BY_SIG_FIELD: authorized_by_sig,
+                                "previous_hash": stored_prev,
+                                "record_kind": record_kind,
+                            },
+                            _att_keys,
+                            content_prehash=row_prehash,
+                        )
+                        if att_status == _ATT_STATUS_INVALID:
+                            violations.append(
+                                f"Entry {row_id}: authorized_by attestation "
+                                f"invalid ({att_detail})"
+                            )
+                        elif att_status == _ATT_STATUS_UNKNOWN_KEY:
+                            violations.append(
+                                f"Entry {row_id}: authorized_by signed by an "
+                                f"unrecognised key ({att_detail})"
+                            )
+                        elif (att_status == _ATT_STATUS_RETIRED_KEY
+                              and _att_enforced):
+                            violations.append(
+                                f"Entry {row_id}: authorized_by signed by a "
+                                f"retired key and attestation is enforced "
+                                f"({att_detail})"
+                            )
+
+                    # UNATTESTED: an accountable claim with no signature on a
+                    # row written after attestation was enforced. Presence,
+                    # not validity, so it needs no key; validity is the check
+                    # above. Rows before the marker are untouched.
+                    if (policy_from_row is not None and authorized_by
+                            and not authorized_by_sig):
+                        violations.append(
+                            f"Entry {row_id}: UNATTESTED (authorized_by "
+                            f"{authorized_by!r} carries no signature; attestation "
+                            f"has been enforced since entry {policy_from_row})"
+                        )
+                    if record_kind == ATTESTATION_POLICY_RECORD_KIND and policy_from_row is None:
+                        policy_from_row = row_id
+
                 except Exception as e:
                     violations.append(f"Entry {row_id}: hash recomputation failed ({e})")
-                
+
                 prev_hash = stored_current
-            
+
+            # TRUNCATED: the chain against its external head anchor, when
+            # one is configured. Fewer rows than the anchor sealed, or a
+            # different hash at the anchored position, means the tail was
+            # cut or the chain rebuilt; rows appended since are expected.
+            anchor_path = self._head_anchor_path()
+            if anchor_path:
+                try:
+                    anchor = read_head_anchor(anchor_path)
+                    failing = check_head_anchor(
+                        [{"id": r[0], "current_hash": r[3]} for r in rows],
+                        anchor, _att_keys)
+                except CustodyError as exc:
+                    failing = (None, "TRUNCATED", str(exc))
+                if failing is not None:
+                    where = f"Entry {failing[0]}" if failing[0] is not None else "Chain"
+                    violations.append(f"{where}: TRUNCATED ({failing[2]})")
+
             ok = len(violations) == 0
             
             if mode == "strict" and violations:
@@ -2138,7 +3428,173 @@ class PostgreSQLLedger:
             }
         finally:
             self.pool.putconn(conn)
-    
+
+    def reconstruct_decision(self, row_id: int) -> Dict[str, Any]:
+        """Replay a governance_decision from its persisted observed_event
+        stream and compare the recomputed assembly against what the row
+        recorded. Read-only: opens no write transaction, mutates nothing.
+
+        This is the payoff of persisting the events (append_decision's
+        observed_events arg): a decision row on its own can be shown to be
+        UNTAMPERED (verify_chain / the twin), but only replaying the
+        observations it was built from shows it is REPRODUCIBLE -- that the
+        recorded provenance map and estimated-field set are what
+        assemble_episode actually produces from those events.
+
+        Verifies the REDUCER layer only. Re-judging tier/score needs the
+        governing cassette rebuilt from its snapshot into a judgeable object,
+        which is not done here -- see the 'rejudged' key, always False for
+        now.
+
+        Returns a dict:
+          ok               -- bool: every checked field matched
+          reason           -- str: why not, when ok is False
+          row_id, episode_id, event_count
+          reducer_version_recorded / _current  -- and reducer_drift bool
+          checks           -- {field: {"recorded":.., "recomputed":.., "match":bool}}
+          rejudged         -- False (documented limitation)
+        """
+        try:
+            from event_v1 import (assemble_episode, make_event,
+                                  REDUCER_VERSION)
+        except Exception as exc:  # pragma: no cover - import wiring
+            return {"ok": False, "reason": f"event_v1 unavailable: {exc}",
+                    "row_id": row_id}
+
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT record_kind, input_data, cassette_version
+                FROM ledger_entries WHERE id = %s
+            """, (row_id,))
+            drow = cursor.fetchone()
+            if drow is None:
+                return {"ok": False, "reason": f"no ledger row with id {row_id}",
+                        "row_id": row_id}
+            record_kind, input_data, cassette_version = drow
+            if record_kind != "governance_decision":
+                return {"ok": False,
+                        "reason": f"row {row_id} is a {record_kind!r}, not a "
+                                  f"governance_decision",
+                        "row_id": row_id}
+
+            idata = self._as_json(input_data) or {}
+            kernel = idata.get("kernel") or {}
+            source_events = list(kernel.get("source_events") or [])
+            if not source_events:
+                return {"ok": False,
+                        "reason": "decision row carries no kernel.source_events -- "
+                                  "it was written before the observed-event layer, "
+                                  "or with observed_events omitted",
+                        "row_id": row_id}
+
+            cursor.execute("""
+                SELECT input_data FROM ledger_entries
+                WHERE record_kind = 'observed_event'
+                  AND input_data->>'event_id' = ANY(%s)
+            """, (source_events,))
+            bodies = [self._as_json(r[0]) or {} for r in cursor.fetchall()]
+
+            missing = set(source_events) - {b.get("event_id") for b in bodies}
+            if missing:
+                return {"ok": False,
+                        "reason": f"observed_event rows missing for "
+                                  f"{sorted(missing)!r} -- the stream is incomplete",
+                        "row_id": row_id, "event_count": len(bodies)}
+
+            episode_ids = {b.get("episode_id") for b in bodies}
+            if len(episode_ids) != 1:
+                return {"ok": False,
+                        "reason": f"events span episodes {sorted(episode_ids)!r}",
+                        "row_id": row_id, "event_count": len(bodies)}
+            episode_id = episode_ids.pop()
+            domain = (bodies[0].get("domain") if bodies else None) or "unknown"
+            reducer_recorded = sorted({b.get("reducer_version") for b in bodies})
+
+            events = [
+                make_event(
+                    event_id=b["event_id"], episode_id=b["episode_id"],
+                    domain=b["domain"], kind=b["kind"],
+                    occurred_at=b["occurred_at"], observed_at=b["observed_at"],
+                    source=b["source"], provenance=b["provenance"],
+                    fields=b.get("fields") or {}, method=b.get("method"),
+                    detail=b.get("detail") or {},
+                    schema_version=b.get("schema_version", 1),
+                    reducer_version=b.get("reducer_version"),
+                )
+                for b in bodies
+            ]
+
+            ep_inputs = kernel.get("episode_inputs") or {}
+            assembly = assemble_episode(
+                episode_id=episode_id, domain=domain,
+                requested=ep_inputs.get("requested") or {},
+                events=events,
+                outcome_reasons=tuple(ep_inputs.get("outcome_reasons") or ()),
+                attributes=ep_inputs.get("attributes") or {},
+            )
+
+            checks: Dict[str, Any] = {}
+            def _check(name, recorded, recomputed):
+                match = recorded == recomputed
+                checks[name] = {"recorded": recorded, "recomputed": recomputed,
+                                "match": match}
+                return match
+
+            _check("source_events",
+                   sorted(source_events), sorted(assembly.source_events))
+            if "field_provenance" in kernel:
+                _check("field_provenance",
+                       kernel.get("field_provenance"), assembly.provenance)
+            if "estimated_fields" in kernel:
+                _check("estimated_fields",
+                       sorted(kernel.get("estimated_fields") or []),
+                       sorted(assembly.estimated_fields))
+
+            failed = [k for k, v in checks.items() if not v["match"]]
+            # An ok verdict requires at least one CONTENT check (not just the
+            # event-id list): a row with tampered fields on every event but an
+            # intact source_events list would otherwise pass on nothing.
+            content_checked = bool({"field_provenance", "estimated_fields"}
+                                   & set(checks))
+            reducer_drift = (len(reducer_recorded) != 1
+                             or reducer_recorded[0] != REDUCER_VERSION)
+
+            if failed:
+                ok = False
+                reason = (f"replayed assembly diverges from the recorded summary "
+                          f"on: {', '.join(failed)}")
+            elif not content_checked:
+                ok = False
+                reason = ("decision summary carries no field_provenance or "
+                          "estimated_fields -- the event bodies cannot be "
+                          "verified against it, only their ids")
+            elif reducer_drift:
+                ok = False
+                reason = (f"assembly matched, but events were recorded under "
+                          f"reducer {reducer_recorded!r} and this build is "
+                          f"{REDUCER_VERSION!r} -- recomputed under the newer fold")
+            else:
+                ok = True
+                reason = ""
+
+            return {
+                "ok": ok,
+                "reason": reason,
+                "row_id": row_id,
+                "episode_id": episode_id,
+                "event_count": len(bodies),
+                "content_verified": content_checked and not failed,
+                "reducer_version_recorded": reducer_recorded,
+                "reducer_version_current": REDUCER_VERSION,
+                "reducer_drift": reducer_drift,
+                "checks": checks,
+                "rejudged": False,
+            }
+        finally:
+            self.pool.putconn(conn)
+
     def sid_exists(self, call_sid: str) -> bool:
         """Check whether a call with this sid has already been recorded.
 
@@ -2153,6 +3609,36 @@ class PostgreSQLLedger:
             cursor.execute(
                 "SELECT 1 FROM ledger_entries WHERE call_sid = %s LIMIT 1;",
                 (call_sid,)
+            )
+            return cursor.fetchone() is not None
+        finally:
+            self.pool.putconn(conn)
+
+    def episode_decision_exists(self, episode_id: str) -> bool:
+        """Check whether a governance_decision for this episode_id has
+        already been recorded.
+
+        Same role as sid_exists above, for consumers built on
+        GovernanceHarness's domain-agnostic Episode path instead of the
+        telephony call_sid column: a redelivery-safe pre-check a caller
+        runs BEFORE invoking GovernanceHarness.process() again, so a
+        crash-between-commit-and-ack redelivery is recognized as
+        already-done rather than written a second time.
+        episode_id lives inside the JSONB input_data column
+        (GovernanceHarness._write_decision's record shape), not a
+        dedicated column the way call_sid is -- there is no unique
+        index backstopping this one, so a caller relying on it for
+        correctness under real concurrency (not just crash recovery)
+        would need one; this is the same pre-check-only posture
+        sid_exists documents for its own DB-level backstop.
+        """
+        conn = self.pool.getconn()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM ledger_entries WHERE record_kind = 'governance_decision' "
+                "AND input_data->>'episode_id' = %s LIMIT 1;",
+                (episode_id,)
             )
             return cursor.fetchone() is not None
         finally:

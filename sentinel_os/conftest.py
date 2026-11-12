@@ -23,6 +23,27 @@ _PG_OWNER = dict(host="localhost", port=5432, dbname="iceberg",
                   user="iceberg", password="iceberg")
 _LEDGER_READER_TEST_PASSWORD = "ledger_reader_test_pw"
 
+# The ledger enforces authorized_by attestation by default: it refuses to start
+# without a signing key, and it has no default key. The suite runs in that real
+# configuration. Unless the run configures its own key, a key file, or the
+# dev-only override, each session signs with a fresh random key generated here.
+# Nothing is hard-coded and nothing outlives the session.
+if not (os.environ.get("ICEBERG_LEDGER_ATTESTATION_KEY")
+        or os.environ.get("ICEBERG_LEDGER_ATTESTATION_KEY_FILE")
+        or os.environ.get("ICEBERG_LEDGER_ATTESTATION_DEV_OVERRIDE")):
+    import secrets
+    os.environ["ICEBERG_LEDGER_ATTESTATION_KEY"] = secrets.token_hex(32)
+
+# The ledger refuses a governance decision that arrives without the episode it
+# was judged from, because the conservation boundary needs the episode and the
+# ledger is the point of durability. Most tests in this suite test the ledger
+# itself (chain, receipts, attestation) and append hand-built records with no
+# episode, so the suite runs with the dev-only override on. A decision that DOES
+# arrive with an episode is verified regardless of the override, and the test
+# that proves enforcement (test_ledger_conservation_boundary.py) switches the
+# override off for itself.
+os.environ.setdefault("ICEBERG_LEDGER_CONSERVATION_DEV_OVERRIDE", "1")
+
 
 def _pg_available() -> bool:
     try:

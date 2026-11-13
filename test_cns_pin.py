@@ -7,7 +7,7 @@ from pathlib import Path
 import cns_connector
 
 ROOT = Path(__file__).resolve().parent
-PIN = "cns @ git+https://github.com/wking53214/CNS.git@v3.0.0"
+PIN = "cns @ git+https://github.com/wking53214/CNS.git@v4.0.0"
 
 
 def test_requirements_cns_pins_exactly_the_release():

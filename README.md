@@ -1,16 +1,65 @@
 # OBSERVE
 
-Industry-agnostic **observation and state-assessment** architecture. The principal demonstration is physiological/clinical monitoring — a representative application, not the definition.
+Observation and state-assessment code for ≡TACK, with pediatric physiological monitoring as the worked example. **Not for clinical use.** It has not been clinically validated or reviewed by a clinician, and it is not a medical device.
 
-## 1. Pipeline Position & Role
+Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at commit `32d5620`. This repo's history was rewritten after the 2026-11-15 review; every root file is unchanged by that rewrite. License: Apache-2.0 (`LICENSE`).
+
+## Role Within ≡TACK
+
+- **What it is.** The observation stage: it turns vitals into a regime, risk score and an escalation flag. It is a downstream copy of the engine in `observe-perceive`, plus OBSERVE-only wiring (`observe_engine_gate.py`, `observe_clinical_risk_adapter.py`, `cns_connector.py`).
+- **What it owns.** The choice of when the behavioral engine runs (`observe_engine_gate.py`, currently the `conservative_legacy` rule), and its own clinical adapter wiring. It does not own the engine: `observe_consolidated.py` is a byte-for-byte copy of observe-perceive `e818659`.
+- **What it contributes.** The observation concept and a reference for the extracted detectors in `interconnected_alpha` and `interconnected_zeta`.
+- **What it does not own.** Authorization, execution, custody, admission, or the orchestrator (observe-perceive). It does not own policy, but PERCEIVE policy files sit in this tree.
+- **Depends on.** observe-perceive (engine source), sentinel_os and GSA-815 (the nested `sentinel_os/` tree). Optional CNS v4.0.0 for the connector (`requirements-cns.txt`).
+- **Depended on by.** UNKNOWN. No consumer was found or inspected.
+- **Verified versus declared.** Verified: root copy matches its pins (`VENDORED.md`, checked by `test_observe_invariants.py`). Declared only: the planned order below and the "paired with PERCEIVE" relationship. Nothing in this repo is on the orchestrator path (observe-perceive's `GovernanceOrchestrator`).
+- **Governance and control design.** OBSERVE's output is evidence, not authority. A regime or escalation flag is a signal for a downstream stage. It is not a decision.
+
+## Known upstream fixes this copy lacks
+
+The root engine is observe-perceive `e818659`. observe-perceive's history has since been rewritten, so the two ids this repo's documents use for its engine, `e818659` and `717c2e2`, are no longer on any of its branches. Their twins, with the same date, subject and engine file, are `bca7a70` and `59f87b4` (VERIFIED 2026-11-19). Upstream has since changed `observe_consolidated.py`: 190 lines added and 13 removed by `827a42a` (2026-11-15), and 626 added and 76 removed by its head `b4f4c62` (INSPECTED with `git diff` from `bca7a70`, 2026-11-19). Four escalation changes that were upstream on 2026-11-15 matter to anyone reading OBSERVE output:
+
+- The post-escalation cooldown could hide a real severity increase (for example WARNING to CRITICAL). Upstream now treats a severity increase as a new escalation.
+- A patient already escalated whose candidate regime is higher now acts on the first reading, with no dwell. This copy still applies dwell.
+- Upstream restores escalation state when a reading is not recorded. This copy can mark a patient "already escalated, locked" for a reading no ledger holds.
+- A hard rule (for example low oxygen) can be averaged away when a reading arrives with previous-reading history, or with no usable age. EXECUTED 2026-11-16 on this copy, through `observe_engine_gate.make_engine`: a 24-month-old with SpO2 86, temperature 39.1, heart rate 138 and respiratory rate 34 was rated STABLE with no escalation when the reading carried history, and WARNING with escalation when it did not. The same reading with the age missing, negative or not a number was also STABLE with no escalation, although the `CRITICAL_O2` rule fired. Upstream now holds a confirmed hard rule at WARNING (observe-perceive PR #79, merged as `e8dd575`), and returned WARNING with escalation for the missing-age reading at `e56244c`, the commit that is now `827a42a` (EXECUTED at review).
+
+This list is not complete. Fourteen more upstream commits (fifteen counting one merge) changed the engine after `827a42a`, up to its head `b4f4c62` (among them a WARNING floor for patients outside the supported age range and changed policy defaults; INSPECTED from commit titles only). Do not use this repo's escalation output where those cases matter. Syncing is an owner decision (`RECONCILE_UPSTREAM_PLAN.md`).
+
+## Pipeline position
 
 **OBSERVATION.** Evidence-bearing state assessment. Does not authorize.
+
+What runs today is observe-perceive's `GovernanceOrchestrator` (INSPECTED in its `governance_orchestrator.py` at `b4f4c62`, 2026-11-19). It uses observe-perceive's own copy of the engine. It does not import this repo.
+
+```text
+(caller)  optional Governance_Gateway admission, passed in
+   │
+   ▼
+OBSERVE assessment            observe-perceive's observe_consolidated (dwell and cooldown locks are inside it)
+   ▼
+admission and source-time checks
+   ▼
+PERCEIVE
+   ▼
+fortress-kernel containment   opt-in
+   ▼
+Conservation_Kernel
+   ▼
+execution approval and scope check
+   ▼
+executor (execution_guard), then the audit-chain link
+```
+
+### Planned order (design, not what runs)
 
 ```text
 Admission → OBSERVE (this repo / observe_consolidated) → Locks → PERCEIVE → Decision → Conservation → Execution → Custody
 ```
 
-Paired with PERCEIVE inside [`observe-perceive`](https://github.com/wking53214/observe-perceive). Named-Keys extraction: [`interconnected_alpha`](https://github.com/wking53214/interconnected_alpha). This repository is **not** the live orchestrator; it is the observation concept plus a large amount of vendored history.
+This is the order the architecture text describes. It differs from what runs: OBSERVE runs before the admission check, the locks are part of OBSERVE, and the engine that runs is observe-perceive's, not this repo's.
+
+Paired with PERCEIVE inside [`observe-perceive`](https://github.com/wking53214/observe-perceive). Named-Keys extraction: [`interconnected_alpha`](https://github.com/wking53214/interconnected_alpha). This repository is **not** on the orchestrator path; it is the observation concept plus a large amount of vendored history.
 
 ## 2. Full System Scope & Architectural Depth
 
@@ -28,7 +77,7 @@ What actually lives in this checkout:
 |---|---|
 | `observe_consolidated.py` | The OBSERVE engine: RiskAdapters, EscalationPolicy, fusion. **Copied byte-for-byte from observe-perceive `e818659`** (never edited here), with its four sibling modules `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py` and `governance_contracts.py`. |
 | `observe_engine_gate.py` | OBSERVE's own: the one place that chooses when the behavioral engine runs (`conservative_legacy`, OBSERVE's rule, until a pediatrician signs off upstream's widened rule). |
-| `observe_clinical_risk_adapter.py` and `clinical_*` | Clinical wiring. |
+| `observe_clinical_risk_adapter.py` and `clinical_*` | Clinical wiring. Three files in this tree do not import (EXECUTED 2026-11-16): `clinical_capacity_orchestration_source.py` needs a `perceive_consolidated` module that is not here, and `clinical_governance_ledger_source.py` and `perceive_policy_enforcement_source.py` are reconstructed files that raise a SyntaxError. No root test covers the capacity, ledger or policy adapters. |
 | `perceive_policy_enforcement_*` | PERCEIVE copies / flattened sources — **policy code in an observation repo**. |
 | `sentinel_os/` | A **vendored historical tree** of sentinel_os: patches (`APPLY-*.md`, `0001-*.patch`), Docker, tests, governance, cassettes. Not a clean observation library. |
 | `docs/CLINICAL_SCORING.md` | Scoring notes. |
@@ -81,4 +130,27 @@ sentinel_os/ (nested, stale)   ──✗ not──►  wking53214/sentinel_os (L
 
 See `VENDORED.md` / `UPSTREAM.md` if present for the intended relationship.
 
-Apache-2.0.
+## Install and quick start
+
+No installable package: there is no `pyproject.toml`. Run the root suite from a checkout:
+
+```
+pip install pytest
+python -m pytest -q test_*.py
+```
+
+The nested `sentinel_os/` suite runs as a CI step that needs Redis and Postgres (`.github/workflows/tests.yml`). That step is marked non-blocking, and the workflow's own comment says the suite fails until the reconcile plan is done, so a green CI run says nothing about it. It was not run for this README. The blocking root step names four test files; `test_observe_gate_sync.py` and `test_domain_signal_validator.py` are in no CI step (INSPECTED).
+
+## Testing and verification
+
+EXECUTED 2026-11-15 (Python 3.13), root suite `test_*.py`: 155 passed, 1 skipped. Same result on 2026-11-19 at `32d5620`, and 186 passed with `requirements-cns.txt` installed. That covers the root engine copy, the invariants and pin test, the clinical adapter, the engine gate and the CNS connector. It does not show the engine is clinically correct. The nested `sentinel_os/` suite was not run (UNKNOWN). Clinical skips recorded upstream are not closed here.
+
+## Failure behavior and trust
+
+Missing evidence is meant to abstain, not read as normal. EXECUTED 2026-11-16 through `make_engine`: a missing or non-numeric vital sign gave WARNING with escalation and a `DATA_INTEGRITY_FAULT` finding. A missing or invalid age is the exception and fails open: a critical oxygen reading was rated STABLE (see "Known upstream fixes this copy lacks"). Context trust-boundary handling (`sanitize_context`) is in this copy: `observe_consolidated.py` defines it and `evaluate` calls it (INSPECTED 2026-11-16). `UPSTREAM.md` still says this copy lacks it; that text describes the 2026-09-07 state.
+
+## Documentation
+
+`UPSTREAM.md` and `VENDORED.md` (what is copied and from where), `RECONCILE_UPSTREAM_PLAN.md`, `RECONCILE_HARNESS_PLAN.md`, `RESILIENCE_INTEGRATION_ASSESSMENT.md`, `TROUBLESHOOTING.md`, `CONTRIBUTING.md`, `docs/CLINICAL_SCORING.md` (for clinical review; not yet reviewed), `docs/CHANGELOG.md`.
+
+Maintainer: William N. King.

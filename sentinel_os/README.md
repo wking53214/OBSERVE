@@ -1,3 +1,5 @@
+> **This is a vendored copy, not the live project.** It is a historical snapshot of `sentinel_os` and `observe-perceive` files kept inside OBSERVE. It can be stale. See `UPSTREAM.md` and `VENDORED.md` at the repo root. Not for clinical use.
+
 # GSA Governance Operating Core (Enterprise)
 
 **Version:** 5.0.0  

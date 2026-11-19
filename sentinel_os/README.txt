@@ -1,3 +1,5 @@
+NOTE: This is a vendored copy, not the live project. See UPSTREAM.md and VENDORED.md at the repo root.
+
 Two independent patches against origin/main (5fb20b3), verified to apply
 cleanly with `git apply --check` against a fresh checkout.
 

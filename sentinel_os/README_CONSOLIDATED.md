@@ -1,3 +1,5 @@
+> **This is a vendored copy, not the live project.** It is a historical snapshot of `sentinel_os` and `observe-perceive` files kept inside OBSERVE. It can be stale. See `UPSTREAM.md` and `VENDORED.md` at the repo root. Not for clinical use.
+
 # OBSERVE + PERCEIVE — Consolidated Clinical Governance System
 
 A pediatric physiological early-warning system (**OBSERVE**) wired to an

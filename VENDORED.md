@@ -6,6 +6,8 @@ Status note (2026-11-15): the pins below were last checked against this repo, no
 
 Status note (2026-11-19): observe-perceive's history has been rewritten. `e818659` and `717c2e2` are no longer on any of its branches; their twins (same date, subject and engine file) are `bca7a70` and `59f87b4`. The 70 rows for files that this repo's own history rewrite removed have been taken out of the table below (owner decision of 2026-11-18). Four other rows name files that later ordinary commits deleted; they are left as they are. The 2026-09-07 counts in the next line were not recomputed.
 
+Status note (2026-11-20): four rows named files that are no longer in this repository (`sentinel_os/test_api_server_v2-1.py`, `sentinel_os/test_governor_failclosed_root.py`, `sentinel_os/rl_ingress_8110.log`, `sentinel_os/Tests/test_queue_staffing_bayes.py`) and were removed. The counts in the "Generated 2026-09-07" line below describe the tree at that date and were not recomputed.
+
 Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'identical': 140} of 402 files.
 
 ## Temporary stopgap (owner-approved 2026-10-29): pins instead of byte-identity
@@ -76,7 +78,6 @@ OBSERVE's own and is not a copy.
 | `sentinel_os/event_v1.py` | sentinel_os | diverged |
 | `sentinel_os/cage_match_brief_v1.md` | (none) | unique |
 | `sentinel_os/observe_consolidated.py` | observe-perceive | identical |
-| `sentinel_os/test_api_server_v2-1.py` | (none) | unique |
 | `sentinel_os/production_harness.py` | GSA-815 | diverged |
 | `sentinel_os/ivr-events-ingestion-contract.diff` | (none) | unique |
 | `sentinel_os/test_sentinel_worker.py` | sentinel_os | diverged |
@@ -163,7 +164,6 @@ OBSERVE's own and is not a copy.
 | `sentinel_os/metrics_prometheus.py` | GSA-815 | identical |
 | `sentinel_os/.gitignore` | sentinel_os | diverged |
 | `sentinel_os/readme-staleness-pass-2.bundle` | (none) | unique |
-| `sentinel_os/test_governor_failclosed_root.py` | (none) | unique |
 | `sentinel_os/_.gitignore` | (none) | unique |
 | `sentinel_os/GSA.py` | (none) | unique |
 | `sentinel_os/api_server_resilient.py` | GSA-815 | identical |
@@ -180,7 +180,6 @@ OBSERVE's own and is not a copy.
 | `sentinel_os/COMPLIANCE.md` | sentinel_os | diverged |
 | `sentinel_os/twin_detector.py` | sentinel_os | identical |
 | `sentinel_os/twin_verification_report_v1-1.md` | (none) | unique |
-| `sentinel_os/rl_ingress_8110.log` | (none) | unique |
 | `sentinel_os/api_server_v2_verification_report_v1.md` | (none) | unique |
 | `sentinel_os/regulatory-cassette-framework.bundle` | (none) | unique |
 | `sentinel_os/README_CONSOLIDATED.md` | (none) | unique |
@@ -314,7 +313,6 @@ OBSERVE's own and is not a copy.
 | `sentinel_os/Tests/test_rl_learning.py` | GSA-815 | identical |
 | `sentinel_os/Tests/test_ivr_events_contract.py` | GSA-815 | identical |
 | `sentinel_os/Tests/test_c2_input_side_checkers.py` | sentinel_os | identical |
-| `sentinel_os/Tests/test_queue_staffing_bayes.py` | GSA-815 | identical |
 | `sentinel_os/Tests/test_ledger_boot_lock.py` | sentinel_os | identical |
 | `sentinel_os/Tests/test_observe_perceive.py` | (none) | unique |
 | `sentinel_os/Tests/test_twin_receiver_auth.py` | sentinel_os | diverged |

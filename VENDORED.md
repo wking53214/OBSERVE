@@ -13,9 +13,9 @@ Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'ide
 ## Temporary stopgap (owner-approved 2026-10-29): pins instead of byte-identity
 
 The root `observe_consolidated.py` and `sentinel_os/observe_consolidated.py` are not byte-identical today, and are not
-meant to be until PR-3 and PR-4 of `RECONCILE_UPSTREAM_PLAN.md` land. Since PR-2 the root engine is observe-perceive
-`e8186599e2399157feaa1592bf1399ff37d5c3d2` (the merge of #67), copied byte-for-byte together with four sibling modules and never edited here. The
-`sentinel_os/` copy has been the same upstream engine since PR-3 (re-synced 2026-11-19 from `bca7a70`). The original assertion that the two are identical has
+meant to be until PR-3 and PR-4 of `RECONCILE_UPSTREAM_PLAN.md` land. Since PR-2b the root engine is observe-perceive
+`d5962621321c791e79129bcfb807b5ee6e9eaa58`, copied byte-for-byte together with seven sibling modules and never edited here. The
+`sentinel_os/` copy is the older upstream engine `bca7a70` (PR-3, 2026-11-19) and was NOT moved to `d596262`. The original assertion that the two are identical has
 therefore been replaced, for now, by pins on both:
 
 | Pin | File | Upstream commit | sha256 |

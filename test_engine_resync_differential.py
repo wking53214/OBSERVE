@@ -166,6 +166,32 @@ class ParityWithTheOldEngine(_Base):
         self.assertEqual([r for r in self.legacy_rows if "error" in r], [])
 
 
+class TheSevenLessCautiousReadings(_Base):
+    """Pins today's output for the readings docs/ENGINE_RESYNC_DISPOSITIONS.md lists as PENDING clinical review.
+    This records behavior; it does not claim the behavior is clinically right."""
+
+    PINNED = {  # reading: (regime, escalation, unassessable)
+        148: ("critical", False, False),
+        330: ("critical", False, True),
+        353: ("critical", False, False),
+        378: ("stable", False, False),
+        398: ("stable", False, False),
+        481: ("critical", False, False),
+        585: ("warning", False, True),
+    }
+
+    def test_the_new_engines_output_for_each_reading_is_pinned(self):
+        for i, (regime, esc, unassess) in self.PINNED.items():
+            row = self.legacy_rows[i]
+            self.assertEqual((row["regime"], row["esc"], row["unassess"]), (regime, esc, unassess), msg=f"reading {i}")
+
+    def test_the_disposition_document_lists_every_reading_as_pending(self):
+        text = (pathlib.Path(__file__).parent / "docs" / "ENGINE_RESYNC_DISPOSITIONS.md").read_text(encoding="utf-8")
+        for i in self.PINNED:
+            row = next(line for line in text.splitlines() if line.startswith(f"| {i} |"))
+            self.assertIn("PENDING clinical review", row, msg=f"reading {i}")
+
+
 class TheGateMatters(_Base):
     def test_upstreams_widened_rule_selects_the_behavioral_engine_more_often(self):
         widened_rows = _run(ObserveClinicalEngine())  # upstream's default: widened_provisional

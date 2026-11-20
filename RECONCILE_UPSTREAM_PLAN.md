@@ -1,6 +1,6 @@
 # Plan: reconcile OBSERVE's engine with observe-perceive (option C, upstream first)
 
-Status: **PLAN ONLY.** Nothing here has been executed. The only change made so far is the stopgap on this branch
+Status (updated 2026-11-19): **PR-2/PR-2b (root engine, now `d596262`) and PR-3 (`sentinel_os/` at `bca7a70`) are done; the root re-sync was merged before clinical review. PR-4 and the rest below are open. The text below is the original 2026-10-29 plan and describes the pre-merge state.** Original status: PLAN ONLY. Nothing here had been executed. The only change made so far is the stopgap on this branch
 (`test_observe_invariants.py::VendoredCopyStaysInSync` and the pin in `VENDORED.md`). observe-perceive was read, never edited.
 Date: 2026-10-29.
 

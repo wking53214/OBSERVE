@@ -521,14 +521,17 @@ class VendoredCopyStaysInSync(unittest.TestCase):
     between root and sentinel_os/ is restored by PR-4 of RECONCILE_UPSTREAM_PLAN.md.
     """
 
-    # Root: observe-perceive e8186599 (merge of #67). Also recorded in VENDORED.md.
-    ROOT_UPSTREAM_COMMIT = "e8186599e2399157feaa1592bf1399ff37d5c3d2"
+    # Root: observe-perceive d5962621321c791e79129bcfb807b5ee6e9eaa58 (main on 2026-11-19; re-synced by PR-4 of RECONCILE_UPSTREAM_PLAN.md). Also recorded in VENDORED.md.
+    ROOT_UPSTREAM_COMMIT = "d5962621321c791e79129bcfb807b5ee6e9eaa58"
     ROOT_PINS = {
-        "observe_consolidated.py": "0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566",
-        "cassette.py": "7e5465d65e2095df547641bd4d814ef496d3d9ac3f81e8ac77c14fb6055965d4",
-        "pediatric_cassette.py": "71774badff2c698e694c61189ec59003b23c288b0efe215304d88d987e991f20",
+        "observe_consolidated.py": "cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b",
+        "cassette.py": "71b68245390e6f0706f57546839dbd3c28982d98ed522b1e81df88e3af24f8af",
+        "pediatric_cassette.py": "af9d14d3559849a3e50d8e86c5ca6ef15588e929f4a4f80dfe1ecdd2c34d0157",
         "kalman_trajectory.py": "03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a",
-        "governance_contracts.py": "2145fb7d4daf1e99e74858a92bd86185650fcf6debb470273411a280091e1aca",
+        "governance_contracts.py": "b483c91bab6a39f2180b69006bad43c525128b3d749b40e1d9db121c4f99b7e2",
+        "clinical_settings.py": "62e06d7cce792e431695720dc20d639c9d1921fbdd070ba6c501ad553b3a9d71",
+        "log_redaction.py": "8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12",
+        "logic_stamp.py": "ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b",
     }
     # sentinel_os/: observe-perceive bca7a70 (twin of e818659), observe_consolidated.py. Also recorded in VENDORED.md.
     SNAPSHOT_COMMIT = "bca7a70"

@@ -74,8 +74,14 @@ class TestRuleModificationPolicy(unittest.TestCase):
         self.assertTrue(any("Temporal lock" in v for v in violations))
 
     def test_safety_critical_requires_three_approvals(self):
+        # Two approvals are refused AND three are accepted. Asserting only the
+        # refusal passed with the threshold set to 100: the test could not tell
+        # "three required" from "never allowed".
         approved, violations = RuleModificationPolicy.can_modify("safety_critical", 2, 100)
         self.assertFalse(approved)
+        self.assertTrue(any("2/3" in v for v in violations), violations)
+        approved, violations = RuleModificationPolicy.can_modify("safety_critical", 3, 100)
+        self.assertTrue(approved, violations)
 
     def test_valid_modification_approved(self):
         approved, violations = RuleModificationPolicy.can_modify("critical", 2, 25)
@@ -489,16 +495,16 @@ class TestDGKSigning(unittest.TestCase):
     def test_sign_and_verify_roundtrip(self):
         key = secrets.token_bytes(32)
         payload = {"node_id": "n1", "decision": {"approved": True}, "timestamp": "2026-01-01T00:00:00+00:00"}
-        sig = Signer.sign(payload, key, "node-a")
+        sig = Signer.sign(payload, key)
         payload["_sig"] = sig
-        self.assertTrue(Signer.verify(payload, key, "node-a"))
+        self.assertTrue(Signer.verify(payload, key))
 
     def test_verify_fails_with_wrong_key(self):
         key = secrets.token_bytes(32)
         wrong_key = secrets.token_bytes(32)
         payload = {"node_id": "n1", "decision": {"approved": True}, "timestamp": "2026-01-01T00:00:00+00:00"}
-        payload["_sig"] = Signer.sign(payload, key, "node-a")
-        self.assertFalse(Signer.verify(payload, wrong_key, "node-a"))
+        payload["_sig"] = Signer.sign(payload, key)
+        self.assertFalse(Signer.verify(payload, wrong_key))
 
 
 class TestDGKConsensus(unittest.TestCase):

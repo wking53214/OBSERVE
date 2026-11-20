@@ -22,8 +22,10 @@ import hmac
 import json
 import logging
 import math
+import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from governance_contracts import compute_state_commitment
@@ -576,12 +578,62 @@ class ManifestRegistry:
 # IMMUTABLE AUDIT LEDGER (SHA256 cryptographic chain)
 # ============================================================================
 
-class ImmutableAuditLedger:
-    """Append-only audit trail with SHA256 chaining."""
+class AuditLedgerIntegrityError(Exception):
+    """A persisted PERCEIVE ledger does not recompute. Nothing is loaded."""
 
-    def __init__(self):
+
+class ImmutableAuditLedger:
+    """Append-only audit trail with SHA256 chaining.
+
+    With a `path` (1.3.0) every entry is appended to a JSONL file as it is
+    made and the file is reloaded, chain re-verified, on construction, so
+    `decision.in_perceive_ledger` can be re-checked after a restart. Until
+    then the ledger lived only in this process and the spine's verifier had
+    to skip that check on any record older than the process.
+    """
+
+    def __init__(self, path=None):
         self.entries: List[AuditEntry] = []
         self.chain_head = hashlib.sha256(b"PERCEIVE_GENESIS").hexdigest()
+        self.path = Path(path) if path else None
+        if self.path and self.path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        for line_no, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            raw["timestamp"] = datetime.fromisoformat(raw["timestamp"])
+            entry = AuditEntry(**raw)
+            if entry.previous_hash != self.chain_head:
+                raise AuditLedgerIntegrityError(f"{self.path}:{line_no}: previous-hash link broken")
+            if self._hash(entry) != entry.immutable_hash:
+                raise AuditLedgerIntegrityError(f"{self.path}:{line_no}: entry hash does not recompute")
+            self.entries.append(entry)
+            self.chain_head = entry.immutable_hash
+
+    @staticmethod
+    def _hash(entry: "AuditEntry") -> str:
+        entry_dict = {
+            "audit_id": entry.audit_id,
+            "timestamp": entry.timestamp.isoformat(),
+            "evaluated_gates": entry.evaluated_gates,
+            "final_verdict": entry.final_verdict,
+        }
+        combined = entry.previous_hash + hashlib.sha256(json.dumps(entry_dict, sort_keys=True, default=str).encode()).hexdigest()
+        return hashlib.sha256(combined.encode()).hexdigest()
+
+    def _persist(self, entry: "AuditEntry") -> None:
+        if not self.path:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        raw = asdict(entry)
+        raw["timestamp"] = entry.timestamp.isoformat()
+        # Owner-only, and refuses a symlink at the path.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(self.path, flags, 0o600), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(raw, sort_keys=True, default=str) + "\n")
 
     def append_decision(
         self,
@@ -607,17 +659,11 @@ class ImmutableAuditLedger:
             previous_hash=self.chain_head,
         )
 
-        entry_dict = {
-            "audit_id": entry.audit_id,
-            "timestamp": entry.timestamp.isoformat(),
-            "evaluated_gates": entry.evaluated_gates,
-            "final_verdict": entry.final_verdict,
-        }
-        combined = self.chain_head + hashlib.sha256(json.dumps(entry_dict, sort_keys=True, default=str).encode()).hexdigest()
-        entry.immutable_hash = hashlib.sha256(combined.encode()).hexdigest()
+        entry.immutable_hash = self._hash(entry)
 
         self.chain_head = entry.immutable_hash
         self.entries.append(entry)
+        self._persist(entry)
         return entry
 
     def verify_chain_integrity(self) -> bool:
@@ -658,31 +704,19 @@ def _public_view(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class Signer:
-    """HMAC-SHA256 signing for multi-node proposals, under a caller-named key ID."""
-
-    ALGORITHM = "hmac-sha256"
+    """HMAC signing for multi-node proposals."""
 
     @staticmethod
-    def _value(payload: Dict[str, Any], key: bytes) -> str:
+    def sign(payload: Dict[str, Any], key: bytes) -> str:
         data = _canonical_json(_public_view(payload)).encode()
         return hmac.new(key, data, hashlib.sha256).hexdigest()
 
     @staticmethod
-    def sign(payload: Dict[str, Any], key: bytes, key_id: str) -> Dict[str, str]:
-        """The stack-wide signature block: algorithm, key ID and value together."""
-        if not key_id:
-            raise ValueError("Signer.sign needs a caller-named key_id")
-        return {"algorithm": Signer.ALGORITHM, "key_id": key_id, "value": Signer._value(payload, key)}
-
-    @staticmethod
-    def verify(payload: Dict[str, Any], key: bytes, key_id: str) -> bool:
-        block = payload.get("_sig")
-        if not isinstance(block, dict) or block.get("algorithm") != Signer.ALGORITHM:
+    def verify(payload: Dict[str, Any], key: bytes) -> bool:
+        sig = payload.get("_sig")
+        if not isinstance(sig, str):
             return False
-        if block.get("key_id") != key_id:
-            return False
-        value = block.get("value")
-        return isinstance(value, str) and hmac.compare_digest(value, Signer._value(payload, key))
+        return hmac.compare_digest(sig, Signer.sign(payload, key))
 
 
 @dataclass
@@ -691,11 +725,11 @@ class Proposal:
     node_id: str
     decision: Dict[str, Any]
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    signature: Any = None
+    signature: str = ""
 
-    def sign(self, key: bytes, key_id: str) -> None:
+    def sign(self, key: bytes) -> None:
         payload = {"node_id": self.node_id, "decision": self.decision, "timestamp": self.timestamp.isoformat()}
-        self.signature = Signer.sign(payload, key, key_id)
+        self.signature = Signer.sign(payload, key)
 
 
 def _l1_distance(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -742,7 +776,7 @@ class ConsensusDecider:
             # payload["_sig"] and Signer.sign strips "_"-prefixed keys via _public_view,
             # so the reconstructed payload must carry the signature to compare against.
             payload = {"node_id": p.node_id, "decision": p.decision, "timestamp": p.timestamp.isoformat(), "_sig": p.signature}
-            if not Signer.verify(payload, key_map[p.node_id], p.node_id):
+            if not Signer.verify(payload, key_map[p.node_id]):
                 raise RuntimeError(f"Signature verification failed for {p.node_id}")
 
         clusters = _cluster_proposals(proposals)
@@ -773,7 +807,7 @@ class GovernanceNode:
 
     def propose(self, decision: Dict[str, Any]) -> Proposal:
         proposal = Proposal(node_id=self.node_id, decision=decision)
-        proposal.sign(self.key, self.node_id)
+        proposal.sign(self.key)
         return proposal
 
 
@@ -885,10 +919,13 @@ class PerceiveGovernanceKernel:
     POLICY_GATES = {"escalation_rate_policy", "data_export_policy", "rule_modification_policy"}
 
     def __init__(self, dgk_gateway: Optional[DGKGateway] = None,
-                 enforcement: Optional[PolicyEnforcementConfig] = None):
+                 enforcement: Optional[PolicyEnforcementConfig] = None,
+                 ledger_path=None):
         self.manifest_registry = ManifestRegistry()
         self.event_store = EventStore()
-        self.audit_ledger = ImmutableAuditLedger()
+        # ledger_path (1.3.0): persist the audit ledger so a decision made
+        # before a restart can still be found in it afterwards.
+        self.audit_ledger = ImmutableAuditLedger(path=ledger_path)
         self.dgk_gateway = dgk_gateway  # Optional multi-node consensus for critical decisions
         self.enforcement = enforcement or PolicyEnforcementConfig()  # WS2a: default advisory
         self.gov_state = GovernanceState()  # WS2a: deterministic rate-limit history
@@ -916,7 +953,7 @@ class PerceiveGovernanceKernel:
             gates.extend(["micropatch", "sentinel"])
         elif request.request_type == "approve_decision":
             # A named person recording a decision about an artifact (the
-            # innovation_os approval path). citadel checks the reviewer
+            # approval_governance_adapter path). citadel checks the reviewer
             # actually gave a substantive rationale rather than a rubber
             # stamp; invariant_validator checks the governance invariants
             # still hold; sentinel catches anomalous approval behaviour such
@@ -988,6 +1025,32 @@ class PerceiveGovernanceKernel:
         return self._advisory_output("rule_modification_policy", ok,
                                      self.enforcement.enforce_rule_modification,
                                      violations, "rule_modification")
+
+    def record_evaluation_failure(self, request: PolicyRequest, error: Exception) -> str:
+        """Record an unavailable evaluation as non-approving audit evidence."""
+        manifest = self.manifest_registry.get_current_manifest()
+        failure = {
+            "approved": False,
+            "status": "unavailable",
+            "error": f"{type(error).__name__}: {error}",
+            # The audit hash covers final_verdict, so include the request here too.
+            "request_snapshot": asdict(request),
+        }
+        entry = self.audit_ledger.append_decision(
+            request_snapshot=asdict(request),
+            evaluated_gates=[],
+            policy_outputs=[],
+            final_verdict=failure,
+            manifest_version=manifest.version if manifest else "",
+            manifest_hash=manifest.manifest_hash if manifest else "",
+        )
+        self.event_store.append_event(
+            event_type="policy_evaluation_unavailable",
+            request_snapshot=asdict(request),
+            actor_id=request.actor_id,
+            details=failure,
+        )
+        return entry.immutable_hash
 
     def evaluate_request(self, request: PolicyRequest) -> PolicyVerdict:
         """Main evaluation loop: gates → consensus → DGK (if critical) → audit."""

@@ -513,8 +513,9 @@ class VendoredCopyStaysInSync(unittest.TestCase):
     The original test asserted that the root and sentinel_os/ copies of
     observe_consolidated.py are byte-identical (review finding 8). They have
     not been since 2026-09-08. Since PR-2 the root engine is observe-perceive
-    e8186599 (byte-identical, with its four sibling modules), while sentinel_os/
-    still holds the older upstream snapshot 717c2e2 until PR-3 re-syncs it.
+    e8186599 (byte-identical, with its four sibling modules), and since PR-3
+    sentinel_os/ holds the same upstream engine (its twin bca7a70 after the
+    history rewrite).
     This test asserts both facts and still fails loudly (never skips) if either
     side, or any pinned file, changes unexpectedly. The identical assertion
     between root and sentinel_os/ is restored by PR-4 of RECONCILE_UPSTREAM_PLAN.md.
@@ -529,9 +530,9 @@ class VendoredCopyStaysInSync(unittest.TestCase):
         "kalman_trajectory.py": "03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a",
         "governance_contracts.py": "2145fb7d4daf1e99e74858a92bd86185650fcf6debb470273411a280091e1aca",
     }
-    # sentinel_os/: observe-perceive 717c2e2, observe_consolidated.py. Also recorded in VENDORED.md.
-    SNAPSHOT_COMMIT = "717c2e2"
-    SNAPSHOT_SHA256 = "66feebf5974bd60fcb7721bcb93477edad7a8fe5a0b7a21bf20e860b6846b53c"
+    # sentinel_os/: observe-perceive bca7a70 (twin of e818659), observe_consolidated.py. Also recorded in VENDORED.md.
+    SNAPSHOT_COMMIT = "bca7a70"
+    SNAPSHOT_SHA256 = "0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566"
 
     def test_root_is_the_pinned_upstream_engine_and_sentinel_os_is_the_pinned_snapshot(self):
         here = pathlib.Path(__file__).parent

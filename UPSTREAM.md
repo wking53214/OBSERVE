@@ -8,7 +8,7 @@ where they came from or when they were last synced. This file and
 | Upstream | Path here | Synced from commit | Sync date |
 | --- | --- | --- | --- |
 | observe-perceive | `test_observe_consolidated.py` | `717c2e2` | 2026-09-07 |
-| observe-perceive | `observe_consolidated.py`, `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py`, `governance_contracts.py` (root, byte-identical) | `e818659` | 2026-10-30 |
+| observe-perceive | `observe_consolidated.py`, `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py`, `governance_contracts.py`, `clinical_settings.py`, `log_redaction.py`, `logic_stamp.py` (root, byte-identical) | `d596262` | 2026-11-19 |
 | sentinel_os (`sentinel_os/` subtree) | `sentinel_os/` | `ddedd12` | 2026-09-07 |
 | GSA-815 | `sentinel_os/` (files that live in GSA-815) | `44ee595` | 2026-09-07 |
 | sentinel_os | `sentinel_os/queue_schema.py` (one file) | `b5d8e78` | 2026-10-29 |
@@ -38,14 +38,12 @@ What was tried on 2026-09-07 and what it showed:
   `diverged`. Reconciliation is upstream-first: port the fingerprint and
   state-commitment work into observe-perceive, then re-sync here.
 
-Status note (2026-11-15): the root engine is observe-perceive `e818659`
-(`bca7a70` since observe-perceive's history was rewritten; the ids in the table
-above are from before that rewrite).
-Upstream has since fixed four escalation behaviors (a cooldown that could
-hide a severity increase, dwell applied to an already-escalated patient who
-worsens, escalation state moved for an unrecorded reading, and a hard rule
-averaged away when a reading carries history). This copy does not have them,
-and upstream has changed the engine again since (see the README). Sync is an owner decision.
+Status note (2026-11-19): the root engine is observe-perceive `d596262` (re-synced in
+OBSERVE PR #35, merged without the clinical review its description asked for; see
+`docs/ENGINE_RESYNC_DIFFERENCES.md`). The `sentinel_os/` engine files are the older
+`bca7a70` (PR-3) and were deliberately not moved forward. The two copies differ until the
+owner decides whether to bring the nested tree forward. The ids `e818659` and `717c2e2`
+are from before observe-perceive's history was rewritten (twins `bca7a70` and `59f87b4`).
 
 Rules from here on:
 

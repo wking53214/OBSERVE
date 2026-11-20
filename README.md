@@ -7,7 +7,7 @@ Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at c
 ## Role Within ≡TACK
 
 - **What it is.** The observation stage: it turns vitals into a regime, risk score and an escalation flag. It is a downstream copy of the engine in `observe-perceive`, plus OBSERVE-only wiring (`observe_engine_gate.py`, `observe_clinical_risk_adapter.py`, `cns_connector.py`).
-- **What it owns.** The choice of when the behavioral engine runs (`observe_engine_gate.py`, currently the `conservative_legacy` rule), and its own clinical adapter wiring. It does not own the engine: `observe_consolidated.py` is a byte-for-byte copy of observe-perceive `e818659`.
+- **What it owns.** The choice of when the behavioral engine runs (`observe_engine_gate.py`, currently the `conservative_legacy` rule), and its own clinical adapter wiring. It does not own the engine: `observe_consolidated.py` is a byte-for-byte copy of observe-perceive `d596262`.
 - **What it contributes.** The observation concept and a reference for the extracted detectors in `interconnected_alpha` and `interconnected_zeta`.
 - **What it does not own.** Authorization, execution, custody, admission, or the orchestrator (observe-perceive). It does not own policy, but PERCEIVE policy files sit in this tree.
 - **Depends on.** observe-perceive (engine source), sentinel_os and GSA-815 (the nested `sentinel_os/` tree). Optional CNS v4.0.0 for the connector (`requirements-cns.txt`).
@@ -17,14 +17,11 @@ Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at c
 
 ## Known upstream fixes this copy lacks
 
-The root engine is observe-perceive `e818659`. observe-perceive's history has since been rewritten, so the two ids this repo's documents use for its engine, `e818659` and `717c2e2`, are no longer on any of its branches. Their twins, with the same date, subject and engine file, are `bca7a70` and `59f87b4` (VERIFIED 2026-11-19). Upstream has since changed `observe_consolidated.py`: 190 lines added and 13 removed by `827a42a` (2026-11-15), and 626 added and 76 removed by its head `b4f4c62` (INSPECTED with `git diff` from `bca7a70`, 2026-11-19). Four escalation changes that were upstream on 2026-11-15 matter to anyone reading OBSERVE output:
+**Root engine (updated 2026-11-19).** The root engine is observe-perceive `d596262`. Between `d596262` and observe-perceive's head `34894bb` the engine files are unchanged (INSPECTED with `git diff`, 2026-11-19), so the root engine is current. The four escalation fixes that earlier versions of this section listed (cooldown hiding a severity increase, dwell on an already-escalated patient who worsens, escalation state for an unrecorded reading, a hard rule averaged away by history) were part of this re-sync. Re-checking each one against the new engine has not been done.
 
-- The post-escalation cooldown could hide a real severity increase (for example WARNING to CRITICAL). Upstream now treats a severity increase as a new escalation.
-- A patient already escalated whose candidate regime is higher now acts on the first reading, with no dwell. This copy still applies dwell.
-- Upstream restores escalation state when a reading is not recorded. This copy can mark a patient "already escalated, locked" for a reading no ledger holds.
-- A hard rule (for example low oxygen) can be averaged away when a reading arrives with previous-reading history, or with no usable age. EXECUTED 2026-11-16 on this copy, through `observe_engine_gate.make_engine`: a 24-month-old with SpO2 86, temperature 39.1, heart rate 138 and respiratory rate 34 was rated STABLE with no escalation when the reading carried history, and WARNING with escalation when it did not. The same reading with the age missing, negative or not a number was also STABLE with no escalation, although the `CRITICAL_O2` rule fired. Upstream now holds a confirmed hard rule at WARNING (observe-perceive PR #79, merged as `e8dd575`), and returned WARNING with escalation for the missing-age reading at `e56244c`, the commit that is now `827a42a` (EXECUTED at review).
+**This re-sync changes scoring and has NOT been clinically reviewed.** On the recorded 600-reading corpus it differs from the old engine on 79 fields; 50 readings change regime or escalation, 43 more cautious and 7 less cautious. See `docs/ENGINE_RESYNC_DIFFERENCES.md` and `docs/ENGINE_RESYNC_DISPOSITIONS.md`. Do not treat the new engine as clinically approved.
 
-This list is not complete. Fourteen more upstream commits (fifteen counting one merge) changed the engine after `827a42a`, up to its head `b4f4c62` (among them a WARNING floor for patients outside the supported age range and changed policy defaults; INSPECTED from commit titles only). Do not use this repo's escalation output where those cases matter. Syncing is an owner decision (`RECONCILE_UPSTREAM_PLAN.md`).
+**Nested copy.** `sentinel_os/observe_consolidated.py` is observe-perceive `bca7a70` (the twin of `e818659`, whose history was rewritten) and still lacks the fixes above. Do not use its escalation output where those cases matter.
 
 ## Pipeline position
 
@@ -75,7 +72,7 @@ What actually lives in this checkout:
 
 | Path | What it is |
 |---|---|
-| `observe_consolidated.py` | The OBSERVE engine: RiskAdapters, EscalationPolicy, fusion. **Copied byte-for-byte from observe-perceive `e818659`** (never edited here), with its four sibling modules `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py` and `governance_contracts.py`. |
+| `observe_consolidated.py` | The OBSERVE engine: RiskAdapters, EscalationPolicy, fusion. **Copied byte-for-byte from observe-perceive `d596262`** (never edited here), with its seven sibling modules `cassette.py`, `pediatric_cassette.py`, `kalman_trajectory.py`, `governance_contracts.py`, `clinical_settings.py`, `log_redaction.py` and `logic_stamp.py`. |
 | `observe_engine_gate.py` | OBSERVE's own: the one place that chooses when the behavioral engine runs (`conservative_legacy`, OBSERVE's rule, until a pediatrician signs off upstream's widened rule). |
 | `observe_clinical_risk_adapter.py` and `clinical_*` | Clinical wiring. Three files in this tree do not import (EXECUTED 2026-11-16): `clinical_capacity_orchestration_source.py` needs a `perceive_consolidated` module that is not here, and `clinical_governance_ledger_source.py` and `perceive_policy_enforcement_source.py` are reconstructed files that raise a SyntaxError. No root test covers the capacity, ledger or policy adapters. |
 | `perceive_policy_enforcement_*` | PERCEIVE copies / flattened sources — **policy code in an observation repo**. |
@@ -97,7 +94,7 @@ What actually lives in this checkout:
 | Gap | Detail |
 |---|---|
 | Nested `sentinel_os/` | Hundreds of files: patches, APPLY playbooks, IVR kernel. OBSERVE-the-idea is a handful of modules; OBSERVE-the-repo is a dump. Drift vs live `wking53214/sentinel_os` is expected. |
-| Engine copies | The root engine is a byte-identical copy of observe-perceive `e818659` (pinned in `VENDORED.md`, checked by `test_observe_invariants.py`). `sentinel_os/observe_consolidated.py` is still the older upstream snapshot `717c2e2` until PR-3 of `RECONCILE_UPSTREAM_PLAN.md`. |
+| Engine copies | The root engine is a byte-identical copy of observe-perceive `d596262` (pinned in `VENDORED.md`, checked by `test_observe_invariants.py`). `sentinel_os/observe_consolidated.py` is the older snapshot `bca7a70` (re-synced in PR-3) and has NOT been brought up to `d596262`; the two copies differ on purpose until the owner decides (`RECONCILE_UPSTREAM_PLAN.md`). |
 | Clinical skips | Commercial red team: missed/late pediatric detections and sensor-fault gaps recorded as **skipped tests** in the spine. This repo does not close them. |
 | Uncalibrated constants | `PEDIATRIC_NORMS`, dwell, lock_seconds, syndrome weights (`0.40`/`0.35`) — copied into α without independent validation. |
 | Age-adjustment asymmetry | Syndromes not age-adjusted. Preserved, not a bug, but unsafe to treat as a finished clinical model. |

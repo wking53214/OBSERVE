@@ -10,7 +10,7 @@ Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at c
 - **What it owns.** The choice of when the behavioral engine runs (`observe_engine_gate.py`, currently the `conservative_legacy` rule), and its own clinical adapter wiring. It does not own the engine: `observe_consolidated.py` is a byte-for-byte copy of observe-perceive `d596262`.
 - **What it contributes.** The observation concept and a reference for the extracted detectors in `interconnected_alpha` and `interconnected_zeta`.
 - **What it does not own.** Authorization, execution, custody, admission, or the orchestrator (observe-perceive). It does not own policy, but PERCEIVE policy files sit in this tree.
-- **Depends on.** observe-perceive (engine source), sentinel_os and GSA-815 (the nested `sentinel_os/` tree). Optional CNS v4.0.0 for the connector (`requirements-cns.txt`).
+- **Depends on.** observe-perceive (engine source), sentinel_os and GSA-815 (the nested `sentinel_os/` tree). Optional CNS v4.1.0 for the connector (`requirements-cns.txt`).
 - **Depended on by.** UNKNOWN. No consumer was found or inspected.
 - **Verified versus declared.** Verified: root copy matches its pins (`VENDORED.md`, checked by `test_observe_invariants.py`). Declared only: the planned order below and the "paired with PERCEIVE" relationship. Nothing in this repo is on the orchestrator path (observe-perceive's `GovernanceOrchestrator`).
 - **Governance and control design.** OBSERVE's output is evidence, not authority. A regime or escalation flag is a signal for a downstream stage. It is not a decision.

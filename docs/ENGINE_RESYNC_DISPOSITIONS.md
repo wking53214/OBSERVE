@@ -4,6 +4,8 @@ Companion to `ENGINE_RESYNC_DIFFERENCES.md`. For each reading where the new engi
 
 **Every disposition below is PENDING clinical review.** Nothing here is approved. The "likely reason" column is inferred from the recorded readings, not confirmed in the engine code. The new engine is already merged on main (PR #35), so these seven behaviors are live today.
 
+The questions for the reviewer, in plain language, are in `CLINICAL_REVIEW_SHEET_v1.md`.
+
 Common pattern: in the new engine each of these patients had already been escalated at an earlier reading, and the reading in question is at the same severity. That fits the upstream change that suppresses a repeat escalation at the same severity (a higher severity still escalates). The length of that suppression window was not checked.
 
 | Reading | Patient | What changed | Likely reason (inferred) | Disposition |

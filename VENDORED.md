@@ -10,13 +10,13 @@ Status note (2026-11-20): four rows named files that are no longer in this repos
 
 Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'identical': 140} of 402 files.
 
-## Temporary stopgap (owner-approved 2026-10-29): pins instead of byte-identity
+## Root pins and identity (restored by PR-4, 2026-11-22)
 
-The root `observe_consolidated.py` and `sentinel_os/observe_consolidated.py` are not byte-identical today, and are not
-meant to be until PR-3 and PR-4 of `RECONCILE_UPSTREAM_PLAN.md` land. Since PR-2b the root engine is observe-perceive
-`d5962621321c791e79129bcfb807b5ee6e9eaa58`, copied byte-for-byte together with seven sibling modules and never edited here. The
-`sentinel_os/` copy is the older upstream engine `bca7a70` (PR-3, 2026-11-19) and was NOT moved to `d596262`. The original assertion that the two are identical has
-therefore been replaced, for now, by pins on both:
+The root engine and its seven sibling modules are observe-perceive
+`d5962621321c791e79129bcfb807b5ee6e9eaa58`, copied byte-for-byte and never edited here. Since PR-4 of
+`RECONCILE_UPSTREAM_PLAN.md`, `sentinel_os/` holds byte-identical copies of the same eight files. From 2026-10-29
+until then a stopgap pinned `sentinel_os/observe_consolidated.py` separately, because it was an older engine
+(`bca7a70`) that still held a worsening patient at WARNING during the escalation lock.
 
 | Pin | File | Upstream commit | sha256 |
 | --- | --- | --- | --- |
@@ -28,20 +28,17 @@ therefore been replaced, for now, by pins on both:
 | root | `clinical_settings.py` | `d596262` | `62e06d7cce792e431695720dc20d639c9d1921fbdd070ba6c501ad553b3a9d71` |
 | root | `log_redaction.py` | `d596262` | `8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12` |
 | root | `logic_stamp.py` | `d596262` | `ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b` |
-| sentinel_os | `sentinel_os/observe_consolidated.py` | `bca7a70` (twin of `e818659`) | `0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566` |
 
-`test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if any pinned file changes without the pins here being
-changed with it, and fails if a root file stops being declared `identical` in the table below.
+`test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if a root file stops matching its pin, if any
+`sentinel_os/` copy stops being byte-identical to root, or if a row below stops declaring either `identical`.
 
 OBSERVE chooses when the behavioral engine runs in one place, `observe_engine_gate.py`: it selects upstream's
 `conservative_legacy` gate (OBSERVE's own rule) until a pediatrician signs off upstream's widened rule. That file is
 OBSERVE's own and is not a copy.
 
-**The original `identical` assertion between root and `sentinel_os/` must be restored when the plan in
-`RECONCILE_UPSTREAM_PLAN.md` completes (PR-4).** Remove this section and the pin test then.
-
 ## Re-sync log
 
+- 2026-11-22 (PR-4): `sentinel_os/observe_consolidated.py` and the seven modules it needs (`cassette`, `pediatric_cassette`, `kalman_trajectory`, `governance_contracts`, `clinical_settings`, `log_redaction`, `logic_stamp`; the last three were missing) copied from root, so `sentinel_os/` is byte-identical to root for all eight. The older `sentinel_os/` engine (`bca7a70`) held a WARNING patient who worsened to CRITICAL at WARNING during the escalation lock; the current one escalates. One rule-5 test edit: `sentinel_os/test_observe_consolidated.py::TestEscalationPolicy::test_escalation_lock_prevents_immediate_re_escalation`, now asserting upstream's behaviour with upstream's lines. Full `sentinel_os/` suite with Postgres and Redis and the pinned requirements: 1006 passed, 5 failed, 6 skipped before and after (the same five; see the PR). The other `sentinel_os/` files PR-3 synced to `bca7a70` (`perceive_consolidated`, `clinical_governance_system` and their tests, `compliance_exporters`) were not moved by PR-4.
 - 2026-11-19 (PR-3): ten observe-perceive-derived files in `sentinel_os/` (`observe_consolidated`, `perceive_consolidated`, `clinical_governance_system`, `kalman_trajectory`, `governance_contracts`, `compliance_exporters` and the four test files for them) re-synced byte-for-byte from observe-perceive `bca7a70`, and `cassette.py` and `pediatric_cassette.py` added. `sentinel_os/observe_consolidated.py` is now byte-identical to the root copy. The oxygen case (SpO2 86, age 24 months, with and without history, age missing, negative or not a number) gave the same five results before and after.
 
 - 2026-10-29: `sentinel_os/queue_schema.py` re-synced from sentinel_os `b5d8e78` (byte-identical, sha256 `6969e87126ed074f...`). The previous copy was an older design that OBSERVE's own `api_server_v2.py` and `twin_sync_worker.py` had already outgrown (they call `namespace=`, `get_job`, `ping`, `promote_due` and `ack(result=)`, which it lacked). Its methods and reasons were a strict subset of upstream's, so nothing OBSERVE-only was lost. Row status above changed from `diverged` to `identical`.
@@ -78,6 +75,11 @@ OBSERVE's own and is not a copy.
 | `sentinel_os/event_v1.py` | sentinel_os | diverged |
 | `sentinel_os/cage_match_brief_v1.md` | (none) | unique |
 | `sentinel_os/observe_consolidated.py` | observe-perceive | identical |
+| `sentinel_os/cassette.py` | observe-perceive | identical |
+| `sentinel_os/pediatric_cassette.py` | observe-perceive | identical |
+| `sentinel_os/clinical_settings.py` | observe-perceive | identical |
+| `sentinel_os/log_redaction.py` | observe-perceive | identical |
+| `sentinel_os/logic_stamp.py` | observe-perceive | identical |
 | `sentinel_os/production_harness.py` | GSA-815 | diverged |
 | `sentinel_os/ivr-events-ingestion-contract.diff` | (none) | unique |
 | `sentinel_os/test_sentinel_worker.py` | sentinel_os | diverged |

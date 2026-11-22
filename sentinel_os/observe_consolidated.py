@@ -23,8 +23,9 @@ import hashlib
 import json
 import logging
 import math
+import os
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -35,6 +36,13 @@ import copy
 from cassette import label as cassette_label, optional_member as cassette_optional_member
 from governance_contracts import compute_state_commitment
 from kalman_trajectory import PatientKalmanTracker
+from logic_stamp import logic_digest, module_logic_digest
+from log_redaction import patient_tag
+import cassette as _cassette_module
+import kalman_trajectory as _kalman_module
+import logic_stamp as _logic_stamp_module
+import sys as _sys
+
 
 logger = logging.getLogger("OBSERVE")
 
@@ -50,6 +58,18 @@ class OperationalRegime(Enum):
 
 #: STABLE < CAUTION < WARNING < CRITICAL, named once so the fault overlay can
 #: take a maximum without re-deriving the order from band shapes.
+class _Marker:
+    """A named sentinel that survives copy and is never equal to a real value."""
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return self.name
+
+
+_ABSENT = _Marker("<nothing was tracked>")   # a snapshot of a subject that had no state of this kind
+_DROP = _Marker("<could not be copied>")     # a tracker that could not be snapshotted: it restarts on rollback
+
 _REGIME_SEVERITY = {
     OperationalRegime.STABLE: 0,
     OperationalRegime.CAUTION: 1,
@@ -116,6 +136,11 @@ class FusedVerdict:
     state_commitment: str = ""  # governance_contracts.compute_state_commitment over verdict_state(),
     # chained per subject through predecessor_state_commitment; recorded in the audit entry
     validation_faults: List[str] = field(default_factory=list)  # validate()'s faults; non-empty iff unassessable
+    escalation_kind: str = ""  # "new_escalation" (up into WARNING or CRITICAL from below), "severity_increase" (an
+    # already-escalated patient moves to a HIGHER regime), "de_escalation" (the reported regime fell), or "".
+    # A severity increase is a new escalation event: escalation_required is True and this says why it is not a repeat.
+    previous_regime: str = ""  # the regime tracked before this reading ("" when there was none): what an
+    # escalation or de-escalation moved from, so two events for one patient stay distinguishable
     unassessable: bool = False  # True iff at least one channel of this reading failed validate().
     # With active_engines non-empty the verdict assesses the VALID channels only, floored at
     # WARNING and never below the tracked regime; with active_engines == [] nothing was scored.
@@ -181,6 +206,13 @@ REGIME_CRITICAL_FLOOR_DEFAULT = 0.01  # regime_distribution: critical never reac
 DRIFT_CRITICAL_FLOOR = 0.02           # the drift adapter's stricter floor
 ESCALATION_DWELL_THRESHOLD = 2        # consecutive confirming readings before a regime change
 ESCALATION_LOCK_SECONDS = 300         # post-escalation cooldown (also the fault-page dedup window)
+# How many of a patient's readings (the current one included) make a repeat of a hard rule, for a cassette that does not
+# say. A hard rule that fires on one reading may be a sensor artefact and is judged as the fusion judges it; the same
+# rule firing again within this window, or accompanied by another abnormal channel, is not an artefact and holds the
+# regime at WARNING whatever the fusion says. Counted in readings, not seconds, so it does not depend on how often a unit
+# samples. The domain's own value (the cassette's hard_rule_confirm_window, a clinician setting) takes precedence. Branch
+# logic, like the rest of evaluate's: attested by the source revision, not by PARAMETER_SET.
+HARD_RULE_CONFIRM_WINDOW = 3
 # Fault overlay (ported from OBSERVE, T2b): how the core reasons about a reading
 # with a faulted channel. Each floor is the bottom of the REGIME_DISTRIBUTION_BANDS
 # band its regime wins, so a floored verdict's risk and regime agree.
@@ -366,15 +398,21 @@ def decision_fingerprint(data: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def get_age_group(age_months: Optional[int]) -> str:
-    """Map age in months to clinical age group. Returns 'generic' if age unknown."""
+#: Upper bounds, in months, of the neonatal, infant and toddler groups; at or beyond the last is "child".
+AGE_GROUP_UPPER_MONTHS = (3, 12, 36)
+
+
+def get_age_group(age_months: Optional[int], bounds: Tuple[float, float, float] = AGE_GROUP_UPPER_MONTHS) -> str:
+    """Map age in months to clinical age group. Returns 'generic' if age unknown.
+
+    `bounds` is the clinician-adjustable setting (see clinical_settings); the default is the original table."""
     if age_months is None:
         return "generic"
-    if age_months < 3:
+    if age_months < bounds[0]:
         return "neonatal"
-    if age_months < 12:
+    if age_months < bounds[1]:
         return "infant"
-    if age_months < 36:
+    if age_months < bounds[2]:
         return "toddler"
     return "child"
 
@@ -409,8 +447,13 @@ class RiskAdapters:
     """All 6 risk assessment engines, consolidated with fixes from code review."""
 
     @staticmethod
-    def heuristic(vitals: VitalsSnapshot) -> RiskOutput:
-        """FIX: confidence = data-completeness, not history_quality formula. Age-adjusted norms."""
+    def heuristic(vitals: VitalsSnapshot, norms: Optional[Mapping[str, Mapping[str, float]]] = None,
+                  age_bounds: Tuple[float, float, float] = AGE_GROUP_UPPER_MONTHS,
+                  critical_o2_below: float = 88.0, hypothermia_below: float = 35.0) -> RiskOutput:
+        """FIX: confidence = data-completeness, not history_quality formula. Age-adjusted norms.
+
+        The keyword arguments are the clinician-adjustable settings (clinical_settings.ClinicalSettings); every
+        default is the value this function always used."""
         triggered = []
         score = 0.0
 
@@ -418,13 +461,13 @@ class RiskAdapters:
         has_history = "previous_o2" in vitals.context and "previous_hr" in vitals.context
 
         if age_months is None:
-            logger.warning(f"HEURISTIC: age_months missing for {vitals.patient_id}; using generic norms")
+            logger.warning(f"HEURISTIC: age_months missing for {patient_tag(vitals.patient_id)}; using generic norms")
 
-        age_group = get_age_group(age_months)
-        thresh = PEDIATRIC_NORMS[age_group]
+        age_group = get_age_group(age_months, age_bounds)
+        thresh = (PEDIATRIC_NORMS if norms is None else norms)[age_group]
 
-        if vitals.oxygen_saturation < 88.0:
-            triggered.append(f"CRITICAL_O2: {vitals.oxygen_saturation}% (<88%)")
+        if vitals.oxygen_saturation < critical_o2_below:
+            triggered.append(f"CRITICAL_O2: {vitals.oxygen_saturation}% (<{critical_o2_below:g}%)")
             score += 0.5
         elif vitals.oxygen_saturation < thresh["o2_low"]:
             triggered.append(f"WARNING_O2: {vitals.oxygen_saturation}% (<{thresh['o2_low']}%)")
@@ -444,8 +487,9 @@ class RiskAdapters:
         if vitals.temperature > thresh["temp_high"]:
             triggered.append(f"FEVER: {vitals.temperature}°C > {thresh['temp_high']}°C")
             score += 0.1
-        elif vitals.temperature < 35.0:
-            triggered.append(f"HYPOTHERMIA: {vitals.temperature}°C < 35.0°C")
+        elif vitals.temperature < hypothermia_below:
+            line = f"{hypothermia_below:.1f}" if round(hypothermia_below, 1) == hypothermia_below else f"{hypothermia_below:g}"
+            triggered.append(f"HYPOTHERMIA: {vitals.temperature}°C < {line}°C")
             score += 0.4
 
         score = min(score, 1.0)
@@ -460,14 +504,17 @@ class RiskAdapters:
         return RiskOutput("heuristic", score, confidence, regime_distribution(score), triggered, datetime.now(timezone.utc))
 
     @staticmethod
-    def bayesian(vitals: VitalsSnapshot) -> RiskOutput:
-        """FIX: age-group lookup (no hardcoded toddler norms), continuous sigmoid likelihood."""
+    def bayesian(vitals: VitalsSnapshot, norms: Optional[Mapping[str, Mapping[str, float]]] = None,
+                 age_bounds: Tuple[float, float, float] = AGE_GROUP_UPPER_MONTHS) -> RiskOutput:
+        """FIX: age-group lookup (no hardcoded toddler norms), continuous sigmoid likelihood.
+
+        `norms` and `age_bounds` are the clinician-adjustable settings; the defaults are the original tables."""
         triggered = []
         debug_info = {}
 
         age_months = vitals.context.get("age_months")
-        age_group = get_age_group(age_months)
-        thresh = PEDIATRIC_NORMS[age_group]
+        age_group = get_age_group(age_months, age_bounds)
+        thresh = (PEDIATRIC_NORMS if norms is None else norms)[age_group]
 
         o2_mean, o2_std = (thresh["o2_low"] + 100) / 2.0, 3.0
         hr_mean, hr_std = (thresh["hr_high"] + thresh["hr_low"]) / 2.0, (thresh["hr_high"] - thresh["hr_low"]) / 4.0
@@ -980,8 +1027,27 @@ class EscalationPolicy:
         if self.escalation_locked and self.last_escalation_time:
             elapsed = (timestamp - self.last_escalation_time).total_seconds()
             if elapsed < self.lock_seconds:
-                return self.current_regime, False
-            self.escalation_locked = False
+                # The cooldown exists to stop a storm of repeats at the SAME severity. It must never
+                # hide a genuine severity increase: a patient escalated at WARNING who worsens to
+                # CRITICAL is a new event, and used to be held at WARNING until the lock expired and
+                # two more readings confirmed.
+                if _REGIME_SEVERITY[new_regime] <= _REGIME_SEVERITY[self.current_regime]:
+                    return self.current_regime, False
+            else:
+                self.escalation_locked = False
+
+        # A patient who is ALREADY escalated (WARNING) and whose candidate is higher is acted on at the first
+        # reading, with no dwell (owner decision, PR-3): dwell damps noise at the edge of a first escalation,
+        # and a worsening patient the system has already flagged is not that. A first escalation from STABLE or
+        # CAUTION still needs its dwell, exactly as before.
+        if (_REGIME_SEVERITY[self.current_regime] >= _REGIME_SEVERITY[OperationalRegime.WARNING]
+                and _REGIME_SEVERITY[new_regime] > _REGIME_SEVERITY[self.current_regime]):
+            self.current_regime = new_regime
+            self.pending_regime = None
+            self.dwell_count = 0
+            self.escalation_locked = True
+            self.last_escalation_time = timestamp
+            return new_regime, True
 
         if new_regime == self.current_regime:
             self.pending_regime = None
@@ -997,8 +1063,9 @@ class EscalationPolicy:
             self.dwell_count = 1
 
         if self.dwell_count >= self.dwell_threshold:
+            # An escalation is any move UP into WARNING or CRITICAL, including WARNING to CRITICAL.
             escalation = (new_regime.value in ("warning", "critical")
-                           and self.current_regime.value in ("stable", "caution"))
+                          and _REGIME_SEVERITY[new_regime] > _REGIME_SEVERITY[self.current_regime])
             self.current_regime = new_regime
             self.pending_regime = None
             self.dwell_count = 0
@@ -1014,43 +1081,261 @@ class EscalationPolicy:
 # AUDIT LEDGER (SHA256 cryptographic chain)
 # ============================================================================
 
+class LedgerArchiveError(ValueError):
+    """The archive a bounded ledger was asked to continue is damaged, so it will not be continued silently."""
+
+
 class ImmutableAuditLedger:
-    def __init__(self):
+    """OBSERVE's hash-chained audit ledger.
+
+    By default it is in memory and grows with every reading, forever. `max_entries` bounds it: once the ledger holds more than
+    `max_entries` plus a tenth, the OLDEST entries are appended to `archive_path` (owner-only, fsynced) and dropped from memory,
+    and the chain continues across the boundary (`anchor_hash` is the hash just before the first retained entry). Nothing is ever
+    dropped unwritten: a bounded ledger must be given an archive, and if the archive cannot be written the entries stay in memory,
+    the failure is reported through `on_error`, and the ledger is unbounded until the archive works again (memory over a silent
+    loss of the audit record). `verify_integrity()` checks the retained part from the anchor; `verify_integrity(full=True)` streams
+    the archive from the start and checks everything. `iter_all()` yields archived then retained entries.
+
+    Restarts: built over an archive that already holds entries, the ledger checks that archive from the first entry and CONTINUES its
+    chain (a damaged archive is refused with `LedgerArchiveError`; a half-written last line, which only a crash mid-write leaves, is
+    moved to `<archive>.torn` and reported in `recovered`). The entries that were still in memory when a process died are not in the
+    archive: call `flush_to_archive()` on a clean shutdown to write them. One process owns an archive; two ledgers on one file are
+    not supported."""
+
+    def __init__(self, max_entries: Optional[int] = None, archive_path: Any = None, on_error: Optional[Callable[[Dict[str, Any]], None]] = None):
+        if max_entries is not None:
+            if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
+                raise ValueError(f"max_entries must be a whole number of entries from 1, or None, not {max_entries!r}")
+            if archive_path is None:
+                raise ValueError("a bounded ledger needs an archive_path: entries that leave memory are written there, "
+                                 "never dropped")
         self.entries: List[Dict[str, Any]] = []
         self.chain_head = "0" * 64
+        self.anchor_hash = "0" * 64              # the chain hash just before the first retained entry
+        self.archived_count = 0
+        self.max_entries = max_entries
+        self.archive_path = None if archive_path is None else os.fspath(archive_path)
+        self._on_error = on_error
+        self._lock = threading.RLock()
+        self._archive_size = 0                   # bytes of the archive that are committed (written AND fsynced)
+        self._written_through = 0                # leading retained entries already in the file past the committed size (an fsync failed)
+        self.recovered: Optional[Dict[str, Any]] = None
+        if self.max_entries is not None and os.path.lexists(self.archive_path):
+            self._resume()
+
+    @staticmethod
+    def _digest(entry: Dict[str, Any]) -> str:
+        """The chain hash of an entry. Hashed through a JSON round trip, so an entry hashes the same in memory and after it has been
+        written to the archive and read back (a dict with integer keys, a tuple or a non-JSON value would not otherwise)."""
+        return hashlib.sha256(ImmutableAuditLedger._line(entry).encode()).hexdigest()
+
+    @staticmethod
+    def _line(entry: Dict[str, Any]) -> str:
+        """An entry as canonical JSON text (what is hashed and what is archived). The round trip first makes every key text, so
+        data with mixed integer and text keys can be sorted and written instead of failing the archive forever."""
+        return json.dumps(json.loads(json.dumps(entry, default=str)), sort_keys=True)
 
     def append(self, patient_id: str, action: str, data: Dict[str, Any]) -> str:
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "patient_id": patient_id,
-            "action": action,
-            "data": copy.deepcopy(data),
-            "previous_hash": self.chain_head,
-        }
-        block_hash = hashlib.sha256(json.dumps(entry, sort_keys=True, default=str).encode()).hexdigest()
-        entry["immutable_hash"] = block_hash
-        self.entries.append(entry)
-        self.chain_head = block_hash
-        return block_hash
+        with self._lock:
+            entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "patient_id": patient_id,
+                "action": action,
+                "data": copy.deepcopy(data),
+                "previous_hash": self.chain_head,
+            }
+            block_hash = self._digest(entry)
+            entry["immutable_hash"] = block_hash
+            self.entries.append(entry)
+            self.chain_head = block_hash
+            self._rotate()
+            return block_hash
 
-    def verify_integrity(self) -> bool:
-        expected_prev = "0" * 64
-        for entry in self.entries:
-            if entry["previous_hash"] != expected_prev:
-                return False
-            target = copy.deepcopy(entry)
-            stored_hash = target.pop("immutable_hash")
-            recalced = hashlib.sha256(json.dumps(target, sort_keys=True, default=str).encode()).hexdigest()
-            if stored_hash != recalced:
-                return False
-            expected_prev = stored_hash
-        return True
+    def _report(self, event: Dict[str, Any]) -> None:
+        if self._on_error is not None:
+            try:
+                self._on_error(event)
+            except Exception:  # noqa: BLE001
+                pass
 
-    def query_patient(self, patient_id: str) -> List[Dict[str, Any]]:
-        return [e for e in self.entries if e["patient_id"] == patient_id]
+    def _open_archive(self, flags: int, mode: int = 0o600):
+        """The archive file, never through a symbolic link, and tightened to owner-only if it was ever looser."""
+        fd = os.open(self.archive_path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+        if flags & (os.O_WRONLY | os.O_RDWR):
+            try:
+                os.fchmod(fd, 0o600)
+            except (AttributeError, OSError):
+                pass
+        return fd
 
-    def export_json(self) -> str:
-        return json.dumps(self.entries, indent=2, default=str)
+    def _resume(self) -> None:
+        """Continue the chain of an archive an earlier process wrote, after checking all of it."""
+        expected, count, good = "0" * 64, 0, 0
+        try:
+            with os.fdopen(self._open_archive(os.O_RDONLY), "rb") as fh:
+                for raw in fh:
+                    if not raw.endswith(b"\n"):
+                        break                      # a torn last line: a crash in the middle of a write
+                    try:
+                        entry = json.loads(raw)
+                    except ValueError as exc:
+                        raise LedgerArchiveError(f"archive entry {count + 1} is not valid JSON ({exc})") from None
+                    if not isinstance(entry, dict) or not self._entry_ok(entry, expected):
+                        raise LedgerArchiveError(f"archive entry {count + 1} breaks the hash chain; move the file aside and "
+                                                 "investigate before starting")
+                    expected, count, good = entry["immutable_hash"], count + 1, good + len(raw)
+        except OSError as exc:
+            raise LedgerArchiveError(f"the archive cannot be read ({type(exc).__name__}: {exc})") from None
+        size = os.path.getsize(self.archive_path)
+        if size > good:
+            torn = self.archive_path + ".torn"
+            try:
+                with os.fdopen(self._open_archive(os.O_RDONLY), "rb") as src:
+                    src.seek(good)
+                    tail = src.read()
+                with os.fdopen(os.open(torn, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600), "ab") as out:
+                    out.write(tail)
+                    out.flush()
+                    os.fsync(out.fileno())
+                fd = self._open_archive(os.O_WRONLY)
+                try:
+                    os.ftruncate(fd, good)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError as exc:
+                raise LedgerArchiveError(f"the archive ends in a half-written line and could not be repaired "
+                                         f"({type(exc).__name__}: {exc})") from None
+            self.recovered = {"kind": "ledger_archive_torn_tail", "torn_bytes": size - good, "kept_entries": count,
+                              "saved_to": torn}
+        self.chain_head = self.anchor_hash = expected
+        self.archived_count = count
+        self._archive_size = good
+
+    def _rotate(self, everything: bool = False) -> None:
+        if self.max_entries is None:
+            return
+        if not everything and len(self.entries) <= self.max_entries + max(1, self.max_entries // 10):
+            return
+        n = len(self.entries) if everything else len(self.entries) - self.max_entries
+        if n <= 0:
+            return
+        batch = self.entries[:n]
+        fh = None
+        start = None
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.archive_path)), exist_ok=True)
+            fh = os.fdopen(self._open_archive(os.O_WRONLY | os.O_CREAT | os.O_APPEND), "ab")
+            start = os.fstat(fh.fileno()).st_size
+            try:
+                # Entries already in the file (written, then the fsync failed) are not written twice.
+                fresh = batch[min(self._written_through, len(batch)):]
+                fh.write("".join(self._line(e) + "\n" for e in fresh).encode("utf-8"))
+                fh.flush()
+            except Exception:
+                try:
+                    os.ftruncate(fh.fileno(), start)     # no half-written line, no entry left half in the file
+                except OSError:
+                    pass
+                raise
+            self._written_through = len(batch)
+            os.fsync(fh.fileno())
+            committed = os.fstat(fh.fileno()).st_size
+        except Exception as exc:  # noqa: BLE001 - keep the entries in memory rather than lose them
+            self._report({"kind": "ledger_archive_failed", "error": f"{type(exc).__name__}: {exc}", "retained": len(self.entries)})
+            return
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        self._archive_size = committed
+        self._written_through = 0
+        self.anchor_hash = batch[-1]["immutable_hash"]
+        self.archived_count += len(batch)
+        del self.entries[:len(batch)]
+
+    def flush_to_archive(self) -> int:
+        """Write every retained entry to the archive (a clean shutdown). Returns how many entries are archived in all; the retained
+        ones stay in memory until it succeeds, and a failure is reported through `on_error` like any other."""
+        with self._lock:
+            self._rotate(everything=True)
+            return self.archived_count
+
+    def _read_archive(self, size: int):
+        """The first `size` bytes of the archive as entries. `size` is a committed length taken under the lock, so a rotation that
+        runs while this reads can only append beyond it."""
+        with os.fdopen(self._open_archive(os.O_RDONLY), "rb") as fh:
+            remaining = size
+            while remaining > 0:
+                line = fh.readline()
+                if not line:
+                    raise ValueError("the archive is shorter than the ledger says it is")
+                remaining -= len(line)
+                if remaining < 0:
+                    raise ValueError("the archive's committed length does not end on an entry")
+                entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    raise ValueError("an archive line is not an entry")
+                yield entry
+
+    def iter_all(self, retained_first: bool = False):
+        """Archived entries (oldest first, from the archive file) then the retained ones; `retained_first` yields the retained
+        ones first, so a search for something recent need not read the archive. One consistent snapshot, whatever rotates while it
+        is read. Raises ValueError or OSError if the archive is unreadable or damaged."""
+        with self._lock:
+            retained = list(self.entries)
+            size = self._archive_size
+        return self._iter(retained, size, retained_first)
+
+    def _iter(self, retained, size, retained_first):
+        if retained_first:
+            yield from retained
+        if size:
+            yield from self._read_archive(size)
+        if not retained_first:
+            yield from retained
+
+    def _entry_ok(self, entry: Dict[str, Any], expected_prev: str) -> bool:
+        if entry.get("previous_hash") != expected_prev:
+            return False
+        target = copy.deepcopy(entry)
+        stored_hash = target.pop("immutable_hash", None)
+        return stored_hash == self._digest(target)
+
+    def verify_integrity(self, full: bool = False) -> bool:
+        """Is the chain intact? The retained entries from the anchor by default; `full=True` also streams the archive from the
+        first entry ever written, which can be slow on a long-running deployment."""
+        try:
+            with self._lock:
+                if full:
+                    expected_prev, entries = "0" * 64, self.iter_all()
+                else:
+                    expected_prev, entries = self.anchor_hash, list(self.entries)
+            for entry in entries:
+                if not self._entry_ok(entry, expected_prev):
+                    return False
+                expected_prev = entry["immutable_hash"]
+            return True
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
+
+    def query_patient(self, patient_id: str, include_archive: bool = False) -> List[Dict[str, Any]]:
+        if include_archive:
+            source = self.iter_all()
+        else:
+            with self._lock:
+                source = list(self.entries)
+        return [e for e in source if e["patient_id"] == patient_id]
+
+    def export_json(self, include_archive: bool = False) -> str:
+        if include_archive:
+            entries = list(self.iter_all())
+        else:
+            with self._lock:
+                entries = list(self.entries)
+        return json.dumps(entries, indent=2, default=str)
 
 
 # ============================================================================
@@ -1216,10 +1501,10 @@ class ProvisionalStore:
         self._evict_expired()
         entry = self.provisionals.get(patient_id)
         if entry is None:
-            logger.warning(f"reconcile: unknown patient {patient_id} (job {job_id})")
+            logger.warning(f"reconcile: unknown patient {patient_tag(patient_id)} (job {job_id})")
             return False
         if entry.get("job_id") != job_id:
-            logger.warning(f"reconcile: job_id mismatch for {patient_id} (expected {entry.get('job_id')}, got {job_id})")
+            logger.warning(f"reconcile: job_id mismatch for {patient_tag(patient_id)} (expected {entry.get('job_id')}, got {job_id})")
             return False
 
         entry["is_provisional"] = False
@@ -1259,7 +1544,7 @@ class ObserveClinicalEngine:
     }
 
     def __init__(self, max_tracked_patients: int = 10000, enable_kalman: bool = False,
-                 cassette=None):
+                 cassette=None, on_degraded=None, ledger_max_entries: Optional[int] = None, ledger_archive_path: Any = None):
         # Deferred import: the cassette imports this module for the engine
         # table it wraps, so binding it at module scope would be circular.
         # Defaulting here keeps every existing caller working unchanged while
@@ -1268,7 +1553,9 @@ class ObserveClinicalEngine:
             from pediatric_cassette import PediatricCassette
             cassette = PediatricCassette()
         self._cassette = cassette
-        self.audit_ledger = ImmutableAuditLedger()
+        # Unbounded and in memory unless a bound and an archive are given (decision D11: the production profile requires them).
+        self.audit_ledger = ImmutableAuditLedger(max_entries=ledger_max_entries, archive_path=ledger_archive_path,
+                                                 on_error=self._ledger_error)
         self.scheduler = AsyncJobScheduler(num_workers=2)
         self.provisional_store = ProvisionalStore()
         # PER-PATIENT STATE: escalation policy + entropy are keyed by patient_id.
@@ -1287,6 +1574,16 @@ class ObserveClinicalEngine:
         # patient (memory over a silent safety reset). Each eviction is written to the
         # audit ledger as STATE_EVICTED.
         self._max_tracked_patients = max_tracked_patients
+        # Housekeeping that failed without failing an assessment (an eviction record that could not be written). Kept in
+        # memory (the last 100) and given to `on_degraded(event)` so a person can be told; the hook is called outside the
+        # state lock and a hook that raises is logged, never raised.
+        self.degraded_events: "deque" = deque(maxlen=100)
+        self.degraded_dropped = 0                       # events pushed out of the last 100 (the count is never lost)
+        self._degraded_pending: "deque" = deque()      # a deque: appended from inside the ledger and the state lock, so no lock
+        self._on_degraded = on_degraded
+        self._degraded_lock = threading.Lock()          # guards the dropped count only; nothing else is taken inside it
+        if self.audit_ledger.recovered is not None:    # the archive of an earlier run ended in a half-written line
+            self._degraded(dict(self.audit_ledger.recovered))
         self._patient_policies: "OrderedDict[str, EscalationPolicy]" = OrderedDict()
         self._patient_entropy: Dict[str, float] = {}
         # Head of each subject's verdict-state chain. Evicted with the policy
@@ -1298,6 +1595,9 @@ class ObserveClinicalEngine:
         # EscalationPolicy is never written on such a reading, so it cannot
         # carry this dedup. Evicted with the policy.
         self._patient_fault_paged: Dict[str, Dict[str, datetime]] = {}
+        # (timestamp, whether a hard rule fired) for each of a subject's last few readings (the window the cassette
+        # names). Evicted with the policy, but never while a hard rule is still pending confirmation.
+        self._patient_hard_rule_recent: Dict[str, List[Tuple[Any, bool]]] = {}
         # FIX(red-team / concurrency): the per-patient OrderedDict + entropy dict are
         # mutated during evaluate(). Safe under a single asyncio loop (no await inside
         # evaluate), but a thread pool / multiple loops could corrupt them mid-resize.
@@ -1311,6 +1611,11 @@ class ObserveClinicalEngine:
         # a stateful "trajectory_kalman" adapter joins fusion (see evaluate()).
         self._enable_kalman = enable_kalman
         self._patient_kalman: "OrderedDict[str, PatientKalmanTracker]" = OrderedDict()
+
+    @property
+    def cassette(self):
+        """The domain this engine runs (read-only), so a deployment can show which settings are in force."""
+        return self._cassette
 
     def _get_kalman(self, patient_id: str) -> "PatientKalmanTracker":
         with self._state_lock:
@@ -1329,6 +1634,7 @@ class ObserveClinicalEngine:
         baseline (STABLE regime, escalation lock clear) is evicted. If none exists,
         every patient is kept: memory over a silent safety reset.
         """
+        events: List[Dict[str, Any]] = []
         with self._state_lock:
             if patient_id in self._patient_policies:
                 self._patient_policies.move_to_end(patient_id)
@@ -1337,7 +1643,10 @@ class ObserveClinicalEngine:
                     (pid for pid, pol in self._patient_policies.items()
                      if pid != patient_id
                      and pol.current_regime == OperationalRegime.STABLE
-                     and not pol.escalation_locked),
+                     and not pol.escalation_locked
+                     # a lone hard rule is waiting for the next reading to confirm it: forgetting it here would
+                     # silence the one case the confirmation window exists to catch
+                     and not any(fired for _, fired in self._patient_hard_rule_recent.get(pid, ()))),
                     None,
                 )
                 if evicted_id is None:
@@ -1346,17 +1655,112 @@ class ObserveClinicalEngine:
                 self._patient_entropy.pop(evicted_id, None)
                 self._state_commitments.pop(evicted_id, None)
                 self._patient_fault_paged.pop(evicted_id, None)
-                self.audit_ledger.append(
-                    evicted_id, "STATE_EVICTED",
-                    {"reason": "lru_capacity", "cap": self._max_tracked_patients},
-                )
+                self._patient_hard_rule_recent.pop(evicted_id, None)
+                try:
+                    self.audit_ledger.append(
+                        evicted_id, "STATE_EVICTED",
+                        {"reason": "lru_capacity", "cap": self._max_tracked_patients},
+                    )
+                except Exception as exc:  # noqa: BLE001 - housekeeping: one patient's eviction record must not fail another's assessment
+                    events.append({"kind": "state_evicted_write_failed", "patient_id": evicted_id,
+                                   "error": f"{type(exc).__name__}: {exc}"})
+        for event in events:
+            self._degraded(event)
+
+    def _degraded(self, event: Dict[str, Any]) -> None:
+        """Record and log housekeeping that failed, and queue it for the hook. Never raises and never calls the hook: this runs
+        in the middle of an assessment, and a slow or re-entrant hook there would widen races with other evaluations."""
+        with self._degraded_lock:
+            if len(self.degraded_events) == self.degraded_events.maxlen:
+                self.degraded_dropped += 1
+            self.degraded_events.append(event)
+        logger.critical("OBSERVE housekeeping failed (%s: %s); the assessment that triggered it continues",
+                        event.get("kind"), event.get("error"))
+        self._degraded_pending.append(event)
+
+    def _ledger_error(self, event: Dict[str, Any]) -> None:
+        """The ledger could not write its archive; the entries stayed in memory (see ImmutableAuditLedger)."""
+        self._degraded(dict(event))
+
+    def _flush_degraded(self) -> None:
+        """Give queued housekeeping failures to the hook, after the assessment that found them has finished and with no lock
+        held. A hook that raises is logged, never raised; a hook may call back into this engine."""
+        pending = []
+        while True:
+            try:
+                pending.append(self._degraded_pending.popleft())
+            except IndexError:
+                break
+        if self._on_degraded is None:
+            return
+        for event in pending:
+            try:
+                self._on_degraded(dict(event))
+            except Exception as exc:  # noqa: BLE001
+                logger.critical("OBSERVE degraded-event hook failed: %s: %s", type(exc).__name__, exc)
+
+    # -- evaluation is all-or-nothing for a patient's tracked state ---------------------------------------------------
+    def _snapshot_tracked_state(self, subject: str) -> Dict[str, Any]:
+        """What this subject's tracked state is right now, so a failed evaluation can put it back.
+
+        The hard-rule history is deliberately not in it: that only ever makes a later hard rule confirm sooner, and a
+        reading already in it is never its own repeat (a retried reading carries the same timestamp)."""
+        with self._state_lock:
+            policy = self._patient_policies.get(subject)
+            paged = self._patient_fault_paged.get(subject)
+            kalman = self._patient_kalman.get(subject)
+            snap = {
+                "policy": _ABSENT if policy is None else copy.copy(policy),
+                "entropy": self._patient_entropy.get(subject, _ABSENT),
+                "commitment": self._state_commitments.get(subject, _ABSENT),
+                "fault_paged": _ABSENT if paged is None else dict(paged),
+            }
+        try:  # the tracker is the one costly copy, so it is made outside the lock that serialises every patient
+            snap["kalman"] = _ABSENT if kalman is None else copy.deepcopy(kalman)
+        except Exception:  # noqa: BLE001 - a tracker that cannot be copied is dropped on rollback: it restarts
+            snap["kalman"] = _DROP
+        return snap
+
+    def _restore_tracked_state(self, subject: str, snapshot: Dict[str, Any]) -> None:
+        """Put the subject's tracked state back as `_snapshot_tracked_state` found it.
+
+        `evaluate` moves a patient's escalation state (tracked regime, post-escalation lock, state-commitment head)
+        BEFORE it fingerprints and writes the reading to its ledger. A crash part way left the state ahead of any
+        record: the patient was marked "already escalated, locked" for a reading no ledger holds, so the next
+        critical reading was swallowed as a repeat. Undoing the crashed evaluation is exact in both directions: a
+        crash after the state moved is as if it never ran (the next reading escalates again, a repeat page and
+        never silence), and a crash before it moved changes nothing (a patient already tracked at CRITICAL stays
+        CRITICAL; nothing falls silently). Nothing is written to the audit ledger: it may be what failed."""
+        stores = {"policy": self._patient_policies, "entropy": self._patient_entropy,
+                  "commitment": self._state_commitments, "fault_paged": self._patient_fault_paged,
+                  "kalman": self._patient_kalman}
+        with self._state_lock:
+            if snapshot["policy"] is not _ABSENT and subject not in self._patient_policies:
+                # Another evaluation evicted this patient while this one ran (only a calm, unlocked patient is ever
+                # evicted, and the ledger says so with STATE_EVICTED). Bringing the old state back would put the store
+                # over its cap and chain the next record onto a head the ledger has already retired.
+                for store in stores.values():
+                    store.pop(subject, None)
+                return
+            for name, store in stores.items():
+                saved = snapshot[name]
+                if saved is _ABSENT or saved is _DROP:
+                    store.pop(subject, None)
+                else:
+                    store[subject] = saved
 
     def _get_policy(self, patient_id: str) -> EscalationPolicy:
         with self._state_lock:
             if patient_id not in self._patient_policies:
                 self._patient_policies[patient_id] = EscalationPolicy()
         self._touch_patient(patient_id)
-        return self._patient_policies[patient_id]
+        with self._state_lock:
+            # Another evaluation may have evicted this patient between the two sections (only a calm, unlocked patient is ever
+            # evicted, so a fresh policy is exactly what eviction would have left): never fail this assessment for it.
+            policy = self._patient_policies.get(patient_id)
+            if policy is None:
+                policy = self._patient_policies[patient_id] = EscalationPolicy()
+            return policy
 
     def _provenance(self) -> Dict[str, Any]:
         """What produced a decision besides its inputs: the core's calibration
@@ -1365,16 +1769,32 @@ class ObserveClinicalEngine:
         A cassette that was built with a non-default setting may expose
         `identity_extras` (a dict); it is recorded under the cassette identity so a
         decision made under that setting is distinguishable in the stored entry and
-        in the fingerprint. A cassette with no extras, or none at all, adds nothing,
-        so every existing entry keeps its exact shape and hash."""
+        in the fingerprint. A cassette with no extras, or none at all, adds nothing to
+        the cassette identity. (Every entry now also records `logic_version`, below: that
+        changed every recorded fingerprint once, deliberately; decision D9.)"""
         identity = {"name": str(getattr(self._cassette, "name", "")),
                     "version": str(getattr(self._cassette, "version", ""))}
         extras = getattr(self._cassette, "identity_extras", None)
         if isinstance(extras, dict):
             for key in sorted(extras):
                 identity[str(key)] = str(extras[key])
+        # What the scoring code and the domain's rules DO, as a digest (logic_stamp): a change to a point value, a syndrome
+        # threshold or a gate cutoff inside a function changes it, which the parameter-set version alone cannot see. One
+        # value for the core and the cassette together, so a record says which behaviour made it. Decision D9.
+        logic = getattr(self, "_logic_version", None)
+        if logic is None:                                   # parsing source is not free: once per engine, not per reading
+            parts = [ENGINE_LOGIC_DIGEST]
+            if type(self).__module__ != __name__:           # an engine subclass is its own code
+                parts.append(module_logic_digest(type(self).__module__))
+            parts.append(module_logic_digest(type(self._cassette).__module__))   # the cassette's module, hook or no hook
+            cassette_logic = cassette_optional_member(self._cassette, "logic_digest")
+            if cassette_logic:
+                parts.append(str(cassette_logic()))
+            logic = hashlib.sha256("|".join(parts).encode()).hexdigest()
+            self._logic_version = logic
         return {
             "parameter_set_version": PARAMETER_SET_VERSION,
+            "logic_version": logic,
             "cassette": identity,
         }
 
@@ -1437,10 +1857,26 @@ class ObserveClinicalEngine:
         return self._cassette.select_engines(vitals, entropy)
 
     def evaluate(self, vitals: VitalsSnapshot) -> FusedVerdict:
-        """Fast synchronous evaluation: validate → select → run → fuse → policy → audit."""
+        """Fast synchronous evaluation: validate → select → run → fuse → policy → audit.
 
+        All-or-nothing for the patient's tracked state: if the evaluation raises at any point, the escalation state, entropy,
+        state-commitment head, fault-page stamps and trajectory tracker are put back as they were when it began (see
+        `_restore_tracked_state`), so a crash can neither swallow the patient's next critical reading nor drop a real tracked
+        escalation. The exception is re-raised unchanged."""
+        subject = self._cassette.subject_id(vitals)
+        snapshot = self._snapshot_tracked_state(subject)
+        try:
+            return self._evaluate(vitals)
+        except BaseException:
+            self._restore_tracked_state(subject, snapshot)
+            raise
+        finally:
+            self._flush_degraded()
+
+    def _evaluate(self, vitals: VitalsSnapshot) -> FusedVerdict:
         subject = self._cassette.subject_id(vitals)
         policy = self._get_policy(subject)
+        prior_regime = policy.current_regime  # what was tracked before this reading moves anything
 
         # DATA-INTEGRITY GATE (FIX, red-team R1/R2): a non-finite or physically
         # impossible reading is a sensor/data fault, not a clinical state. It must
@@ -1505,7 +1941,9 @@ class ObserveClinicalEngine:
         candidate_regime = OperationalRegime(max_regime_name)
 
         # CLINICAL SAFETY BYPASS: two triggers skip dwell/hysteresis entirely —
-        #   (1) a heuristic hard rule (risk >= 0.5: CRITICAL_O2, HYPOTHERMIA, etc.), and
+        #   (1) a heuristic hard rule (risk >= 0.5). CRITICAL_O2 reaches it alone (it scores 0.5). HYPOTHERMIA scores 0.4,
+        #       so on its own it does NOT; it becomes one only with another finding that lifts the score to 0.5 or more
+        #       (for example a raised respiratory rate, +0.15). See test_hypothermia_scoring.py, and
         #   (2) a confirmed dangerous clinical syndrome from the behavioral adapter
         #       (septic shock / respiratory distress / hypovolemic shock).
         # Dwell exists to damp noise-driven thrashing on borderline multi-engine
@@ -1523,6 +1961,32 @@ class ObserveClinicalEngine:
             for o in outputs for r in o.triggered_rules
         )
         bypass = hard_rule_fired or syndrome_fired
+        # What holds the WARNING floor even when fusion rates the reading lower. A named syndrome is a conjunction of
+        # vitals, not one sensor, so it always does. A hard rule does once it is confirmed: it fired again within the
+        # window, or another channel is abnormal beside it (an artefact on one sensor does not raise a child's
+        # respiratory rate or temperature), or the window is 1 (the clinician chose to wait for nothing). A lone,
+        # uncorroborated hard-rule reading is judged exactly as before: it may be an artefact, and the next reading
+        # decides. The domain says how many readings make a repeat and what corroboration is.
+        window_of = cassette_optional_member(self._cassette, "hard_rule_confirm_window")
+        window = max(1, int(window_of())) if window_of else HARD_RULE_CONFIRM_WINDOW
+        corroborated_by = cassette_optional_member(self._cassette, "hard_rule_corroborated")
+        corroborated = bool(hard_rule_fired and corroborated_by and corroborated_by(outputs))
+        with self._state_lock:
+            # A reading seen again (same timestamp: a retransmission, a replay, a retry after a crash) replaces its
+            # earlier entry and is never its own repeat; and only a hard rule on an EARLIER reading counts as one. A
+            # timestamp that cannot be ordered against the history counts: that is the direction that escalates.
+            now = vitals.timestamp
+            recent = [e for e in self._patient_hard_rule_recent.get(subject, []) if e[0] != now]
+
+            def _earlier_firing(entry) -> bool:
+                try:
+                    return bool(entry[1]) and entry[0] < now
+                except TypeError:
+                    return bool(entry[1])
+            repeated = window > 1 and any(_earlier_firing(e) for e in recent[-(window - 1):])
+            hard_rule_confirmed = hard_rule_fired and (window <= 1 or repeated or corroborated)
+            self._patient_hard_rule_recent[subject] = (recent + [(now, hard_rule_fired)])[-window:]
+        hold_floor = syndrome_fired or hard_rule_confirmed
 
         if unassessable:
             # FROZEN POLICY: read, never written, on a faulted reading. Placeholder
@@ -1541,9 +2005,17 @@ class ObserveClinicalEngine:
             else:
                 all_triggered_bypass_note = []
             fused_risk = max(fused_risk, REGIME_RISK_FLOOR[final_regime.value])  # every call, not only a change
-        elif bypass and candidate_regime.value in ("warning", "critical"):
-            escalation = policy.current_regime.value in ("stable", "caution")
-            final_regime = candidate_regime
+        elif bypass and (hold_floor or candidate_regime.value in ("warning", "critical")):
+            # A bypass raises the regime and never lowers it: a patient tracked at CRITICAL stays CRITICAL
+            # when a later reading's bypass rates only WARNING. Any move UP is an escalation event, WARNING to
+            # CRITICAL included (it used to be one only from STABLE or CAUTION, so a worsening patient
+            # changed regime and raised no event). A confirmed hard rule or a named syndrome holds WARNING even
+            # when fusion rated the reading lower: the fusion averages axes that do not all see the danger.
+            lifted = _REGIME_SEVERITY[candidate_regime] < _REGIME_SEVERITY[OperationalRegime.WARNING]
+            final_regime = _max_severity(candidate_regime, OperationalRegime.WARNING, policy.current_regime)
+            if lifted:  # only reachable with hold_floor; the risk is floored to match so score and regime agree
+                fused_risk = max(fused_risk, REGIME_RISK_FLOOR[final_regime.value])
+            escalation = _REGIME_SEVERITY[final_regime] > _REGIME_SEVERITY[policy.current_regime]
             policy.current_regime = final_regime
             policy.pending_regime = None
             policy.dwell_count = 0
@@ -1553,12 +2025,62 @@ class ObserveClinicalEngine:
             reason = "hard-rule" if hard_rule_fired else "dangerous-syndrome"
             bypass_label = cassette_label(self._cassette, "safety_bypass")
             all_triggered_bypass_note = [f"{bypass_label}: {reason} trigger skipped dwell confirmation"]
+            if lifted:
+                if syndrome_fired and not hard_rule_confirmed:
+                    reason = "dangerous-syndrome"                     # the note names what actually held the floor
+                why = "a named syndrome" if syndrome_fired and not hard_rule_confirmed else (
+                    "corroborated by another abnormal channel" if corroborated else
+                    "confirmed within the window" if repeated else "window of 1")
+                all_triggered_bypass_note.append(
+                    f"{bypass_label}: {reason} trigger ({why}) held the regime at WARNING against a lower fused regime")
         else:
             final_regime, escalation = policy.evaluate(candidate_regime, vitals.timestamp)
             all_triggered_bypass_note = []
 
+        # A floor the domain sets on the REPORTED regime (for example a patient outside the supported population). It
+        # follows the normal tracking above, so a tracked CRITICAL is still held; it never writes the policy, never
+        # lowers anything, and pages at most once per window (the same dedup a sensor fault uses).
+        floor_of = cassette_optional_member(self._cassette, "regime_floor")
+        floor = floor_of(recorded) if floor_of else None
+        floor_notes: List[str] = []
+        # Notes the domain wants beside the verdict that change no regime (for example a probe that may be off).
+        notes_of = cassette_optional_member(self._cassette, "advisory_notes")
+        advisory_notes = list(notes_of(recorded)) if notes_of else []
+        # The floor is a standing condition (a patient who stays out of the supported population stays so), so it pages
+        # ONCE, when it first applies, and again only after a reading that is back in scope. It does not page on a
+        # timer: a timed dedup would re-page an adult every window for as long as they are monitored.
+        with self._state_lock:
+            if floor:
+                stamps = self._patient_fault_paged.setdefault(subject, {})
+                first_time = "population" not in stamps
+                stamps.setdefault("population", recorded.timestamp)
+            else:
+                first_time = False
+                stamps = self._patient_fault_paged.get(subject)
+                if stamps:
+                    stamps.pop("population", None)
+        if floor:
+            floor_value, floor_note = floor
+            floor_notes.append(floor_note)
+            floor_regime = OperationalRegime(floor_value)
+            if _REGIME_SEVERITY[final_regime] < _REGIME_SEVERITY[floor_regime]:
+                final_regime = floor_regime
+                fused_risk = max(fused_risk, REGIME_RISK_FLOOR[final_regime.value])
+                if first_time and not escalation:
+                    escalation = True
+
+        if escalation:
+            moved_up_from_escalated = (_REGIME_SEVERITY[prior_regime] >= _REGIME_SEVERITY[OperationalRegime.WARNING]
+                                       and _REGIME_SEVERITY[final_regime] > _REGIME_SEVERITY[prior_regime])
+            escalation_kind = "severity_increase" if moved_up_from_escalated else "new_escalation"
+        elif not unassessable and _REGIME_SEVERITY[final_regime] < _REGIME_SEVERITY[prior_regime]:
+            escalation_kind = "de_escalation"
+        else:
+            escalation_kind = ""
+
         fault_notes = [f"DATA_INTEGRITY_FAULT: {f}" for f in faults]
-        all_triggered = fault_notes + all_triggered_bypass_note + [r for o in outputs for r in o.triggered_rules]
+        all_triggered = (fault_notes + all_triggered_bypass_note + floor_notes + advisory_notes
+                         + [r for o in outputs for r in o.triggered_rules])
         avg_confidence = sum(o.confidence for o in outputs) / len(outputs) if outputs else 0.0
         if unassessable:
             avg_confidence *= UNASSESSABLE_CONFIDENCE_PENALTY
@@ -1573,6 +2095,13 @@ class ObserveClinicalEngine:
         }
         if all_triggered_bypass_note:  # present only then, so a clean entry keeps its shape
             decision_data["safety_bypass"] = list(all_triggered_bypass_note)
+        if advisory_notes:  # likewise
+            decision_data["advisory_notes"] = list(advisory_notes)
+        if floor_notes:  # present only then, so an entry nothing floored keeps its shape
+            decision_data["regime_floor"] = list(floor_notes)
+        if escalation_kind in ("severity_increase", "de_escalation"):  # only the kinds this change adds
+            decision_data["escalation_kind"] = escalation_kind
+            decision_data["previous_regime"] = prior_regime.value
         if unassessable:  # present only then, so a clean entry keeps its shape
             decision_data["validation_faults"] = list(faults)
             decision_data["verdict"]["unassessable"] = True
@@ -1595,6 +2124,8 @@ class ObserveClinicalEngine:
             state_commitment=commitment,
             validation_faults=list(faults),
             unassessable=unassessable,
+            escalation_kind=escalation_kind,
+            previous_regime=prior_regime.value,
         )
 
         audit_hash = self.audit_ledger.append(
@@ -1604,11 +2135,17 @@ class ObserveClinicalEngine:
         )
         verdict.audit_hash = audit_hash
 
-        if unassessable:
-            logger.warning(f"DATA_INTEGRITY_FAULT: subject={subject} faults={faults} "
-                           f"assessed={selected} regime={final_regime.value}")
-        if escalation:
-            logger.info(f"ESCALATION: subject={subject} regime={final_regime.value} risk={fused_risk:.2f}")
+        # The ledger now holds this reading and the state-commitment head has moved with it. From here a failure must not
+        # roll the state back (that would fork the commitment chain), so a log handler that raises cannot fail the
+        # assessment: logging is the one thing after the write, and it is never allowed to be fatal.
+        try:
+            if unassessable:
+                logger.warning(f"DATA_INTEGRITY_FAULT: subject={patient_tag(subject)} faults={faults} "
+                               f"assessed={selected} regime={final_regime.value}")
+            if escalation:
+                logger.info(f"ESCALATION: subject={patient_tag(subject)} regime={final_regime.value} risk={fused_risk:.2f}")
+        except Exception:  # noqa: BLE001 - see above
+            pass
 
         return verdict
 
@@ -1652,7 +2189,7 @@ class ObserveClinicalEngine:
             {**decision_data, "decision_fingerprint": fingerprint,
              "predecessor_state_commitment": predecessor, "state_commitment": commitment},
         )
-        logger.warning(f"DATA_INTEGRITY_FAULT: subject={subject} faults={faults}")
+        logger.warning(f"DATA_INTEGRITY_FAULT: subject={patient_tag(subject)} faults={faults}")
         return FusedVerdict(
             risk_score=0.0, regime=OperationalRegime.WARNING, confidence=0.0, entropy=0.0,
             active_engines=[], triggered_rules=triggered, timestamp=datetime.now(timezone.utc),
@@ -1662,6 +2199,19 @@ class ObserveClinicalEngine:
             validation_faults=list(faults), unassessable=True,
         )
 
+
+# What the scoring code DOES, as one digest (see logic_stamp). Defined here, at the end, and recorded in every decision's
+# provenance. It hashes WHOLE MODULES, not a list of functions: this module, the Kalman tracker, the cassette seam and the stamp
+# itself, so a module-level constant (the severity order, the engine table, the context bounds, the Kalman tuning) or a helper the
+# scoring reads cannot be missed. (A first version hashed a hand-picked list of functions; an independent review found 13
+# clinically meaningful edits it did not see.) Editing a comment, a docstring or a log message does not change it; changing a
+# constant, a comparison or a branch anywhere in these modules does, including a change that is not clinical, which is the price of
+# not missing one that is: such a change is a model change to be reviewed, and says so in the pinned fingerprints.
+ENGINE_LOGIC_COVERS: Tuple[str, ...] = (__name__, _kalman_module.__name__, _cassette_module.__name__, _logic_stamp_module.__name__)
+ENGINE_LOGIC_DIGEST: str = logic_digest(
+    _sys.modules[__name__], _kalman_module, _cassette_module, _logic_stamp_module,
+    constants={"hard_rule_confirm_window_fallback": HARD_RULE_CONFIRM_WINDOW, "parameter_set_version": PARAMETER_SET_VERSION},
+)
 
 if __name__ == "__main__":
     # Smoke test: critical hypoxia + fever case

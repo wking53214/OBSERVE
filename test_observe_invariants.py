@@ -508,20 +508,16 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
 
 
 class VendoredCopyStaysInSync(unittest.TestCase):
-    """TEMPORARY STOPGAP (owner-approved 2026-10-29), not the original assertion.
+    """The copied engine files: root is observe-perceive at one recorded commit, and sentinel_os/ is root.
 
-    The original test asserted that the root and sentinel_os/ copies of
-    observe_consolidated.py are byte-identical (review finding 8). They have
-    not been since 2026-09-08. Since PR-2 the root engine is observe-perceive
-    e8186599 (byte-identical, with its four sibling modules), and since PR-3
-    sentinel_os/ holds the same upstream engine (its twin bca7a70 after the
-    history rewrite).
-    This test asserts both facts and still fails loudly (never skips) if either
-    side, or any pinned file, changes unexpectedly. The identical assertion
-    between root and sentinel_os/ is restored by PR-4 of RECONCILE_UPSTREAM_PLAN.md.
+    Restored by PR-4 of RECONCILE_UPSTREAM_PLAN.md. From 2026-10-29 until then this was a stopgap that pinned
+    sentinel_os/observe_consolidated.py separately, because it was an older engine. Now every one of the eight
+    files must be byte-identical between root and sentinel_os/ (review finding 8's original assertion, widened
+    to the engine's sibling modules), and root stays pinned to the upstream commit it was copied from. Fails
+    loudly, never skips, if either side or any pin changes unexpectedly.
     """
 
-    # Root: observe-perceive d5962621321c791e79129bcfb807b5ee6e9eaa58 (main on 2026-11-19; re-synced by PR-4 of RECONCILE_UPSTREAM_PLAN.md). Also recorded in VENDORED.md.
+    # Root: observe-perceive d5962621321c791e79129bcfb807b5ee6e9eaa58 (main on 2026-11-19). Also recorded in VENDORED.md.
     ROOT_UPSTREAM_COMMIT = "d5962621321c791e79129bcfb807b5ee6e9eaa58"
     ROOT_PINS = {
         "observe_consolidated.py": "cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b",
@@ -533,11 +529,7 @@ class VendoredCopyStaysInSync(unittest.TestCase):
         "log_redaction.py": "8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12",
         "logic_stamp.py": "ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b",
     }
-    # sentinel_os/: observe-perceive bca7a70 (twin of e818659), observe_consolidated.py. Also recorded in VENDORED.md.
-    SNAPSHOT_COMMIT = "bca7a70"
-    SNAPSHOT_SHA256 = "0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566"
-
-    def test_root_is_the_pinned_upstream_engine_and_sentinel_os_is_the_pinned_snapshot(self):
+    def test_root_is_the_pinned_upstream_engine_and_sentinel_os_is_identical_to_root(self):
         here = pathlib.Path(__file__).parent
         for name, pin in self.ROOT_PINS.items():
             path = here / name
@@ -548,31 +540,27 @@ class VendoredCopyStaysInSync(unittest.TestCase):
                 msg=(
                     f"{name} no longer matches observe-perceive {self.ROOT_UPSTREAM_COMMIT}. These files are "
                     "copied, never edited here. If this was a deliberate re-sync, update the pins here and "
-                    "in VENDORED.md together."
+                    "in VENDORED.md together, and copy the same file into sentinel_os/."
                 ),
             )
-        vendored = here / "sentinel_os" / "observe_consolidated.py"
-        self.assertTrue(vendored.exists(), "sentinel_os/observe_consolidated.py is missing")
-        self.assertEqual(
-            hashlib.sha256(vendored.read_bytes()).hexdigest(),
-            self.SNAPSHOT_SHA256,
-            msg=(
-                "sentinel_os/observe_consolidated.py no longer matches the pinned upstream snapshot "
-                f"(observe-perceive {self.SNAPSHOT_COMMIT}). If this was a deliberate re-sync, update the "
-                "pin here and in VENDORED.md together."
-            ),
-        )
+            vendored = here / "sentinel_os" / name
+            self.assertTrue(vendored.exists(), f"sentinel_os/{name} is missing")
+            self.assertEqual(
+                vendored.read_bytes(),
+                path.read_bytes(),
+                msg=f"sentinel_os/{name} is not byte-identical to the root {name}; re-sync them together",
+            )
         manifest = (here / "VENDORED.md").read_text(encoding="utf-8")
-        for pin in (self.SNAPSHOT_SHA256, *self.ROOT_PINS.values()):
+        for pin in self.ROOT_PINS.values():
             self.assertIn(pin, manifest, msg="VENDORED.md does not record the same pin as this test")
         for name in self.ROOT_PINS:
-            rows = [ln for ln in manifest.splitlines() if ln.startswith(f"| `{name}` |")]
-            self.assertEqual(len(rows), 1, msg=f"VENDORED.md must have exactly one row for the root {name}")
-            self.assertTrue(
-                rows[0].rstrip().endswith("| identical |"),
-                msg=f"VENDORED.md must declare the root {name} as 'identical' to observe-perceive",
-            )
-
+            for listed in (name, f"sentinel_os/{name}"):
+                rows = [ln for ln in manifest.splitlines() if ln.startswith(f"| `{listed}` |")]
+                self.assertEqual(len(rows), 1, msg=f"VENDORED.md must have exactly one row for {listed}")
+                self.assertTrue(
+                    rows[0].rstrip().endswith("| identical |"),
+                    msg=f"VENDORED.md must declare {listed} as 'identical' to observe-perceive",
+                )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

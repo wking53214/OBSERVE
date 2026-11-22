@@ -12,7 +12,7 @@ Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at c
 - **What it does not own.** Authorization, execution, custody, admission, or the orchestrator (observe-perceive). It does not own policy, but PERCEIVE policy files sit in this tree.
 - **Depends on.** observe-perceive (engine source), sentinel_os and GSA-815 (the nested `sentinel_os/` tree). Optional CNS v4.1.0 for the connector (`requirements-cns.txt`).
 - **Depended on by.** UNKNOWN. No consumer was found or inspected.
-- **Verified versus declared.** Verified: root copy matches its pins (`VENDORED.md`, checked by `test_observe_invariants.py`). Declared only: the planned order below and the "paired with PERCEIVE" relationship. Nothing in this repo is on the orchestrator path (observe-perceive's `GovernanceOrchestrator`).
+- **Verified versus declared.** Verified: root copy matches its pins (`VENDORED.md`, checked by `test_observe_invariants.py`). Declared only: the planned order below. The "paired with PERCEIVE" relationship is tested in observe-perceive, on its own copies of the engine and of PERCEIVE (`test_cns_composition.py`, observe-perceive PR #112, open at the time of writing), not here. Nothing in this repo is on the orchestrator path (observe-perceive's `GovernanceOrchestrator`).
 - **Governance and control design.** OBSERVE's output is evidence, not authority. A regime or escalation flag is a signal for a downstream stage. It is not a decision.
 
 ## Known upstream fixes this copy lacks
@@ -56,7 +56,7 @@ Admission → OBSERVE (this repo / observe_consolidated) → Locks → PERCEIVE 
 
 This is the order the architecture text describes. It differs from what runs: OBSERVE runs before the admission check, the locks are part of OBSERVE, and the engine that runs is observe-perceive's, not this repo's.
 
-Paired with PERCEIVE inside [`observe-perceive`](https://github.com/wking53214/observe-perceive). Named-Keys extraction: [`interconnected_alpha`](https://github.com/wking53214/interconnected_alpha). This repository is **not** on the orchestrator path; it is the observation concept plus a large amount of vendored history.
+Paired with PERCEIVE inside [`observe-perceive`](https://github.com/wking53214/observe-perceive). Named-Keys extraction: [`interconnected_alpha`](https://github.com/wking53214/interconnected_alpha). This repository is **not** on the orchestrator path; it is the observation concept plus a large amount of vendored history. One piece moved the other way: this repo's `cns_connector.py` confirms an OMEGA verdict's evidence by re-running the recorded engines, because `active_engines` lists selected engines, abstaining ones included. That check was ported to observe-perceive as `confirmed_evidence` (PR #112, step 14), where the gates had read selection as evidence.
 
 ## 2. Full System Scope & Architectural Depth
 

@@ -533,9 +533,9 @@ class VendoredCopyStaysInSync(unittest.TestCase):
         "log_redaction.py": "8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12",
         "logic_stamp.py": "ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b",
     }
-    # sentinel_os/: observe-perceive bca7a70 (twin of e818659), observe_consolidated.py. Also recorded in VENDORED.md.
-    SNAPSHOT_COMMIT = "bca7a70"
-    SNAPSHOT_SHA256 = "0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566"
+    # sentinel_os/: observe-perceive d596262, observe_consolidated.py (PR-4 step 1). Also recorded in VENDORED.md.
+    SNAPSHOT_COMMIT = "d596262"
+    SNAPSHOT_SHA256 = "cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b"
 
     def test_root_is_the_pinned_upstream_engine_and_sentinel_os_is_the_pinned_snapshot(self):
         here = pathlib.Path(__file__).parent

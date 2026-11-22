@@ -28,7 +28,7 @@ therefore been replaced, for now, by pins on both:
 | root | `clinical_settings.py` | `d596262` | `62e06d7cce792e431695720dc20d639c9d1921fbdd070ba6c501ad553b3a9d71` |
 | root | `log_redaction.py` | `d596262` | `8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12` |
 | root | `logic_stamp.py` | `d596262` | `ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b` |
-| sentinel_os | `sentinel_os/observe_consolidated.py` | `bca7a70` (twin of `e818659`) | `0a1cc62de6d391b21476b6116b669081ed47141ac3a6c71a2d0a8d5899ddd566` |
+| sentinel_os | `sentinel_os/observe_consolidated.py` | `d596262` (PR-4 step 1) | `cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b` |
 
 `test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if any pinned file changes without the pins here being
 changed with it, and fails if a root file stops being declared `identical` in the table below.

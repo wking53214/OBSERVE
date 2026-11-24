@@ -9,7 +9,7 @@ force and compares.
 
 NOTE (2026-11-19): the root engine is now observe-perceive d596262 and SCORES DIFFERENTLY from the old
 engine. Items 1 and 2 below describe the earlier e8186599 re-sync and are superseded: the tests now pin the
-79 reviewed differences instead of asserting parity. See docs/ENGINE_RESYNC_DIFFERENCES.md.
+240 reviewed differences instead of asserting parity (re-pinned 2026-11-23 for the new age-band limits; see docs/ENGINE_RESYNC_DIFFERENCES.md). See docs/ENGINE_RESYNC_DIFFERENCES.md.
 
 What it proves (historical):
 
@@ -139,10 +139,10 @@ class ParityWithTheOldEngine(_Base):
         by_field = {}
         for _i, field, _o, _n in diffs:
             by_field[field] = by_field.get(field, 0) + 1
-        self.assertEqual(len(diffs), 79)
-        self.assertEqual(by_field, {"regime": 42, "esc": 16, "risk": 21})
+        self.assertEqual(len(diffs), 240)
+        self.assertEqual(by_field, {"risk": 178, "regime": 45, "esc": 17})
 
-    def test_the_less_cautious_readings_are_exactly_these_seven(self):
+    def test_the_less_cautious_readings_are_exactly_these(self):
         sev = {"stable": 0, "warning": 1, "critical": 2}
         old = self.fixture["junk_previous_o2_stripped"]
         less, more = [], []
@@ -151,13 +151,13 @@ class ParityWithTheOldEngine(_Base):
             changed = o["regime"] != n["regime"] or o["esc"] != n["esc"]
             if changed:
                 (less if lower else more).append(o["i"])
-        self.assertEqual(less, [148, 330, 353, 378, 398, 481, 585])
-        self.assertEqual(len(more), 43)
+        self.assertEqual(less, [47, 61, 131, 138, 143, 270, 271, 275, 284, 372, 577, 585, 592])
+        self.assertEqual(len(more), 40)
 
     def test_every_difference_against_the_old_engine_as_it_ran_is_counted(self):
         diffs = _differences(self.fixture["as_run"], self.legacy_rows)
         errors = [d for d in diffs if d[1] == "error"]
-        self.assertEqual(len(diffs), 115)
+        self.assertEqual(len(diffs), 257)
         self.assertEqual(len(errors), 12)
         for i, _f, old, new in errors:
             self.assertEqual((old, new), ("TypeError", None), msg=f"reading {i}")
@@ -166,18 +166,24 @@ class ParityWithTheOldEngine(_Base):
         self.assertEqual([r for r in self.legacy_rows if "error" in r], [])
 
 
-class TheSevenLessCautiousReadings(_Base):
+class TheLessCautiousReadings(_Base):
     """Pins today's output for the readings docs/ENGINE_RESYNC_DISPOSITIONS.md lists as PENDING clinical review.
     This records behavior; it does not claim the behavior is clinically right."""
 
     PINNED = {  # reading: (regime, escalation, unassessable)
-        148: ("critical", False, False),
-        330: ("critical", False, True),
-        353: ("critical", False, False),
-        378: ("stable", False, False),
-        398: ("stable", False, False),
-        481: ("critical", False, False),
+        47: ("warning", True, False),
+        61: ("warning", False, False),
+        131: ("stable", False, False),
+        138: ("stable", False, False),
+        143: ("stable", False, False),
+        270: ("stable", False, False),
+        271: ("stable", False, False),
+        275: ("warning", True, False),
+        284: ("warning", False, False),
+        372: ("warning", True, False),
+        577: ("stable", False, False),
         585: ("warning", False, True),
+        592: ("warning", False, False),
     }
 
     def test_the_new_engines_output_for_each_reading_is_pinned(self):

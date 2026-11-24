@@ -38,6 +38,8 @@ What was tried on 2026-09-07 and what it showed:
   `diverged`. Reconciliation is upstream-first: port the fingerprint and
   state-commitment work into observe-perceive, then re-sync here.
 
+Status note (2026-11-23): the eight root engine files, and the two that changed (`observe_consolidated.py`, `clinical_settings.py`) in `sentinel_os/` too, are now observe-perceive `8d70b95` (main). This adds the 2026-11-23 evidence-based heart-rate, respiratory-rate and fever limits and the split of the old "child" age group into preschool, school and adolescent (observe-perceive #113, #114). Provisional, not clinically validated; the scoring differences against the old engine were re-measured and are pending clinical review (`docs/ENGINE_RESYNC_DISPOSITIONS.md`).
+
 Status note (2026-11-19): the root engine is observe-perceive `d596262` (re-synced in
 OBSERVE PR #35, merged without the clinical review its description asked for; see
 `docs/ENGINE_RESYNC_DIFFERENCES.md`). The `sentinel_os/` engine files are the older

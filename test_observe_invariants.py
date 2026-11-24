@@ -297,7 +297,7 @@ class T2b_ValidationFaultOverlayIsSafe(unittest.TestCase):
                                     heart_rate=210.0, timestamp=t0))
         self.assertEqual(engine._patient_policies["bpf"].current_regime, OperationalRegime.STABLE)
         recovered = engine.evaluate(make_vitals(patient_id="bpf", oxygen_saturation=75.0,
-                                                heart_rate=150.0, respiratory_rate=45.0,
+                                                heart_rate=160.0, respiratory_rate=50.0,
                                                 timestamp=t0 + timedelta(seconds=600)))
         self.assertEqual(recovered.regime, OperationalRegime.CRITICAL)
         self.assertTrue(recovered.escalation_required)
@@ -459,13 +459,13 @@ class I3_ParameterSetVersionIsBoundIntoProvenance(unittest.TestCase):
         # a runtime mutation shifted the effective config while the version stamp
         # stayed byte-identical. It must be a deep copy, and drift must be visible.
         self.assertIsNot(PARAMETER_SET["pediatric_norms"], PEDIATRIC_NORMS)
-        original = PEDIATRIC_NORMS["child"]["hr_high"]
+        original = PEDIATRIC_NORMS["school"]["hr_high"]
         try:
-            PEDIATRIC_NORMS["child"]["hr_high"] = original + 99
-            self.assertNotEqual(PARAMETER_SET["pediatric_norms"]["child"]["hr_high"],
-                                PEDIATRIC_NORMS["child"]["hr_high"])
+            PEDIATRIC_NORMS["school"]["hr_high"] = original + 99
+            self.assertNotEqual(PARAMETER_SET["pediatric_norms"]["school"]["hr_high"],
+                                PEDIATRIC_NORMS["school"]["hr_high"])
         finally:
-            PEDIATRIC_NORMS["child"]["hr_high"] = original
+            PEDIATRIC_NORMS["school"]["hr_high"] = original
 
     def test_regime_risk_floor_covers_every_regime(self):
         self.assertEqual(set(REGIME_RISK_FLOOR), {r.value for r in OperationalRegime})
@@ -517,15 +517,15 @@ class VendoredCopyStaysInSync(unittest.TestCase):
     loudly, never skips, if either side or any pin changes unexpectedly.
     """
 
-    # Root: observe-perceive d5962621321c791e79129bcfb807b5ee6e9eaa58 (main on 2026-11-19). Also recorded in VENDORED.md.
-    ROOT_UPSTREAM_COMMIT = "d5962621321c791e79129bcfb807b5ee6e9eaa58"
+    # Root: observe-perceive 8d70b95b427854857aeae1bc304e6db2f18687d0 (main on 2026-11-23). Also recorded in VENDORED.md.
+    ROOT_UPSTREAM_COMMIT = "8d70b95b427854857aeae1bc304e6db2f18687d0"
     ROOT_PINS = {
-        "observe_consolidated.py": "cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b",
+        "observe_consolidated.py": "e947efb387a7b6ddbba9253e4f3d3fd24d805badfa5812d6155b0f8db0a19d5b",
         "cassette.py": "71b68245390e6f0706f57546839dbd3c28982d98ed522b1e81df88e3af24f8af",
         "pediatric_cassette.py": "af9d14d3559849a3e50d8e86c5ca6ef15588e929f4a4f80dfe1ecdd2c34d0157",
         "kalman_trajectory.py": "03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a",
         "governance_contracts.py": "b483c91bab6a39f2180b69006bad43c525128b3d749b40e1d9db121c4f99b7e2",
-        "clinical_settings.py": "62e06d7cce792e431695720dc20d639c9d1921fbdd070ba6c501ad553b3a9d71",
+        "clinical_settings.py": "6afb3e3557687372c263d3cf86b368eddb1a583561d306b8f6cfa31a962adbc0",
         "log_redaction.py": "8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12",
         "logic_stamp.py": "ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b",
     }

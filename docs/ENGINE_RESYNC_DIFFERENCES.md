@@ -1,4 +1,6 @@
-# Engine re-sync: scoring differences (2026-11-19)
+# Engine re-sync: scoring differences (2026-11-19; totals re-measured 2026-11-23)
+
+> **2026-11-23:** after re-syncing to observe-perceive `8d70b95` (new evidence-based limits, "child" group split), the corpus gives 240 field differences against the old engine ({'risk': 178, 'regime': 45, 'esc': 17}) and 13 readings that are less cautious ([47, 61, 131, 138, 143, 270, 271, 275, 284, 372, 577, 585, 592]) and 40 more cautious. The tables below are the 2026-11-19 measurement and are superseded; see `ENGINE_RESYNC_DISPOSITIONS.md` for the current less-cautious list. Needs clinical review.
 
 OBSERVE's root engine was re-synced from observe-perceive `d596262` (see `VENDORED.md`). This lists how the engine in force now differs from the old OBSERVE engine on the recorded 600-reading corpus (`testdata/old_engine_corpus_20261029.json`, seed 20261029), with the one junk `previous_o2` input difference removed so only scoring is compared.
 

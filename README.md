@@ -17,7 +17,7 @@ Status: downstream copy plus a large vendored tree. Last checked 2026-11-19 at c
 
 ## Known upstream fixes this copy lacks
 
-**Root engine (updated 2026-11-19).** The root engine is observe-perceive `d596262`. Between `d596262` and observe-perceive's head `34894bb` the engine files are unchanged (INSPECTED with `git diff`, 2026-11-19), so the root engine is current. The four escalation fixes that earlier versions of this section listed (cooldown hiding a severity increase, dwell on an already-escalated patient who worsens, escalation state for an unrecorded reading, a hard rule averaged away by history) were part of this re-sync. Re-checking each one against the new engine has not been done.
+**Root engine (re-synced 2026-11-23 to observe-perceive `8d70b95`, which carries new provisional age-band limits; see `UPSTREAM.md`). Earlier note (2026-11-19):** The root engine is observe-perceive `d596262`. Between `d596262` and observe-perceive's head `34894bb` the engine files are unchanged (INSPECTED with `git diff`, 2026-11-19), so the root engine is current. The four escalation fixes that earlier versions of this section listed (cooldown hiding a severity increase, dwell on an already-escalated patient who worsens, escalation state for an unrecorded reading, a hard rule averaged away by history) were part of this re-sync. Re-checking each one against the new engine has not been done.
 
 **This re-sync changes scoring and has NOT been clinically reviewed.** On the recorded 600-reading corpus it differs from the old engine on 79 fields; 50 readings change regime or escalation, 43 more cautious and 7 less cautious. See `docs/ENGINE_RESYNC_DIFFERENCES.md` and `docs/ENGINE_RESYNC_DISPOSITIONS.md`. Do not treat the new engine as clinically approved.
 

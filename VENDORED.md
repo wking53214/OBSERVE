@@ -13,21 +13,21 @@ Generated 2026-09-07. sentinel_os/ subtree: {'unique': 209, 'diverged': 53, 'ide
 ## Root pins and identity (restored by PR-4, 2026-11-22)
 
 The root engine and its seven sibling modules are observe-perceive
-`d5962621321c791e79129bcfb807b5ee6e9eaa58`, copied byte-for-byte and never edited here. Since PR-4 of
+`8d70b95b427854857aeae1bc304e6db2f18687d0`, copied byte-for-byte and never edited here. Since PR-4 of
 `RECONCILE_UPSTREAM_PLAN.md`, `sentinel_os/` holds byte-identical copies of the same eight files. From 2026-10-29
 until then a stopgap pinned `sentinel_os/observe_consolidated.py` separately, because it was an older engine
 (`bca7a70`) that still held a worsening patient at WARNING during the escalation lock.
 
 | Pin | File | Upstream commit | sha256 |
 | --- | --- | --- | --- |
-| root | `observe_consolidated.py` | `d596262` | `cf494f53b663b080b5d0f0baa276d8bc41ef8ac7eb4c91e21dbe8d638269338b` |
-| root | `cassette.py` | `d596262` | `71b68245390e6f0706f57546839dbd3c28982d98ed522b1e81df88e3af24f8af` |
-| root | `pediatric_cassette.py` | `d596262` | `af9d14d3559849a3e50d8e86c5ca6ef15588e929f4a4f80dfe1ecdd2c34d0157` |
-| root | `kalman_trajectory.py` | `d596262` | `03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a` |
-| root | `governance_contracts.py` | `d596262` | `b483c91bab6a39f2180b69006bad43c525128b3d749b40e1d9db121c4f99b7e2` |
-| root | `clinical_settings.py` | `d596262` | `62e06d7cce792e431695720dc20d639c9d1921fbdd070ba6c501ad553b3a9d71` |
-| root | `log_redaction.py` | `d596262` | `8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12` |
-| root | `logic_stamp.py` | `d596262` | `ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b` |
+| root | `observe_consolidated.py` | `8d70b95` | `e947efb387a7b6ddbba9253e4f3d3fd24d805badfa5812d6155b0f8db0a19d5b` |
+| root | `cassette.py` | `8d70b95` | `71b68245390e6f0706f57546839dbd3c28982d98ed522b1e81df88e3af24f8af` |
+| root | `pediatric_cassette.py` | `8d70b95` | `af9d14d3559849a3e50d8e86c5ca6ef15588e929f4a4f80dfe1ecdd2c34d0157` |
+| root | `kalman_trajectory.py` | `8d70b95` | `03be64ba12cbcb3c9fce5b0e20d839bac83537775bbc1a09f9d6c6f45a2e5e9a` |
+| root | `governance_contracts.py` | `8d70b95` | `b483c91bab6a39f2180b69006bad43c525128b3d749b40e1d9db121c4f99b7e2` |
+| root | `clinical_settings.py` | `8d70b95` | `6afb3e3557687372c263d3cf86b368eddb1a583561d306b8f6cfa31a962adbc0` |
+| root | `log_redaction.py` | `8d70b95` | `8a499683eef8bfc4c9f4215f6296ee60dfb4fdb059c7d94b94145302b3935b12` |
+| root | `logic_stamp.py` | `8d70b95` | `ce2ba57778b4a447c822622c3bfe91034056881d3c65f3a634cf9bb7d56abd2b` |
 
 `test_observe_invariants.py::VendoredCopyStaysInSync` fails loudly if a root file stops matching its pin, if any
 `sentinel_os/` copy stops being byte-identical to root, or if a row below stops declaring either `identical`.

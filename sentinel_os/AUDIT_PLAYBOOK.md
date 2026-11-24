@@ -367,7 +367,7 @@ Use this table to record findings:
 ## Post-Audit
 
 ### If all checks PASS:
-- Sentinel governance engine is **compliant** with stated requirements
+- The engine passed this checklist. That is a test result, not a finding that it complies with any law or regulation, and it is not an audit opinion
 - No further investigation needed (unless flagged by WARN)
 
 ### If any check FAILS:
